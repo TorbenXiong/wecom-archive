@@ -10,21 +10,21 @@ type ClientInfo = { title: string; message: string; canOpenFolder?: boolean };
 export default function ClientApp() {
   const [state, setState] = useState<PrepareState>("preparing");
   const [summary, setSummary] = useState<CollectionSummary>();
-  const [status, setStatus] = useState("正在自动发现并解析本机聊天数据…");
+  const [status, setStatus] = useState("正在准备，仅处理您有权归档的数据…");
   const [exporting, setExporting] = useState(false);
   const [info, setInfo] = useState<ClientInfo>();
 
   const prepare = useCallback(async () => {
     setState("preparing");
     setSummary(undefined);
-    setStatus("正在自动发现并解析本机聊天数据…");
+    setStatus("正在准备，仅处理您有权归档的数据…");
     try {
       const sources = await backend.discoverSources();
       const source = sources[0];
       if (!source) throw new Error("未发现可支持的本机企业微信数据，请确认客户端已登录。");
       const result = await backend.collectSourceAutomatically(source.sourceId);
       setSummary(result);
-      setStatus("聊天数据已准备完成。");
+      setStatus("准备完成，请仅导出您有权归档的数据。");
       setState("ready");
     } catch (reason) {
       setStatus(formatBackendError(reason, "自动解析未完成，请保持企业微信运行后重试。"));

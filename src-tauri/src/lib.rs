@@ -22,6 +22,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod sqlite3mc;
 
+const LOCAL_NOTICE_VERSION: &str = "client-notice.v1";
+const LOCAL_NOTICE_TEXT: &str = "仅处理您有权归档的数据。";
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BootstrapResponse {
@@ -83,6 +86,7 @@ struct SafeDirectorySelection {
 #[derive(Debug)]
 struct CollectionAuthorization {
     notice_version: String,
+    notice_displayed_at: chrono::DateTime<Utc>,
     remember_key: bool,
 }
 
@@ -300,7 +304,8 @@ async fn collect_source(
     source_id: String,
 ) -> Result<CollectionSummary, CommandError> {
     let authorization = CollectionAuthorization {
-        notice_version: "client-notice.v1".into(),
+        notice_version: LOCAL_NOTICE_VERSION.into(),
+        notice_displayed_at: Utc::now(),
         remember_key: true,
     };
     let candidate = state
@@ -1125,10 +1130,10 @@ fn read_snapshot_export(
         source_instance_id: candidate.source_id.clone(),
         collected_at,
         employee_notice: EmployeeNoticeEvidence {
+            evidence_hash: notice_evidence_hash(&authorization.notice_version),
             notice_version: authorization.notice_version,
-            displayed_at: collected_at,
-            acknowledged_at: Some(collected_at),
-            evidence_hash: receipt.source_fingerprint.clone(),
+            displayed_at: authorization.notice_displayed_at,
+            acknowledged_at: None,
         },
         external_contact_consent: ExternalContactConsent::Unknown,
         collection_scope: CollectionScope {
@@ -1340,6 +1345,10 @@ fn portable_root_error() -> CommandError {
     }
 }
 
+fn notice_evidence_hash(version: &str) -> String {
+    hex::encode(Sha256::digest(format!("{version}\n{LOCAL_NOTICE_TEXT}")))
+}
+
 fn internal_error() -> CommandError {
     CommandError {
         code: "INTERNAL_ERROR",
@@ -1471,6 +1480,7 @@ mod tests {
     fn authorization() -> CollectionAuthorization {
         CollectionAuthorization {
             notice_version: "test-notice.v1".into(),
+            notice_displayed_at: Utc::now(),
             remember_key: false,
         }
     }
@@ -1545,6 +1555,11 @@ mod tests {
 
         assert_eq!(export.schema_version, "client-export.v1");
         assert_eq!(export.message_count, 1);
+        assert_eq!(export.batches[0].employee_notice.acknowledged_at, None);
+        assert_eq!(
+            export.batches[0].employee_notice.evidence_hash,
+            notice_evidence_hash("test-notice.v1")
+        );
         assert_eq!(
             export.batches[0].messages[0].body_text.as_deref(),
             Some("你好")
