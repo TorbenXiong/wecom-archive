@@ -1,0 +1,46 @@
+{
+  "name": "wecom-archive",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Offline-first Windows chat archive workspace",
+  "license": "MIT",
+  "author": "Torben Xiong",
+  "type": "module",
+  "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=24.0.0",
+    "pnpm": "10.30.3"
+  },
+  "scripts": {
+    "dev": "vite --mode server",
+    "dev:server": "vite --mode server",
+    "dev:client": "vite --mode client",
+    "build": "pnpm build:client && pnpm build:server",
+    "build:server": "tsc -b && vite build --mode server",
+    "build:client": "tsc -b && vite build --mode client",
+    "preview": "vite preview --outDir dist/server",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "lucide-react": "1.42.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@types/node": "26.4.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
+    "@vitejs/plugin-react": "6.1.1",
+    "jsdom": "30.0.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vitest": "5.0.0"
+  }
+}

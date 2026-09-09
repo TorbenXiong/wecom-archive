@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="企业微信记录归档">
+  <defs>
+    <linearGradient id="archive-blue" x1="40" y1="24" x2="216" y2="232" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3f73f1"/>
+      <stop offset="1" stop-color="#174ab8"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="52" fill="url(#archive-blue)"/>
+  <path d="M76 54h75l35 35v91c0 12.15-9.85 22-22 22H76c-12.15 0-22-9.85-22-22V76c0-12.15 9.85-22 22-22Z" fill="#fff"/>
+  <path d="M151 54v27c0 4.42 3.58 8 8 8h27" fill="#dce8ff"/>
+  <path d="M82 115h76M82 139h76" fill="none" stroke="#2c61d3" stroke-linecap="round" stroke-width="12"/>
+  <path d="M91 163h58v34H91z" fill="#2c61d3"/>
+  <path d="M105 163v-9h30v9" fill="none" stroke="#2c61d3" stroke-linecap="round" stroke-width="8"/>
+</svg>

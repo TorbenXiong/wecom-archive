@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "企业微信记录归档",
+  "version": "0.1.0",
+  "identifier": "com.torbenxiong.wecomarchive",
+  "build": {
+    "beforeDevCommand": "pnpm dev:client",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build:client",
+    "frontendDist": "../dist/client"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "企业微信记录归档",
+        "width": 420,
+        "height": 330,
+        "minWidth": 400,
+        "minHeight": 310,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "backgroundColor": "#f5f7fb"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": []
+      }
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": [],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "skip"
+      }
+    }
+  }
+}
