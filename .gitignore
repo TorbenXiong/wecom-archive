@@ -1,0 +1,36 @@
+# Frontend and Rust build output
+node_modules/
+dist/
+target/
+*.pdb
+*.tsbuildinfo
+src-tauri/gen/
+portable-client/*.exe
+portable-server/*.exe
+
+# Portable runtime data: never commit real archive material
+userData/
+**/userData/
+serverData/
+**/serverData/
+*.partial
+*.wecom-archive.zip
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.dpapi
+
+# Editors and operating system
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Test artifacts that can contain generated message data
+test-results/
+playwright-report/
+coverage/
+artifacts/

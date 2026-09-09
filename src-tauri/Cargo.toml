@@ -1,0 +1,40 @@
+[package]
+name = "wecom-archive-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "wecom_archive_desktop"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "WeComArchive"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+archive-domain.workspace = true
+message-parser.workspace = true
+media-store.workspace = true
+archive-transfer.workspace = true
+source-windows.workspace = true
+chrono.workspace = true
+hex.workspace = true
+rusqlite.workspace = true
+libsqlite3-sys.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tauri = { workspace = true, features = ["protocol-asset"] }
+thiserror.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

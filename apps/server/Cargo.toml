@@ -1,0 +1,28 @@
+[package]
+name = "wecom-archive-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "WeComArchiveServer"
+path = "src/main.rs"
+
+[dependencies]
+archive-domain.workspace = true
+archive-export.workspace = true
+archive-store.workspace = true
+archive-transfer.workspace = true
+axum = { workspace = true, features = ["http1", "json", "tokio"] }
+chrono.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
+tower-http = { workspace = true, features = ["fs", "set-header"] }
+uuid.workspace = true
+zeroize.workspace = true
