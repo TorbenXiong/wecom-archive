@@ -49,7 +49,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "archive-domain"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "serde",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "archive-export"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "archive-domain",
  "chrono",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "archive-store"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "archive-domain",
  "chrono",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "archive-transfer"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "archive-domain",
  "chrono",
@@ -2045,7 +2045,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "media-store"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "archive-domain",
  "hex",
@@ -2072,7 +2072,7 @@ dependencies = [
 
 [[package]]
 name = "message-parser"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "archive-domain",
  "chrono",
@@ -3278,7 +3278,7 @@ dependencies = [
 
 [[package]]
 name = "source-windows"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "archive-domain",
  "hex",
@@ -4446,7 +4446,7 @@ dependencies = [
 
 [[package]]
 name = "wecom-archive-desktop"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "archive-domain",
  "archive-transfer",
@@ -4469,7 +4469,7 @@ dependencies = [
 
 [[package]]
 name = "wecom-archive-server"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "archive-domain",
  "archive-export",
