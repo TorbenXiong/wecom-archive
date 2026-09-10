@@ -4,21 +4,21 @@ import { ConversationList } from "./components/ConversationList";
 import { DetailPanel } from "./components/DetailPanel";
 import { MessageTimeline } from "./components/MessageTimeline";
 import { Navigation } from "./components/Navigation";
-import { ExportDialog, ServerAccessGate, ServerImportDialog, ServerSettingsPanel, Toast } from "./components/Overlays";
+import { ExportDialog, ServerAccessGate, ServerSettingsPanel, Toast } from "./components/Overlays";
 import type { ConversationSummary, ExportFormat, ExportScope, FilterState, MessageItem } from "./domain/types";
 import { createServerExport, getArchiveSummary, listConversations, listMessages, type ServerArchiveSummary, type ServerConversation, type ServerMessage } from "./lib/server-api";
 import "./styles.css";
 
-type Section = "sources" | "conversations" | "exports" | "settings";
+type Section = "conversations" | "exports" | "settings";
 
 const defaultFilters: FilterState = { search: "", date: "all", participant: "all", type: "all", mediaOnly: false };
 const emptySummary: ServerArchiveSummary = { conversation_count: 0, message_count: 0, media_count: 0 };
 const emptyConversation: ConversationSummary = {
   id: "",
-  title: "尚未导入归档",
+  title: "尚无归档数据",
   initials: "档",
   accent: "blue",
-  lastMessage: "请从采集客户端导入 JSON",
+  lastMessage: "等待企业版专属采集端数据",
   lastAt: "--",
   unread: 0,
   messageCount: 0,
@@ -102,8 +102,7 @@ export default function App() {
       <DetailPanel conversation={selectedConversation} scope={scope} format={format} onScopeChange={setScope} onFormatChange={setFormat} onExport={() => setShowExport(true)} />
     </div>
     <footer className="status-bar"><span>已归档 {summary.message_count.toLocaleString("zh-CN")} 条消息 · {summary.media_count.toLocaleString("zh-CN")} 项媒体 · {summary.conversation_count.toLocaleString("zh-CN")} 个会话</span><span><i />受控访问 · 审计已启用</span></footer>
-    {section === "sources" && <ServerImportDialog token={token} onClose={() => setSection("conversations")} onImported={async (message) => { await loadDirectory(token); setSection("conversations"); setToast(message); }} />}
-    {section === "settings" && <ServerSettingsPanel onClose={() => setSection("conversations")} onImport={() => setSection("sources")} onDisconnect={() => { setToken(undefined); setMessages([]); setConversations([]); setSummary(emptySummary); setSection("conversations"); }} />}
+    {section === "settings" && <ServerSettingsPanel onClose={() => setSection("conversations")} onDisconnect={() => { setToken(undefined); setMessages([]); setConversations([]); setSummary(emptySummary); setSection("conversations"); }} />}
     {showExport && <ExportDialog scope={scope} format={format} messageCount={scope === "entire_archive" ? summary.message_count : scope === "current_filter" ? messages.length : selectedConversation.messageCount} mediaCount={scope === "entire_archive" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onClose={() => setShowExport(false)} onConfirm={async () => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, participantId: filters.participant === "all" ? undefined : filters.participant, text: filters.search.trim() || undefined, messageType: filters.type === "all" ? undefined : filters.type, mediaOnly: filters.mediaOnly }); setShowExport(false); setToast(`服务端导出完成：${result.fileName}，共 ${result.messageCount.toLocaleString("zh-CN")} 条消息。`); }} />}
     {toast && <Toast onClose={() => setToast(undefined)}>{toast}</Toast>}
   </div>;

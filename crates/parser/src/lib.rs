@@ -132,8 +132,20 @@ fn extract_text(message_type: MessageType, payload: &Value) -> Option<String> {
 
     keys.iter()
         .filter_map(|key| payload.get(*key).and_then(Value::as_str))
-        .find(|value| !value.trim().is_empty())
-        .map(str::to_owned)
+        .filter_map(clean_readable_text)
+        .next()
+}
+
+fn clean_readable_text(value: &str) -> Option<String> {
+    let cleaned = value
+        .chars()
+        .filter(|character| {
+            matches!(character, '\n' | '\r' | '\t')
+                || (!character.is_control() && *character != '\u{fffd}')
+        })
+        .collect::<String>();
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_owned())
 }
 
 fn extract_media(payload: &Value) -> Vec<MediaRefV1> {
@@ -197,5 +209,25 @@ mod tests {
         let message = normalize(row("future-type", payload.clone()), Uuid::nil()).unwrap();
         assert_eq!(message.message_type, MessageType::Unsupported);
         assert_eq!(message.raw_payload, payload);
+    }
+
+    #[test]
+    fn removes_binary_control_bytes_from_readable_text() {
+        let message = normalize(
+            row(
+                "text",
+                json!({"text": "\u{001e}\u{0008}\0\u{0012}\u{001a}\n\u{0018}"}),
+            ),
+            Uuid::nil(),
+        )
+        .unwrap();
+        assert_eq!(message.body_text, None);
+
+        let message = normalize(
+            row("text", json!({"text": "\u{0012}你好\n世界\u{0000}"})),
+            Uuid::nil(),
+        )
+        .unwrap();
+        assert_eq!(message.body_text.as_deref(), Some("你好\n世界"));
     }
 }

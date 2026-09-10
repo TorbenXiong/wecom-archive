@@ -1,14 +1,13 @@
-import { Database, MessagesSquare, Settings, SquareArrowOutUpRight } from "lucide-react";
+import { MessagesSquare, Settings, SquareArrowOutUpRight } from "lucide-react";
 
-type Section = "sources" | "conversations" | "exports" | "settings";
+type Section = "conversations" | "exports" | "settings";
 
 interface NavigationProps {
   active: Section;
   onSelect: (section: Section) => void;
 }
 
-const items: Array<{ id: Section; label: string; icon: typeof Database }> = [
-  { id: "sources", label: "客户端导入", icon: Database },
+const items: Array<{ id: Section; label: string; icon: typeof MessagesSquare }> = [
   { id: "conversations", label: "会话", icon: MessagesSquare },
   { id: "exports", label: "导出记录", icon: SquareArrowOutUpRight },
   { id: "settings", label: "设置", icon: Settings },

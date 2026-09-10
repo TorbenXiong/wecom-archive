@@ -55,10 +55,23 @@ describe("archive workspace", () => {
     installApiMock();
     const storageSpy = vi.spyOn(Storage.prototype, "setItem");
     render(<App />);
+    expect(screen.getByText("企业版")).toBeInTheDocument();
     await connect();
     expect(await screen.findByText("来自服务端归档的数据")).toBeInTheDocument();
     expect(screen.getAllByText(/已归档 1 条消息/).length).toBeGreaterThan(0);
     expect(storageSpy).not.toHaveBeenCalled();
+  });
+
+  it("labels encryption collection as planned in enterprise settings", async () => {
+    installApiMock();
+    render(<App />);
+    await connect();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    expect(screen.getByRole("heading", { name: "企业版设置" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "加密收集 · 规划中" })).toBeInTheDocument();
+    expect(screen.getByText(/企业版只接收专属采集端生成的加密数据/)).toBeInTheDocument();
+    expect(screen.queryByText("客户端导入")).not.toBeInTheDocument();
+    expect(screen.getByText(/当前版本尚未开放配置、生成或加密导入/)).toBeInTheDocument();
   });
 
   it("requires a second confirmation for entire archive export", async () => {

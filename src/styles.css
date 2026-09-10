@@ -19,7 +19,7 @@
 * { box-sizing: border-box; }
 html, body, #root { width: 100%; height: 100%; margin: 0; overflow: hidden; }
 body { min-width: 760px; min-height: 560px; }
-body[data-product="client"] { min-width: 440px; min-height: 420px; }
+body[data-product="client"] { min-width: 0; min-height: 0; }
 button, input, select { font: inherit; }
 button { color: inherit; }
 button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid rgba(20, 94, 232, 0.42); outline-offset: 2px; }
@@ -186,7 +186,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .modal-actions { display: flex; justify-content: flex-end; gap: 9px; }
 .toast { position: fixed; z-index: 50; left: 50%; bottom: 24px; transform: translateX(-50%); min-width: 340px; max-width: calc(100vw - 32px); padding: 11px 13px; display: flex; align-items: center; gap: 9px; color: #fff; border-radius: 7px; background: #172b48; box-shadow: 0 12px 30px rgba(17,31,53,.28); font-size: 12px; }
 .toast > svg { flex: none; color: #63d59e; }.toast span { flex: 1; }.toast button { border: 0; color: #fff; cursor: pointer; }.toast-action { flex: none; padding: 6px 9px; border-radius: 5px; background: #2f68bd; font-size: 11px; font-weight: 650; }.toast-action:hover { background: #3977d0; }.toast-close { flex: none; display: grid; place-items: center; padding: 3px; background: transparent; }
-.client-info-backdrop { z-index: 60; }.client-info-dialog { width: min(380px, calc(100vw - 36px)); padding: 25px; text-align: center; }.client-info-dialog .modal-icon { width: 46px; height: 46px; margin-inline: auto; }.client-info-dialog.error .modal-icon { color: #a86312; background: #fff5df; }.client-info-dialog h2 { margin: 17px 0 8px; font-size: 20px; }.client-info-dialog p { min-height: 42px; margin: 0; white-space: pre-line; overflow-wrap: anywhere; line-height: 1.7; }.client-info-dialog .modal-actions { margin-top: 22px; justify-content: center; }
+.client-info-backdrop { inset: 0; z-index: 60; padding: 16px; }
+.client-info-dialog { width: min(380px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; padding: 24px; text-align: center; }
+.client-info-dialog .modal-icon { width: 46px; height: 46px; margin-inline: auto; }.client-info-dialog.error .modal-icon { color: #a86312; background: #fff5df; }.client-info-dialog h2 { margin: 17px 0 8px; font-size: 20px; }.client-info-dialog p { min-height: 42px; max-width: 320px; margin: 0 auto; white-space: pre-line; overflow-wrap: anywhere; line-height: 1.7; }.client-info-dialog .modal-actions { margin-top: 22px; justify-content: center; }
 .import-dialog { width: min(520px, 100%); }
 .file-drop { position: relative; min-height: 84px; margin: 18px 0 12px; padding: 15px; display: flex; align-items: center; gap: 13px; color: var(--blue); border: 1px dashed #91b1e8; border-radius: 8px; background: #f5f9ff; cursor: pointer; }
 .file-drop:hover { border-color: var(--blue); background: #eff5ff; }.file-drop > span { display: grid; gap: 5px; }.file-drop strong { color: #1d2e48; font-size: 12px; }.file-drop small { color: #748197; font-size: 10px; }.file-drop input { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
@@ -218,12 +220,20 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .client-header { padding: 0 28px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); background: #fff; }
 
 .simple-client-shell { height: 100%; display: grid; grid-template-rows: minmax(0, 1fr); background: #f6f8fc; color: var(--ink); }
-.simple-client-main { min-height: 0; display: grid; place-items: center; place-content: center; padding: 10px; overflow-y: auto; }
-.simple-export-card { width: min(370px,100%); padding: 22px; display: grid; justify-items: center; text-align: center; border: 1px solid #dce3ed; border-radius: 13px; background: #fff; box-shadow: 0 13px 36px rgba(29,48,79,.10); }
+.simple-client-main { min-height: 0; display: flex; flex-direction: column; padding: 12px; overflow-y: auto; }
+.simple-export-card { flex-shrink: 0; width: min(370px,100%); margin: auto; padding: 18px 22px; display: grid; justify-items: center; text-align: center; border: 1px solid #dce3ed; border-radius: 13px; background: #fff; box-shadow: 0 13px 36px rgba(29,48,79,.10); }
 .simple-state-icon { width: 48px; height: 48px; display: grid; place-items: center; color: var(--blue); border-radius: 13px; background: var(--blue-soft); }.simple-state-icon svg { width: 23px; height: 23px; }
 .simple-export-card.ready .simple-state-icon { color: #148658; background: #e9f8f1; }.simple-export-card.failed .simple-state-icon { color: #a86312; background: #fff5df; }
 .simple-export-card h1 { margin: 12px 0 4px; font-size: 21px; letter-spacing: -.03em; }.simple-export-card > p { min-height: 30px; margin: 0; color: #68758a; font-size: 10px; line-height: 1.65; word-break: break-word; }
-.simple-result { margin-top: 4px; display: flex; align-items: baseline; gap: 5px; color: #6c788b; font-size: 9px; }.simple-result strong { color: #14243c; font-size: 19px; }.simple-result i { width: 1px; height: 12px; margin: 0 4px; background: #dce2ea; }
+.simple-result { margin-top: 4px; display: flex; flex-wrap: wrap; justify-content: center; align-items: baseline; gap: 5px; color: #6c788b; font-size: 10px; }.simple-result strong { color: #14243c; font-size: 19px; }.simple-result i { width: 1px; height: 12px; margin: 0 4px; background: #dce2ea; }
+.simple-format-field { width: 100%; margin: 12px 0 0; padding: 0; border: 0; text-align: left; }
+.simple-format-field legend { margin-bottom: 7px; color: var(--ink); font-size: 12px; }
+.simple-format-options { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.simple-format-option { min-width: 0; height: 32px; display: flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid #cfd7e3; border-radius: 6px; color: #40506a; background: #fff; cursor: pointer; font-size: 11px; font-weight: 600; }
+.simple-format-option:has(input:checked) { border-color: var(--blue); color: var(--blue); background: var(--blue-soft); box-shadow: inset 0 0 0 1px var(--blue); }
+.simple-format-option input { width: 13px; height: 13px; margin: 0; accent-color: var(--blue); }
+.simple-format-field small { display: block; margin-top: 7px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+@media (max-width: 360px) { .simple-format-options { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .simple-main-button { width: 100%; height: 40px; margin-top: 17px; justify-content: center; }
 .spin { animation: client-spin .9s linear infinite; } @keyframes client-spin { to { transform: rotate(360deg); } }
 

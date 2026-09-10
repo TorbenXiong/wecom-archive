@@ -172,6 +172,8 @@ struct CollectionSummary {
 enum ClientExportFormat {
     Json,
     Csv,
+    Html,
+    Txt,
 }
 
 #[derive(Debug, Serialize)]
@@ -424,6 +426,8 @@ fn export_latest_to_root(
     let extension = match format {
         ClientExportFormat::Json => "json",
         ClientExportFormat::Csv => "csv",
+        ClientExportFormat::Html => "html",
+        ClientExportFormat::Txt => "txt",
     };
     let username = current_username_component();
     let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
@@ -433,6 +437,8 @@ fn export_latest_to_root(
     let result = match format {
         ClientExportFormat::Json => archive_transfer::write_json(&export, &target),
         ClientExportFormat::Csv => archive_transfer::write_csv(&export, &target),
+        ClientExportFormat::Html => archive_transfer::write_html(&export, &target),
+        ClientExportFormat::Txt => archive_transfer::write_txt(&export, &target),
     };
     result.map_err(|_| CommandError {
         code: "CLIENT_EXPORT_FAILED",
@@ -1055,7 +1061,7 @@ fn read_snapshot_export(
                     value => Some(sqlite_value_to_string(value)),
                 };
                 let raw_type = sqlite_value_to_string(row.get_ref(4)?);
-                let content = sqlite_value_to_string(row.get_ref(5)?);
+                let content = sqlite_value_to_bytes(row.get_ref(5)?);
                 Ok((
                     row_id,
                     conversation_id,
@@ -1069,6 +1075,7 @@ fn read_snapshot_export(
         for row in rows {
             let (source_message_id, conversation_id, sender_id, sent_at_unix_ms, raw_type, content) =
                 row.map_err(|_| unsupported_source_schema())?;
+            let payload = readable_message_payload(&raw_type, decode_wecom_body(&content));
             let mut message = normalize(
                 RawMessageRow {
                     source_instance_id: candidate.source_id.clone(),
@@ -1078,7 +1085,7 @@ fn read_snapshot_export(
                     sent_at_unix_ms,
                     outgoing: None,
                     raw_type,
-                    payload: serde_json::json!({"text": content}),
+                    payload,
                     recalled: false,
                 },
                 batch_id,
@@ -1089,8 +1096,57 @@ fn read_snapshot_export(
         }
     }
 
+    let inferred_self_sender_id = infer_self_sender_id(&messages);
+    if let Some(self_sender_id) = inferred_self_sender_id.as_deref() {
+        for message in &mut messages {
+            if message.direction == archive_domain::MessageDirection::Unknown {
+                message.direction = if message.sender_id.as_deref() == Some(self_sender_id) {
+                    archive_domain::MessageDirection::Outgoing
+                } else if message.sender_id.is_some() {
+                    archive_domain::MessageDirection::Incoming
+                } else {
+                    archive_domain::MessageDirection::System
+                };
+            }
+        }
+    }
+
+    let mut display_names = DisplayNameIndex::default();
+    collect_display_names(&connection, &mut display_names);
+    let mut metadata_paths = receipt
+        .copied_files
+        .iter()
+        .filter(|path| {
+            !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("message.db"))
+        })
+        .collect::<Vec<_>>();
+    metadata_paths.sort_by_key(
+        |path| match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) if name.eq_ignore_ascii_case("user.db") => 0,
+            Some(name) if name.eq_ignore_ascii_case("session.db") => 1,
+            _ => 2,
+        },
+    );
+    for metadata_path in metadata_paths {
+        if let Some(metadata) = open_snapshot_metadata_database(metadata_path, key) {
+            collect_display_names(&metadata, &mut display_names);
+        }
+    }
+    for message in &messages {
+        if let (Some(sender_id), Some(name)) = (
+            message.sender_id.as_ref(),
+            payload_display_name(&message.raw_payload),
+        ) {
+            display_names.set_participant(sender_id, name, 30);
+        }
+    }
+
     let mut conversation_participants = BTreeMap::<String, Vec<String>>::new();
     let mut participant_ids = std::collections::BTreeSet::new();
+    let mut outgoing_sender_counts = BTreeMap::<String, usize>::new();
     for message in &messages {
         let members = conversation_participants
             .entry(message.conversation_id.clone())
@@ -1100,22 +1156,90 @@ fn read_snapshot_export(
                 members.push(sender_id.clone());
             }
             participant_ids.insert(sender_id.clone());
+            if message.direction == archive_domain::MessageDirection::Outgoing {
+                *outgoing_sender_counts.entry(sender_id.clone()).or_default() += 1;
+            }
+        }
+        if display_names
+            .participants
+            .contains_key(&message.conversation_id)
+            && !members.contains(&message.conversation_id)
+        {
+            members.push(message.conversation_id.clone());
+            participant_ids.insert(message.conversation_id.clone());
+        }
+    }
+    for (conversation_id, scoped_members) in &display_names.conversation_members {
+        let Some(members) = conversation_participants.get_mut(conversation_id) else {
+            continue;
+        };
+        for member_id in scoped_members.keys() {
+            if !members.iter().any(|member| member == member_id) {
+                members.push(member_id.clone());
+            }
+            participant_ids.insert(member_id.clone());
+        }
+    }
+    let self_sender_id = outgoing_sender_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(sender_id, _)| sender_id)
+        .or(inferred_self_sender_id);
+    for (conversation_id, members) in &mut conversation_participants {
+        let Some(direct_members) = conversation_id.strip_prefix("S:") else {
+            continue;
+        };
+        for member_id in direct_members.split('_') {
+            if member_id.is_empty() {
+                continue;
+            }
+            if !members.iter().any(|member| member == member_id) {
+                members.push(member_id.to_owned());
+            }
+            participant_ids.insert(member_id.to_owned());
         }
     }
     let conversations = conversation_participants
         .into_iter()
-        .map(|(conversation_id, participant_ids)| ConversationV1 {
-            conversation_id,
-            display_name: None,
-            conversation_type: None,
-            participant_ids,
+        .map(|(conversation_id, participant_ids)| {
+            let display_name = display_names
+                .conversations
+                .get(&conversation_id)
+                .or_else(|| display_names.participants.get(&conversation_id))
+                .cloned()
+                .or_else(|| {
+                    direct_conversation_name(
+                        &conversation_id,
+                        self_sender_id.as_deref(),
+                        &display_names.participants,
+                    )
+                });
+            ConversationV1 {
+                conversation_id,
+                display_name,
+                conversation_type: None,
+                participant_ids,
+            }
         })
         .collect::<Vec<_>>();
     let participants = participant_ids
         .into_iter()
         .map(|participant_id| ParticipantV1 {
+            display_name: display_names
+                .participants
+                .get(&participant_id)
+                .cloned()
+                .or_else(|| {
+                    if Some(participant_id.as_str()) == self_sender_id.as_deref() {
+                        None
+                    } else {
+                        preferred_scoped_member_name(
+                            &participant_id,
+                            &display_names.conversation_members,
+                        )
+                    }
+                }),
             participant_id,
-            display_name: None,
             participant_kind: None,
         })
         .collect::<Vec<_>>();
@@ -1169,6 +1293,443 @@ fn read_snapshot_export(
     })
 }
 
+#[derive(Default)]
+struct DisplayNameIndex {
+    participants: BTreeMap<String, String>,
+    participant_priorities: BTreeMap<String, u8>,
+    conversations: BTreeMap<String, String>,
+    conversation_priorities: BTreeMap<String, u8>,
+    conversation_members: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl DisplayNameIndex {
+    fn set_participant(&mut self, id: &str, name: String, priority: u8) {
+        if self
+            .participant_priorities
+            .get(id)
+            .is_none_or(|current| priority >= *current)
+        {
+            self.participants.insert(id.to_owned(), name);
+            self.participant_priorities.insert(id.to_owned(), priority);
+        }
+    }
+}
+
+fn infer_self_sender_id(messages: &[archive_domain::MessageV1]) -> Option<String> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for message in messages {
+        if !seen.insert(&message.conversation_id) {
+            continue;
+        }
+        let Some(members) = message.conversation_id.strip_prefix("S:") else {
+            continue;
+        };
+        for member in members.split('_').filter(|member| !member.is_empty()) {
+            *counts.entry(member.to_owned()).or_default() += 1;
+        }
+    }
+    let mut ranked = counts.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    match ranked.as_slice() {
+        [(sender_id, count), rest @ ..]
+            if rest
+                .first()
+                .is_none_or(|(_, next_count)| count > next_count) =>
+        {
+            Some(sender_id.clone())
+        }
+        _ => None,
+    }
+}
+
+fn direct_conversation_name(
+    conversation_id: &str,
+    self_sender_id: Option<&str>,
+    participants: &BTreeMap<String, String>,
+) -> Option<String> {
+    conversation_id
+        .strip_prefix("S:")?
+        .split('_')
+        .filter(|participant_id| Some(*participant_id) != self_sender_id)
+        .find_map(|participant_id| participants.get(participant_id).cloned())
+}
+
+fn preferred_scoped_member_name(
+    participant_id: &str,
+    conversation_members: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Option<String> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for members in conversation_members.values() {
+        let Some(name) = members.get(participant_id) else {
+            continue;
+        };
+        let Some(name) = clean_display_name(name) else {
+            continue;
+        };
+        *counts.entry(name).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+        .map(|(name, _)| name)
+}
+
+fn open_snapshot_metadata_database(
+    path: &Path,
+    key: Option<&SourceKey>,
+) -> Option<rusqlite::Connection> {
+    if let Ok(connection) = open_source_database(path, None) {
+        return Some(connection);
+    }
+    match key {
+        Some(SourceKey {
+            kind: SourceKeyKind::RawWxSqlite3Key,
+            bytes,
+            ..
+        }) => sqlite3mc::decrypt_raw_wxsqlite3_database(path, bytes)
+            .ok()
+            .and_then(|plain| open_source_database(&plain, None).ok()),
+        Some(key) => open_source_database(path, Some(key)).ok(),
+        None => None,
+    }
+}
+
+fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayNameIndex) {
+    for (table, id_column, name_column, priority) in [
+        ("user_table", "id", "name", 100),
+        ("wechat_contactV1", "wxid", "name", 80),
+        ("USER", "RID", "name", 90),
+    ] {
+        collect_name_rows_priority(
+            connection,
+            table,
+            id_column,
+            name_column,
+            &mut index.participants,
+            &mut index.participant_priorities,
+            priority,
+        );
+    }
+    collect_conversation_member_rows(
+        connection,
+        "conversation_user_table",
+        "conversation_id",
+        "user_id",
+        "nick_name",
+        &mut index.conversation_members,
+    );
+    collect_name_rows_priority(
+        connection,
+        "conversation_table",
+        "id",
+        "name",
+        &mut index.conversations,
+        &mut index.conversation_priorities,
+        100,
+    );
+
+    let Ok(mut statement) = connection.prepare(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    ) else {
+        return;
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+        return;
+    };
+    let tables = rows.filter_map(Result::ok).collect::<Vec<_>>();
+    for table in tables {
+        let normalized_table = normalized_identifier(&table);
+        let columns = table_columns(connection, &table);
+        let name_column = choose_column(
+            &columns,
+            &[
+                "remark_name",
+                "remark",
+                "display_name",
+                "displayname",
+                "nickname",
+                "nick_name",
+                "real_name",
+                "name",
+                "alias",
+            ],
+        );
+        let Some(name_column) = name_column else {
+            continue;
+        };
+        if normalized_table.contains("conversation")
+            && (normalized_table.contains("user") || normalized_table.contains("member"))
+            && let (Some(conversation_column), Some(participant_column)) = (
+                choose_column(
+                    &columns,
+                    &[
+                        "conversation_id",
+                        "conversationid",
+                        "session_id",
+                        "sessionid",
+                    ],
+                ),
+                choose_column(
+                    &columns,
+                    &[
+                        "participant_id",
+                        "user_id",
+                        "userid",
+                        "member_id",
+                        "account_id",
+                        "rid",
+                        "vid",
+                        "wxid",
+                        "username",
+                        "id",
+                    ],
+                ),
+            )
+        {
+            collect_conversation_member_rows(
+                connection,
+                &table,
+                conversation_column,
+                participant_column,
+                name_column,
+                &mut index.conversation_members,
+            );
+            continue;
+        }
+        if [
+            "participant",
+            "contact",
+            "member",
+            "userinfo",
+            "user",
+            "friend",
+            "buddy",
+        ]
+        .iter()
+        .any(|keyword| normalized_table.contains(keyword))
+            && !normalized_table.contains("conversation")
+        {
+            for id_column in choose_identifier_columns(
+                &columns,
+                &[
+                    "participant_id",
+                    "user_id",
+                    "userid",
+                    "member_id",
+                    "account_id",
+                    "rid",
+                    "vid",
+                    "wxid",
+                    "openid",
+                    "open_id",
+                    "username",
+                    "id",
+                ],
+            ) {
+                collect_name_rows_priority(
+                    connection,
+                    &table,
+                    id_column,
+                    name_column,
+                    &mut index.participants,
+                    &mut index.participant_priorities,
+                    20,
+                );
+            }
+        }
+        if !["user", "member"]
+            .iter()
+            .any(|keyword| normalized_table.contains(keyword))
+            && ["conversation", "session", "chat", "room", "group"]
+                .iter()
+                .any(|keyword| normalized_table.contains(keyword))
+            && let Some(id_column) = choose_column(
+                &columns,
+                &[
+                    "conversation_id",
+                    "session_id",
+                    "chat_id",
+                    "room_id",
+                    "group_id",
+                    "id",
+                ],
+            )
+        {
+            collect_name_rows_priority(
+                connection,
+                &table,
+                id_column,
+                name_column,
+                &mut index.conversations,
+                &mut index.conversation_priorities,
+                20,
+            );
+        }
+    }
+}
+
+fn payload_display_name(payload: &serde_json::Value) -> Option<String> {
+    ["sender_name", "display_name", "nickname", "nick_name"]
+        .into_iter()
+        .filter_map(|key| payload.get(key).and_then(serde_json::Value::as_str))
+        .find_map(clean_display_name)
+}
+
+fn clean_display_name(value: &str) -> Option<String> {
+    if value
+        .chars()
+        .any(|character| character.is_control() || character == '\u{fffd}')
+    {
+        return None;
+    }
+    let cleaned = value.trim();
+    (!cleaned.is_empty() && cleaned != "-").then(|| cleaned.chars().take(128).collect())
+}
+
+fn normalized_identifier(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn choose_column<'a>(columns: &'a [String], candidates: &[&str]) -> Option<&'a str> {
+    candidates.iter().find_map(|candidate| {
+        let expected = normalized_identifier(candidate);
+        columns
+            .iter()
+            .find(|column| normalized_identifier(column) == expected)
+            .map(String::as_str)
+    })
+}
+
+fn table_columns(connection: &rusqlite::Connection, table: &str) -> Vec<String> {
+    let sql = format!("PRAGMA table_info({})", quote_identifier(table));
+    let Ok(mut statement) = connection.prepare(&sql) else {
+        return vec![];
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(1)) else {
+        return vec![];
+    };
+    rows.filter_map(Result::ok).collect()
+}
+
+fn collect_name_rows_priority(
+    connection: &rusqlite::Connection,
+    table: &str,
+    id_column: &str,
+    name_column: &str,
+    target: &mut BTreeMap<String, String>,
+    priorities: &mut BTreeMap<String, u8>,
+    priority: u8,
+) {
+    let sql = format!(
+        "SELECT {}, {} FROM {} WHERE {} IS NOT NULL AND {} IS NOT NULL LIMIT 100000",
+        quote_identifier(id_column),
+        quote_identifier(name_column),
+        quote_identifier(table),
+        quote_identifier(id_column),
+        quote_identifier(name_column),
+    );
+    let Ok(mut statement) = connection.prepare(&sql) else {
+        return;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            sqlite_value_to_string(row.get_ref(0)?),
+            sqlite_value_to_string(row.get_ref(1)?),
+        ))
+    }) else {
+        return;
+    };
+    for (id, raw_name) in rows.filter_map(Result::ok) {
+        let id = id.trim();
+        let Some(name) = clean_display_name(&raw_name) else {
+            continue;
+        };
+        if !id.is_empty() && id != name {
+            if priorities
+                .get(id)
+                .is_none_or(|current| priority >= *current)
+            {
+                target.insert(id.to_owned(), name);
+                priorities.insert(id.to_owned(), priority);
+            }
+        }
+    }
+}
+
+fn collect_conversation_member_rows(
+    connection: &rusqlite::Connection,
+    table: &str,
+    conversation_column: &str,
+    participant_column: &str,
+    name_column: &str,
+    target: &mut BTreeMap<String, BTreeMap<String, String>>,
+) {
+    let sql = format!(
+        "SELECT {}, {}, {} FROM {} WHERE {} IS NOT NULL AND {} IS NOT NULL LIMIT 200000",
+        quote_identifier(conversation_column),
+        quote_identifier(participant_column),
+        quote_identifier(name_column),
+        quote_identifier(table),
+        quote_identifier(conversation_column),
+        quote_identifier(participant_column),
+    );
+    let Ok(mut statement) = connection.prepare(&sql) else {
+        return;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            sqlite_value_to_string(row.get_ref(0)?),
+            sqlite_value_to_string(row.get_ref(1)?),
+            sqlite_value_to_string(row.get_ref(2)?),
+        ))
+    }) else {
+        return;
+    };
+    for (conversation_id, participant_id, raw_name) in rows.filter_map(Result::ok) {
+        let conversation_id = conversation_id.trim();
+        let participant_id = participant_id.trim();
+        if conversation_id.is_empty() || participant_id.is_empty() {
+            continue;
+        }
+        let name = clean_display_name(&raw_name).unwrap_or_default();
+        let members = target.entry(conversation_id.to_owned()).or_default();
+        if name.is_empty() {
+            members.entry(participant_id.to_owned()).or_default();
+        } else {
+            members
+                .entry(participant_id.to_owned())
+                .and_modify(|current| {
+                    if current.is_empty() {
+                        *current = name.clone();
+                    }
+                })
+                .or_insert(name);
+        }
+    }
+}
+
+fn choose_identifier_columns<'a>(columns: &'a [String], candidates: &[&str]) -> Vec<&'a str> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let expected = normalized_identifier(candidate);
+            columns
+                .iter()
+                .find(|column| normalized_identifier(column) == expected)
+                .map(String::as_str)
+        })
+        .collect()
+}
+
 fn sqlite_value_to_string(value: rusqlite::types::ValueRef<'_>) -> String {
     match value {
         rusqlite::types::ValueRef::Null => String::new(),
@@ -1178,6 +1739,135 @@ fn sqlite_value_to_string(value: rusqlite::types::ValueRef<'_>) -> String {
             String::from_utf8_lossy(value).into_owned()
         }
     }
+}
+
+fn sqlite_value_to_bytes(value: rusqlite::types::ValueRef<'_>) -> Vec<u8> {
+    match value {
+        rusqlite::types::ValueRef::Null => vec![],
+        rusqlite::types::ValueRef::Integer(value) => value.to_string().into_bytes(),
+        rusqlite::types::ValueRef::Real(value) => value.to_string().into_bytes(),
+        rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
+            value.to_vec()
+        }
+    }
+}
+
+fn decode_wecom_body(raw: &[u8]) -> Option<String> {
+    if let Ok(text) = std::str::from_utf8(raw) {
+        if text
+            .chars()
+            .all(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        {
+            return clean_message_text(text);
+        }
+    }
+    let mut values = Vec::new();
+    parse_protobuf_text(raw, 0, &mut values)?;
+    values.dedup();
+    (!values.is_empty()).then(|| values.into_iter().take(12).collect::<Vec<_>>().join("\n"))
+}
+
+fn readable_message_payload(raw_type: &str, text: Option<String>) -> serde_json::Value {
+    let Some(text) = text else {
+        return serde_json::json!({});
+    };
+    match raw_type.trim() {
+        "15" | "16" => serde_json::json!({"name": text}),
+        "13" => serde_json::json!({"title": text}),
+        _ => serde_json::json!({"text": text}),
+    }
+}
+
+fn parse_protobuf_text(raw: &[u8], depth: usize, values: &mut Vec<String>) -> Option<()> {
+    if raw.is_empty() || depth > 4 {
+        return None;
+    }
+    let mut offset = 0;
+    let mut field_count = 0;
+    while offset < raw.len() {
+        let tag = read_varint(raw, &mut offset)?;
+        if tag == 0 {
+            return None;
+        }
+        field_count += 1;
+        match tag & 7 {
+            0 => {
+                read_varint(raw, &mut offset)?;
+            }
+            1 => offset = offset.checked_add(8)?,
+            2 => {
+                let length = usize::try_from(read_varint(raw, &mut offset)?).ok()?;
+                let end = offset.checked_add(length)?;
+                let segment = raw.get(offset..end)?;
+                offset = end;
+                let mut nested = Vec::new();
+                if parse_protobuf_text(segment, depth + 1, &mut nested).is_some()
+                    && !nested.is_empty()
+                {
+                    for text in nested {
+                        if !values.contains(&text) {
+                            values.push(text);
+                        }
+                    }
+                } else if let Some(text) = readable_protobuf_segment(segment)
+                    && !values.contains(&text)
+                {
+                    values.push(text);
+                }
+            }
+            5 => offset = offset.checked_add(4)?,
+            _ => return None,
+        }
+        if offset > raw.len() {
+            return None;
+        }
+    }
+    (field_count > 0).then_some(())
+}
+
+fn read_varint(raw: &[u8], offset: &mut usize) -> Option<u64> {
+    let mut value = 0_u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *raw.get(*offset)?;
+        *offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn readable_protobuf_segment(raw: &[u8]) -> Option<String> {
+    if raw.contains(&0) {
+        return None;
+    }
+    let text = std::str::from_utf8(raw).ok()?;
+    let text = clean_message_text(text)?;
+    let compact = text
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    if compact.len() >= 32
+        && compact
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(text)
+}
+
+fn clean_message_text(value: &str) -> Option<String> {
+    let cleaned = value
+        .chars()
+        .filter(|character| {
+            *character != '\u{fffd}'
+                && (!character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        })
+        .collect::<String>();
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_owned())
 }
 
 fn sqlite_value_to_i64(value: rusqlite::types::ValueRef<'_>) -> Option<i64> {
@@ -1486,6 +2176,96 @@ mod tests {
     }
 
     #[test]
+    fn maps_known_windows_contact_and_session_tables() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE user_table (id TEXT, name TEXT);
+                 INSERT INTO user_table VALUES ('0000000000000000', '联系人甲');
+                 CREATE TABLE wechat_contactV1 (wxid TEXT, name TEXT);
+                 INSERT INTO wechat_contactV1 VALUES ('wxid_1', '微信联系人');
+                 CREATE TABLE conversation_table (id TEXT, name TEXT);
+                 INSERT INTO conversation_table VALUES ('S:1_2', '项目会话');
+                 CREATE TABLE conversation_user_table (
+                    conversation_id TEXT, user_id TEXT, nick_name TEXT
+                 );
+                 INSERT INTO conversation_user_table VALUES ('R:1', 'group-user', '群成员昵称');
+                 INSERT INTO conversation_user_table VALUES ('R:1', '0000000000000000', '群内别名');",
+            )
+            .unwrap();
+
+        let mut names = DisplayNameIndex::default();
+        collect_display_names(&connection, &mut names);
+
+        assert_eq!(
+            names
+                .participants
+                .get("0000000000000000")
+                .map(String::as_str),
+            Some("联系人甲")
+        );
+        assert_eq!(
+            names
+                .conversation_members
+                .get("R:1")
+                .and_then(|members| members.get("0000000000000000"))
+                .map(String::as_str),
+            Some("群内别名")
+        );
+        assert_eq!(
+            names.participants.get("wxid_1").map(String::as_str),
+            Some("微信联系人")
+        );
+        assert!(!names.participants.contains_key("group-user"));
+        assert_eq!(
+            names
+                .conversation_members
+                .get("R:1")
+                .and_then(|members| members.get("group-user"))
+                .map(String::as_str),
+            Some("群成员昵称")
+        );
+        assert_eq!(
+            names.conversations.get("S:1_2").map(String::as_str),
+            Some("项目会话")
+        );
+        assert!(!names.conversations.contains_key("R:1"));
+        assert_eq!(
+            direct_conversation_name("S:self_0000000000000000", Some("self"), &names.participants)
+                .as_deref(),
+            Some("联系人甲")
+        );
+
+        let session = Connection::open_in_memory().unwrap();
+        session
+            .execute_batch(
+                "CREATE TABLE \"USER\" (RID TEXT, name TEXT);
+                 INSERT INTO \"USER\" VALUES ('0000000000000000', '会话别名');",
+            )
+            .unwrap();
+        collect_display_names(&session, &mut names);
+        assert_eq!(
+            names
+                .participants
+                .get("0000000000000000")
+                .map(String::as_str),
+            Some("联系人甲")
+        );
+    }
+
+    #[test]
+    fn extracts_text_from_protobuf_and_rejects_binary_noise() {
+        let text = "你好，世界";
+        let mut encoded = vec![0x0a, text.len() as u8];
+        encoded.extend_from_slice(text.as_bytes());
+        assert_eq!(decode_wecom_body(&encoded).as_deref(), Some(text));
+        assert_eq!(
+            decode_wecom_body(&[0x1e, 0x08, 0x00, 0x12, 0x1a, 0x0a, 0x18]),
+            None
+        );
+    }
+
+    #[test]
     fn export_filename_starts_with_safe_username_date_and_time() {
         let export_id = uuid::Uuid::nil();
         let username = sanitize_filename_component("熊<测试>/.. ");
@@ -1536,12 +2316,24 @@ mod tests {
             )
             .unwrap();
         drop(connection);
-        for name in ["session.db", "user.db"] {
-            let auxiliary = Connection::open(source_root.join(name)).unwrap();
-            auxiliary
-                .execute_batch("CREATE TABLE fixture (id INTEGER PRIMARY KEY);")
-                .unwrap();
-        }
+        let user = Connection::open(source_root.join("user.db")).unwrap();
+        user.execute_batch(
+            "CREATE TABLE contacts (user_id TEXT PRIMARY KEY, display_name TEXT NOT NULL);
+             INSERT INTO contacts VALUES ('participant-1', '测试成员');",
+        )
+        .unwrap();
+        drop(user);
+        let session = Connection::open(source_root.join("session.db")).unwrap();
+        session
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    conversation_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL
+                 );
+                 INSERT INTO sessions VALUES ('conversation-1', '与测试成员的会话');",
+            )
+            .unwrap();
+        drop(session);
 
         let candidate = WindowsSourceAdapter
             .discover(Some(source_root))
@@ -1563,6 +2355,14 @@ mod tests {
         assert_eq!(
             export.batches[0].messages[0].body_text.as_deref(),
             Some("你好")
+        );
+        assert_eq!(
+            export.participants[0].display_name.as_deref(),
+            Some("测试成员")
+        );
+        assert_eq!(
+            export.conversations[0].display_name.as_deref(),
+            Some("与测试成员的会话")
         );
         let serialized = serde_json::to_string(&export).unwrap();
         assert!(!serialized.contains("private"));

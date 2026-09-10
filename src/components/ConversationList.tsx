@@ -48,7 +48,7 @@ export function ConversationList({ conversations, selectedId, filters, participa
         <label className="media-filter"><input type="checkbox" checked={filters.mediaOnly} onChange={(event) => update("mediaOnly", event.target.checked)} /><span />仅媒体</label>
       </div>
       <div className="conversation-scroll">
-        {visible.length === 0 ? <div className="conversation-empty">尚无会话，请先导入客户端 JSON。</div> : visible.map((conversation) => (
+        {visible.length === 0 ? <div className="conversation-empty">尚无归档数据，请使用企业版专属采集端。</div> : visible.map((conversation) => (
           <button
             aria-current={selectedId === conversation.id ? "true" : undefined}
             className={selectedId === conversation.id ? "conversation-item selected" : "conversation-item"}
