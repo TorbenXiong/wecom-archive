@@ -27,9 +27,11 @@ export interface CollectionSummary {
   contentSha256Prefix: string;
 }
 
+export type ClientExportFormat = "json" | "csv" | "html" | "txt";
+
 export interface ClientExportResult {
   fileName: string;
-  format: "json" | "csv";
+  format: ClientExportFormat;
   messageCount: number;
 }
 
@@ -150,7 +152,7 @@ export const backend = {
     });
   },
 
-  async exportLatest(format: "json" | "csv", selectionHandle: string): Promise<ClientExportResult> {
+  async exportLatest(format: ClientExportFormat, selectionHandle: string): Promise<ClientExportResult> {
     if (!this.isNative()) {
       return { fileName: `client-export-preview.${format}`, format, messageCount: 238 };
     }

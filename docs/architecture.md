@@ -1,20 +1,20 @@
-# 客户端 / 服务端架构
+# 普通版 / 企业版架构
 
 ```text
-Windows 客户端                                  中央服务端
+普通版（个人独立使用）                          企业版专属采集链路（规划中）
 ┌──────────────────────────┐                    ┌──────────────────────────┐
-│ 发现 / 探针 / DPAPI       │                    │ 身份校验 / JSON 导入      │
-│ DB+WAL+SHM 快照           │── client-export ─▶│ 幂等归档 / 修订 / FTS5    │
-│ MessageV1 / 媒体元数据    │                    │ 会话浏览 / 审计 / 富导出  │
-│ 单一 JSON 导出入口        │                    │ JSON / CSV / HTML / PDF   │
+│ 发现 / 探针 / DPAPI       │                    │ 企业版生成专属采集端      │
+│ DB+WAL+SHM 快照           │                    │ 员工授权 / 只读采集       │
+│ MessageV1 / 媒体元数据    │                    │ 加密包 ─▶ 企业版解密归档  │
+│ JSON / CSV / HTML / TXT   │                    │ 会话浏览 / 审计 / 富导出  │
 └──────────────────────────┘                    └──────────────────────────┘
 ```
 
-两端通过版本化 `MessageV1`、`ArchiveBatchV1` 和 `ClientExportV1` 交互。客户端不包含浏览工作台、全文索引或 HTML/PDF 生成器；服务端不接触员工终端源目录和密钥。
+普通版的 JSON 是 `readable-export.v1` 阅读格式，按会话、参与人和消息组织，不携带批次审计、解析器、原始载荷或机器标识，也不用于企业版导入。后续企业版员工收集端使用独立的版本化加密契约。现有 `ClientExportV1` 校验代码暂时作为内部兼容实现保留，不在企业版产品界面开放。
 
 ## 客户端链路
 
-React 仅调用白名单 Tauri commands。`source-windows` 负责默认目录/手选目录探测、可信进程隔离探针、DPAPI 和 DB/WAL/SHM 一致性快照；`parser` 生成 `MessageV1`；`media-store` 记录 SHA-256 媒体元数据；`transfer` 生成 JSON（并保留内部兼容 CSV writer）。
+React 仅调用白名单 Tauri commands。`source-windows` 负责默认目录/手选目录探测、可信进程隔离探针、DPAPI 和 DB/WAL/SHM 一致性快照；`parser` 生成 `MessageV1`；`media-store` 记录 SHA-256 媒体元数据；`transfer` 生成 JSON、CSV、HTML、TXT。HTML 对消息、名称和媒体引用转义，CSP 禁止脚本及外部资源；CSV 防公式注入。
 
 客户端在 exe 同级 `userData/` 保存 DPAPI 密钥、脱敏诊断和临时工作区。导出时系统目录选择器默认打开 `userData/exports/`，最终写入用户选择的目录。源文件始终只读；快照不一致时返回可恢复错误并清理临时目录。程序目录不可写时返回 `PORTABLE_ROOT_NOT_WRITABLE`，不静默回退 `%LOCALAPPDATA%`。
 
@@ -22,15 +22,17 @@ React 仅调用白名单 Tauri commands。`source-windows` 负责默认目录/�
 
 服务端将网页资源嵌入 `WeComArchiveServer.exe`，默认仅监听 `127.0.0.1:8787`。导入顺序为：请求体限制 → 身份校验 → schema/关系校验 → 计数与 SHA-256 校验 → 按源消息 ID 幂等合并 → 导入审计。SQLite/FTS5 提供会话、参与人、消息、修订、媒体和审计查询。
 
-## `ClientExportV1`
+## 普通版导出 JSON
 
-JSON 固定包含 schema 版本、导出 ID、客户端版本、批次授权/同意证据、采集范围、游标、消息/媒体计数和确定性 SHA-256。媒体首期只携带名称、MIME、大小、内容哈希及缺失原因，不写入本地绝对路径或二进制。CSV 是人工查看的扁平格式，不支持回灌。
+普通版 JSON 固定包含格式版本、导出时间、消息/会话计数、会话名称、参与人名称，以及消息的发送者、方向、时间、类型、正文和媒体摘要。它不写入会话 ID、参与人 ID、发送者 ID、批次、授权证据、游标、解析器版本、原始载荷、本地绝对路径或媒体二进制。JSON、CSV、HTML、TXT 均为个人阅读格式，不用于企业版导入。
 
 ## 生命周期
 
 1. 自动发现并隔离读取源数据，复制一致性快照。
 2. 验证候选密钥和数据库结构，归一化消息并关联媒体。
-3. 生成 JSON `.partial`，成功后原子改名并允许用户导入服务端。
-4. 服务端校验后幂等入库，变化内容写入新 revision，不覆盖历史证据。
+3. 按选择的格式写入独占 `.partial`，同步落盘后通过硬链接原子发布并清理临时名，避免并发覆盖目标。此流程要求目标文件系统支持硬链接（例如 NTFS），不支持时安全失败，不退回覆盖式写入。
+4. 用户在本地直接查看或保存导出结果。
 
 未来上传可采用每批随机 DEK、AES-256-GCM 分块、服务端公钥封装和幂等续传；默认构建不开放网络 capability。
+
+企业版离线加密收集规划见 [`enterprise-collection-plan.md`](enterprise-collection-plan.md)，当前没有加密配置、员工收集端生成或密文导入实现。
