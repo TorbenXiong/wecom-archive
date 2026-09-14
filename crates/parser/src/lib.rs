@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PARSER_VERSION: &str = "windows-message-parser/0.0.1";
+pub const PARSER_VERSION: &str = "windows-message-parser/0.1.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawMessageRow {

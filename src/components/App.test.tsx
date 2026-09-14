@@ -35,6 +35,9 @@ function installApiMock() {
         raw_type: "text",
       }]);
     }
+    if (url.includes("/enterprise/config")) {
+      return Response.json({ configured: false, organizationId: "org-1", organizationName: "", collectionNotice: "加密传输本机企业微信聊天记录到服务端", keyId: "key-1" });
+    }
     return Response.json({}, { status: 404 });
   }));
 }
@@ -62,16 +65,20 @@ describe("archive workspace", () => {
     expect(storageSpy).not.toHaveBeenCalled();
   });
 
-  it("labels encryption collection as planned in enterprise settings", async () => {
+  it("separates server configuration and exposes key and token controls", async () => {
     installApiMock();
     render(<App />);
     await connect();
-    fireEvent.click(screen.getByRole("button", { name: "设置" }));
-    expect(screen.getByRole("heading", { name: "企业版设置" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "加密收集 · 规划中" })).toBeInTheDocument();
-    expect(screen.getByText(/企业版只接收专属采集端生成的加密数据/)).toBeInTheDocument();
-    expect(screen.queryByText("客户端导入")).not.toBeInTheDocument();
-    expect(screen.getByText(/当前版本尚未开放配置、生成或加密导入/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "服务端配置" }));
+    expect(await screen.findByLabelText("员工告知内容")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("加密传输本机企业微信聊天记录到服务端")).toBeInTheDocument();
+    expect(screen.queryByText("采集前向员工展示，请清晰说明用途和范围。")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "采集端配置" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "生成采集端" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新生成密钥" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "随机重新生成" })).toBeInTheDocument();
+    expect(screen.getByDisplayValue(accessToken)).toBeInTheDocument();
+    expect(screen.getByText("导入加密包")).toBeInTheDocument();
   });
 
   it("requires a second confirmation for entire archive export", async () => {
@@ -82,5 +89,14 @@ describe("archive workspace", () => {
     fireEvent.click(screen.getByText("开始导出"));
     expect(screen.getByRole("heading", { name: "确认导出全部档案" })).toBeInTheDocument();
     expect(screen.getByText("ZIP 包")).toBeInTheDocument();
+  });
+
+  it("does not expose service shutdown to browser sessions", async () => {
+    installApiMock();
+    render(<App />);
+    await connect();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    expect(await screen.findByRole("heading", { name: "关于" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "退出企业版" })).not.toBeInTheDocument();
   });
 });

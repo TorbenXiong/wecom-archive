@@ -58,6 +58,22 @@ interface ServerImportResult {
   revised: number;
 }
 
+export interface EnterpriseConfig {
+  configured: boolean;
+  organizationId: string;
+  organizationName: string;
+  collectionNotice: string;
+  keyId: string;
+}
+
+export interface CollectorResult {
+  fileName: string;
+  organizationId: string;
+  keyId: string;
+  artifact: string;
+  executableGenerated: boolean;
+}
+
 export interface ServerExportRequest {
   scope: "current_conversation" | "current_filter" | "entire_archive";
   format: "json" | "csv" | "html" | "pdf";
@@ -122,6 +138,48 @@ export async function importClientJson(file: File, token: string): Promise<Serve
   return request<ServerImportResult>("/api/v1/imports/json", token, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    body: file,
+  });
+}
+
+export function getEnterpriseConfig(token: string): Promise<EnterpriseConfig> {
+  return request<EnterpriseConfig>("/api/v1/enterprise/config", token);
+}
+
+export function updateServerAccessToken(currentToken: string, accessToken: string): Promise<{ updated: boolean }> {
+  return request<{ updated: boolean }>("/api/v1/server/access-token", currentToken, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ accessToken }),
+  });
+}
+
+export function regenerateServerAccessToken(currentToken: string): Promise<{ accessToken: string }> {
+  return request<{ accessToken: string }>("/api/v1/server/access-token/regenerate", currentToken, {
+    method: "POST",
+  });
+}
+
+export function updateEnterpriseConfig(token: string, config: { organizationName: string; collectionNotice: string; keyId?: string }): Promise<EnterpriseConfig> {
+  return request<EnterpriseConfig>("/api/v1/enterprise/config", token, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(config),
+  });
+}
+
+export function rotateEnterpriseKey(token: string): Promise<EnterpriseConfig> {
+  return request<EnterpriseConfig>("/api/v1/enterprise/key/rotate", token, { method: "POST" });
+}
+
+export function generateEnterpriseCollector(token: string): Promise<CollectorResult> {
+  return request<CollectorResult>("/api/v1/enterprise/collectors", token, { method: "POST" });
+}
+
+export async function importEnterprisePackage(file: File, token: string): Promise<ServerImportResult> {
+  return request<ServerImportResult>("/api/v1/imports/enterprise", token, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
     body: file,
   });
 }

@@ -17,8 +17,8 @@
 
 - 当前提供中央归档浏览、检索、审计和富格式导出能力。
 - 提供会话浏览、全文检索、组合筛选、媒体完整性和 JSON/CSV/HTML/PDF/ZIP 导出。
-- 单节点首期默认监听 `127.0.0.1:8787`，网页资源编译进单一 `WeComArchiveServer.exe`。
-- 加密配置、生成员工收集端、加密数据导入解密属于后续规划，当前尚未开放。详见 [`docs/enterprise-collection-plan.md`](docs/enterprise-collection-plan.md)。
+- 企业版发布包只包含 `WeComArchiveEnterprise.exe`。程序在同一进程中运行桌面窗口与本机服务；服务监听 `127.0.0.1:8787`，可同时使用浏览器访问。
+- 支持配置组织与员工告知文案、生成带企业配置的 Windows 采集端、导入离线 `.wca` 加密包并在服务端解密入库。采集端配置由服务端 RSA-PSS-SHA256 签名并在启动时验证；采集端使用 Windows CNG 的 RSA-OAEP-SHA256 + AES-256-GCM 混合加密，解密私钥只保存在服务端 DPAPI 保护的数据目录。
 
 ## 工程结构
 
@@ -48,14 +48,13 @@ pnpm build:server
 cargo test --workspace --locked
 ```
 
-服务端示例（PowerShell）：
+服务端开发启动示例（PowerShell）：
 
 ```powershell
-$env:WECOM_ARCHIVE_SERVER_TOKEN = "请替换为至少24字节的随机令牌"
 cargo run -p wecom-archive-server --locked
 ```
 
-浏览器打开 `http://127.0.0.1:8787`，输入同一令牌后进入企业版工作台。
+发布包中直接运行 `WeComArchiveEnterprise.exe` 即可打开独立桌面窗口，不显示控制台，也不会预先创建临时小窗口。关闭桌面窗口时，同一进程内的本机服务会安全退出；程序运行期间也可用浏览器访问 `http://127.0.0.1:8787`，浏览器页面不具备停服能力。首次启动会随机生成访问令牌并通过 Windows DPAPI 持久化到 `serverData/access-token.dpapi`；无需环境变量，当前值、复制、手动修改和随机重新生成均位于“服务端配置”。企业密钥也可在该页面重新生成；只有实际生成过采集端的旧密钥才会保留，用于继续解密这些采集端生成的数据。生成采集端时，程序复制自身并附加使用当前企业密钥的签名配置；采集端启动后自动进入离线采集模式。
 
 ## 安全边界
 

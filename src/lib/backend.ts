@@ -27,7 +27,7 @@ export interface CollectionSummary {
   contentSha256Prefix: string;
 }
 
-export type ClientExportFormat = "json" | "csv" | "html" | "txt";
+export type ClientExportFormat = "json" | "csv" | "html" | "txt" | "wca";
 
 export interface ClientExportResult {
   fileName: string;
@@ -79,6 +79,7 @@ const browserBootstrap: BootstrapState = {
   automaticRefresh: true,
   runtimeNetworkEnabled: false,
   implementationStage: "browser-preview",
+  enterpriseMode: false,
 };
 
 export const backend = {

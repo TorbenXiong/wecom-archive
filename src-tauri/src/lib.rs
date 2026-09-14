@@ -23,7 +23,7 @@ use zeroize::{Zeroize, Zeroizing};
 mod sqlite3mc;
 
 const LOCAL_NOTICE_VERSION: &str = "client-notice.v1";
-const LOCAL_NOTICE_TEXT: &str = "仅处理您有权归档的数据。";
+const LOCAL_NOTICE_TEXT: &str = "加密传输本机企业微信聊天记录到服务端";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +34,23 @@ struct BootstrapResponse {
     automatic_refresh: bool,
     runtime_network_enabled: bool,
     implementation_stage: &'static str,
+    enterprise_mode: bool,
+    organization_name: Option<String>,
+    collection_notice: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnterpriseCollectorConfig {
+    schema_version: String,
+    organization_id: String,
+    organization_name: String,
+    collection_notice: String,
+    key_id: String,
+    public_key_hex: String,
+    signing_public_key_hex: String,
+    signature_hex: String,
+    offline_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -197,6 +214,7 @@ struct AppState {
 fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapResponse, CommandError> {
     let portable_root = selected_portable_root(&state)?;
     let writable = verify_portable_root(&portable_root).is_ok();
+    let enterprise = load_enterprise_collector_config().ok();
     Ok(BootstrapResponse {
         source_key_saved: portable_root
             .join("secrets")
@@ -206,7 +224,16 @@ fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapResponse, CommandErr
         portable_root_writable: writable,
         automatic_refresh: false,
         runtime_network_enabled: false,
-        implementation_stage: "windows-archive-mvp",
+        implementation_stage: if enterprise.is_some() {
+            "enterprise-collector-v1"
+        } else {
+            "windows-archive-mvp"
+        },
+        enterprise_mode: enterprise.is_some(),
+        organization_name: enterprise
+            .as_ref()
+            .map(|config| config.organization_name.clone()),
+        collection_notice: enterprise.map(|config| config.collection_notice),
     })
 }
 
@@ -423,6 +450,9 @@ fn export_latest_to_root(
             recoverable: true,
         })?;
     verify_export_root(&target_root)?;
+    if let Ok(config) = load_enterprise_collector_config() {
+        return export_enterprise_to_root(&export, &config, target_root);
+    }
     let extension = match format {
         ClientExportFormat::Json => "json",
         ClientExportFormat::Csv => "csv",
@@ -452,6 +482,145 @@ fn export_latest_to_root(
     Ok(ClientExportResult {
         file_name,
         format: extension,
+        message_count: export.message_count,
+    })
+}
+
+fn load_enterprise_collector_config() -> Result<EnterpriseCollectorConfig, CommandError> {
+    let executable = std::env::current_exe().map_err(|_| internal_error())?;
+    let directory = executable.parent().ok_or_else(internal_error)?;
+    let executable_name = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(internal_error)?;
+    let path = directory.join(format!("{executable_name}.wca-collector"));
+    let bytes = fs::read(path).map_err(|_| CommandError {
+        code: "ENTERPRISE_CONFIG_MISSING",
+        message: "未找到企业采集配置。".into(),
+        recoverable: false,
+    })?;
+    let config: EnterpriseCollectorConfig =
+        serde_json::from_slice(&bytes).map_err(|_| CommandError {
+            code: "ENTERPRISE_CONFIG_INVALID",
+            message: "企业采集配置无效。".into(),
+            recoverable: false,
+        })?;
+    let key = hex::decode(&config.public_key_hex).map_err(|_| CommandError {
+        code: "ENTERPRISE_CONFIG_INVALID",
+        message: "企业采集配置中的加密密钥无效。".into(),
+        recoverable: false,
+    })?;
+    let signing_public_key =
+        hex::decode(&config.signing_public_key_hex).map_err(|_| CommandError {
+            code: "ENTERPRISE_CONFIG_INVALID",
+            message: "企业采集配置中的签名公钥无效。".into(),
+            recoverable: false,
+        })?;
+    let signature = hex::decode(&config.signature_hex).map_err(|_| CommandError {
+        code: "ENTERPRISE_CONFIG_INVALID",
+        message: "企业采集配置中的签名无效。".into(),
+        recoverable: false,
+    })?;
+    let signing_payload = format!(
+        "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        config.organization_id,
+        config.organization_name,
+        config.collection_notice,
+        config.key_id,
+        config.public_key_hex,
+        "aes-256-gcm+rsa-oaep-sha256"
+    );
+    source_windows::enterprise_crypto::verify(
+        &signing_public_key,
+        signing_payload.as_bytes(),
+        &signature,
+    )
+    .map_err(|_| CommandError {
+        code: "ENTERPRISE_CONFIG_SIGNATURE_INVALID",
+        message: "企业采集配置签名校验失败。".into(),
+        recoverable: false,
+    })?;
+    if config.schema_version != "enterprise-collector.v1"
+        || config.organization_id.trim().is_empty()
+        || config.organization_name.trim().is_empty()
+        || config.collection_notice.trim().is_empty()
+        || config.key_id.trim().is_empty()
+        || !config.offline_only
+        || key.len() < 64
+    {
+        return Err(CommandError {
+            code: "ENTERPRISE_CONFIG_INVALID",
+            message: "企业采集配置不完整或不允许离线运行。".into(),
+            recoverable: false,
+        });
+    }
+    Ok(config)
+}
+
+fn export_enterprise_to_root(
+    export: &ClientExportV1,
+    config: &EnterpriseCollectorConfig,
+    target_root: PathBuf,
+) -> Result<ClientExportResult, CommandError> {
+    verify_export_root(&target_root)?;
+    let public_key = hex::decode(&config.public_key_hex).map_err(|_| internal_error())?;
+    let plaintext = Zeroizing::new(serde_json::to_vec(export).map_err(|_| internal_error())?);
+    let encrypted =
+        source_windows::enterprise_crypto::encrypt(&public_key, &plaintext).map_err(|_| {
+            CommandError {
+                code: "ENTERPRISE_ENCRYPTION_FAILED",
+                message: "企业加密包生成失败；不会降级为明文导出。".into(),
+                recoverable: true,
+            }
+        })?;
+    let package = archive_transfer::create_enterprise_package(
+        export,
+        &config.organization_id,
+        &config.key_id,
+        &encrypted.wrapped_dek,
+        &encrypted.nonce,
+        &encrypted.ciphertext,
+        &encrypted.tag,
+    )
+    .map_err(|_| CommandError {
+        code: "ENTERPRISE_ENCRYPTION_FAILED",
+        message: "企业加密包生成失败；不会降级为明文导出。".into(),
+        recoverable: true,
+    })?;
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let file_name = format!(
+        "enterprise-collection-{timestamp}-{}.wca",
+        export.export_id.simple()
+    );
+    let target = target_root.join(&file_name);
+    let partial = target.with_extension("wca.partial");
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&partial)
+        .map_err(|_| CommandError {
+            code: "CLIENT_EXPORT_FAILED",
+            message: "无法创建企业加密包。".into(),
+            recoverable: true,
+        })?;
+    if output.write_all(&package).is_err() || output.sync_all().is_err() {
+        drop(output);
+        let _ = fs::remove_file(&partial);
+        return Err(CommandError {
+            code: "CLIENT_EXPORT_FAILED",
+            message: "企业加密包写入失败，临时文件已清理。".into(),
+            recoverable: true,
+        });
+    }
+    drop(output);
+    fs::rename(&partial, &target).map_err(|_| CommandError {
+        code: "CLIENT_EXPORT_FAILED",
+        message: "企业加密包无法原子完成。".into(),
+        recoverable: true,
+    })?;
+    Ok(ClientExportResult {
+        file_name,
+        format: "wca",
         message_count: export.message_count,
     })
 }
@@ -2110,6 +2279,20 @@ pub fn run_key_probe() -> i32 {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .setup(|app| {
+            tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title("企业微信记录归档")
+            .inner_size(440.0, 360.0)
+            .min_inner_size(420.0, 340.0)
+            .resizable(true)
+            .center()
+            .build()?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             discover_sources,

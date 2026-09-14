@@ -8,7 +8,7 @@ use archive_domain::{
     ParticipantV1,
 };
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -29,6 +29,121 @@ pub enum TransferError {
     Json(#[from] serde_json::Error),
     #[error("client export CSV failed: {0}")]
     Csv(#[from] csv::Error),
+    #[error("enterprise package is invalid")]
+    InvalidEnterprisePackage,
+    #[error("enterprise package authentication failed")]
+    EnterpriseAuthenticationFailed,
+    #[error("enterprise package organization or key mismatch")]
+    EnterpriseKeyMismatch,
+}
+
+pub const ENTERPRISE_PACKAGE_SCHEMA_VERSION: &str = "enterprise-package.v1";
+
+/// Offline authenticated package used by an enterprise-generated collector.
+/// The package deliberately wraps the unchanged ClientExportV1 JSON so the
+/// server can decrypt it and reuse the existing validation and ingest path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnterprisePackageV1 {
+    pub schema_version: String,
+    pub organization_id: String,
+    pub key_id: String,
+    pub export_id: Uuid,
+    pub encryption: String,
+    pub wrapped_dek_hex: String,
+    pub nonce_hex: String,
+    pub ciphertext_hex: String,
+    pub plaintext_sha256: String,
+    pub authentication_tag_hex: String,
+}
+
+pub fn create_enterprise_package(
+    export: &ClientExportV1,
+    organization_id: &str,
+    key_id: &str,
+    wrapped_dek: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    authentication_tag: &[u8],
+) -> Result<Vec<u8>, TransferError> {
+    export.validate()?;
+    if organization_id.trim().is_empty()
+        || key_id.trim().is_empty()
+        || wrapped_dek.is_empty()
+        || nonce.len() != 12
+        || ciphertext.is_empty()
+        || authentication_tag.len() != 16
+    {
+        return Err(TransferError::InvalidEnterprisePackage);
+    }
+    let plaintext = serde_json::to_vec(export)?;
+    let plaintext_sha256 = hex::encode(Sha256::digest(&plaintext));
+    let package = EnterprisePackageV1 {
+        schema_version: ENTERPRISE_PACKAGE_SCHEMA_VERSION.into(),
+        organization_id: organization_id.into(),
+        key_id: key_id.into(),
+        export_id: export.export_id,
+        encryption: "aes-256-gcm+rsa-oaep-sha256".into(),
+        wrapped_dek_hex: hex::encode(wrapped_dek),
+        nonce_hex: hex::encode(nonce),
+        ciphertext_hex: hex::encode(ciphertext),
+        plaintext_sha256,
+        authentication_tag_hex: hex::encode(authentication_tag),
+    };
+    Ok(serde_json::to_vec(&package)?)
+}
+
+pub fn parse_enterprise_package(
+    package_bytes: &[u8],
+    expected_organization_id: &str,
+    expected_key_id: &str,
+) -> Result<EnterprisePackageV1, TransferError> {
+    let package =
+        parse_enterprise_package_for_organization(package_bytes, expected_organization_id)?;
+    if package.key_id != expected_key_id {
+        return Err(TransferError::EnterpriseKeyMismatch);
+    }
+    Ok(package)
+}
+
+pub fn parse_enterprise_package_for_organization(
+    package_bytes: &[u8],
+    expected_organization_id: &str,
+) -> Result<EnterprisePackageV1, TransferError> {
+    let package: EnterprisePackageV1 = serde_json::from_slice(package_bytes)
+        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
+    if package.schema_version != ENTERPRISE_PACKAGE_SCHEMA_VERSION
+        || package.encryption != "aes-256-gcm+rsa-oaep-sha256"
+        || package.organization_id != expected_organization_id
+    {
+        return Err(TransferError::EnterpriseKeyMismatch);
+    }
+    let wrapped_dek = hex::decode(&package.wrapped_dek_hex)
+        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
+    let nonce =
+        hex::decode(&package.nonce_hex).map_err(|_| TransferError::InvalidEnterprisePackage)?;
+    let ciphertext = hex::decode(&package.ciphertext_hex)
+        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
+    let tag = hex::decode(&package.authentication_tag_hex)
+        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
+    if wrapped_dek.is_empty() || nonce.len() != 12 || ciphertext.is_empty() || tag.len() != 16 {
+        return Err(TransferError::InvalidEnterprisePackage);
+    }
+    Ok(package)
+}
+
+pub fn validate_enterprise_plaintext(
+    package: &EnterprisePackageV1,
+    plaintext: &[u8],
+) -> Result<ClientExportV1, TransferError> {
+    if hex::encode(Sha256::digest(&plaintext)) != package.plaintext_sha256 {
+        return Err(TransferError::EnterpriseAuthenticationFailed);
+    }
+    let export: ClientExportV1 = serde_json::from_slice(&plaintext)?;
+    if export.export_id != package.export_id {
+        return Err(TransferError::InvalidEnterprisePackage);
+    }
+    export.validate()?;
+    Ok(export)
 }
 
 pub fn create_export(

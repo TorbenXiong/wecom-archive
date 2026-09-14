@@ -67,6 +67,9 @@ export interface BootstrapState {
   automaticRefresh: boolean;
   runtimeNetworkEnabled: boolean;
   implementationStage: string;
+  enterpriseMode: boolean;
+  organizationName?: string;
+  collectionNotice?: string;
 }
 
 export interface FilterState {
