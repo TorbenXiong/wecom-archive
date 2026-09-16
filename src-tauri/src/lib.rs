@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -12,7 +12,7 @@ use archive_domain::{
     ExternalContactConsent, MediaIntegrity, MessageType, ParticipantV1, RetentionDirective,
     SourceAdapter, SourceCandidate, SourceCapability,
 };
-use chrono::{Local, Utc};
+use chrono::{Local, TimeZone, Utc};
 use message_parser::{RawMessageRow, normalize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,17 +23,37 @@ use zeroize::{Zeroize, Zeroizing};
 mod sqlite3mc;
 
 const LOCAL_NOTICE_VERSION: &str = "client-notice.v1";
-const LOCAL_NOTICE_TEXT: &str = "仅处理您有权归档的数据。";
+const LOCAL_NOTICE_TEXT: &str = "加密传输本机企业微信聊天记录到服务端";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BootstrapResponse {
-    portable_root: String,
-    portable_root_writable: bool,
-    source_key_saved: bool,
-    automatic_refresh: bool,
-    runtime_network_enabled: bool,
-    implementation_stage: &'static str,
+    organization_name: Option<String>,
+    collection_notice: Option<String>,
+    offline_export_enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnterpriseCollectorConfig {
+    schema_version: String,
+    organization_id: String,
+    organization_name: String,
+    collection_notice: String,
+    key_id: String,
+    public_key_hex: String,
+    signing_public_key_hex: String,
+    signature_hex: String,
+    upload_url: String,
+    upload_token: String,
+    #[serde(default)]
+    include_files: bool,
+    #[serde(default)]
+    include_images: bool,
+    #[serde(default)]
+    data_redaction: bool,
+    #[serde(default)]
+    offline_export_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,32 +82,16 @@ struct SafeSourceDatabase {
     page_size_hint: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum DirectoryPurpose {
-    Source,
-    Export,
-    PortableRoot,
-}
-
-#[derive(Debug)]
-struct DirectoryGrant {
-    path: PathBuf,
-    purpose: DirectoryPurpose,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SafeDirectorySelection {
-    handle: String,
-    display_path: String,
-}
-
 #[derive(Debug)]
 struct CollectionAuthorization {
     notice_version: String,
     notice_displayed_at: chrono::DateTime<Utc>,
-    remember_key: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MediaCollectionOptions {
+    include_files: bool,
+    include_images: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -167,46 +171,33 @@ struct CollectionSummary {
     content_sha256_prefix: String,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ClientExportFormat {
-    Json,
-    Csv,
-    Html,
-    Txt,
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadResult {
+    message_count: u64,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ClientExportResult {
+struct OfflineExportResult {
     file_name: String,
-    format: &'static str,
+    directory: String,
     message_count: u64,
 }
 
 #[derive(Default)]
 struct AppState {
-    portable_root_override: Mutex<Option<PathBuf>>,
     discovered_sources: Mutex<BTreeMap<String, SourceCandidate>>,
-    directory_grants: Mutex<BTreeMap<String, DirectoryGrant>>,
     latest_export: Mutex<Option<ClientExportV1>>,
-    last_export_root: Mutex<Option<PathBuf>>,
 }
 
 #[tauri::command]
-fn bootstrap(state: State<'_, AppState>) -> Result<BootstrapResponse, CommandError> {
-    let portable_root = selected_portable_root(&state)?;
-    let writable = verify_portable_root(&portable_root).is_ok();
+fn bootstrap() -> Result<BootstrapResponse, CommandError> {
+    let config = load_enterprise_collector_config()?;
     Ok(BootstrapResponse {
-        source_key_saved: portable_root
-            .join("secrets")
-            .join("source-keys.dpapi")
-            .is_file(),
-        portable_root: redacted_path(&portable_root),
-        portable_root_writable: writable,
-        automatic_refresh: false,
-        runtime_network_enabled: false,
-        implementation_stage: "windows-archive-mvp",
+        organization_name: Some(config.organization_name),
+        collection_notice: Some(config.collection_notice),
+        offline_export_enabled: config.offline_export_enabled,
     })
 }
 
@@ -223,84 +214,6 @@ fn discover_sources(state: State<'_, AppState>) -> Result<Vec<SafeSourceCandidat
 }
 
 #[tauri::command]
-fn pick_directory(
-    state: State<'_, AppState>,
-    purpose: DirectoryPurpose,
-) -> Result<Option<SafeDirectorySelection>, CommandError> {
-    let initial_folder = if purpose == DirectoryPurpose::Export {
-        let root = selected_portable_root(&state)?.join("exports");
-        fs::create_dir_all(&root).ok();
-        Some(root)
-    } else {
-        None
-    };
-    #[cfg(windows)]
-    let selected =
-        source_windows::dialog::pick_folder(initial_folder).map_err(|_| CommandError {
-            code: "DIRECTORY_PICKER_FAILED",
-            message: "无法打开系统目录选择器。".into(),
-            recoverable: true,
-        })?;
-    #[cfg(not(windows))]
-    let selected: Option<PathBuf> = None;
-
-    let Some(path) = selected else {
-        return Ok(None);
-    };
-    let path = path.canonicalize().map_err(|_| CommandError {
-        code: "DIRECTORY_UNAVAILABLE",
-        message: "所选目录不可用。".into(),
-        recoverable: true,
-    })?;
-    let handle = uuid::Uuid::new_v4().to_string();
-    state
-        .directory_grants
-        .lock()
-        .map_err(|_| internal_error())?
-        .insert(
-            handle.clone(),
-            DirectoryGrant {
-                path: path.clone(),
-                purpose,
-            },
-        );
-    Ok(Some(SafeDirectorySelection {
-        handle,
-        display_path: redacted_path(&path),
-    }))
-}
-
-#[tauri::command]
-fn discover_selected_source(
-    state: State<'_, AppState>,
-    selection_handle: String,
-) -> Result<Vec<SafeSourceCandidate>, CommandError> {
-    let root = consume_directory_grant(&state, &selection_handle, DirectoryPurpose::Source)?;
-    let candidates = WindowsSourceAdapter
-        .discover(Some(root))
-        .map_err(|error| CommandError {
-            code: "SOURCE_DISCOVERY_FAILED",
-            message: sanitize_error(&error.to_string()),
-            recoverable: true,
-        })?;
-    store_candidates(&state, candidates)
-}
-
-#[tauri::command]
-fn set_portable_root(
-    state: State<'_, AppState>,
-    selection_handle: String,
-) -> Result<BootstrapResponse, CommandError> {
-    let root = consume_directory_grant(&state, &selection_handle, DirectoryPurpose::PortableRoot)?;
-    verify_portable_root(&root)?;
-    *state
-        .portable_root_override
-        .lock()
-        .map_err(|_| internal_error())? = Some(root);
-    bootstrap(state)
-}
-
-#[tauri::command]
 async fn collect_source(
     state: State<'_, AppState>,
     source_id: String,
@@ -308,7 +221,6 @@ async fn collect_source(
     let authorization = CollectionAuthorization {
         notice_version: LOCAL_NOTICE_VERSION.into(),
         notice_displayed_at: Utc::now(),
-        remember_key: true,
     };
     let candidate = state
         .discovered_sources
@@ -321,27 +233,31 @@ async fn collect_source(
             message: "数据源授权已失效，请重新发现。".into(),
             recoverable: true,
         })?;
-    let root = selected_portable_root(&state)?;
-    verify_portable_root(&root)?;
+    let config = load_enterprise_collector_config()?;
+    let media_options = MediaCollectionOptions {
+        include_files: config.include_files,
+        include_images: config.include_images,
+    };
+    let root =
+        std::env::temp_dir().join(format!("wecom-archive-collector-{}", uuid::Uuid::new_v4()));
     let encrypted = candidate
         .databases
         .iter()
         .any(|database| database.encrypted);
-    let key = resolve_collection_key(&root, &candidate, encrypted)?;
-    let remember_key = encrypted && authorization.remember_key && key.is_some();
-    let saved_source_id = candidate.source_id.clone();
+    let key = resolve_collection_key(&candidate, encrypted)?;
     let work_root = root.join("work");
-    let (result, key) = tauri::async_runtime::spawn_blocking(move || {
-        let result = collect_candidate(candidate, work_root, key.as_ref(), authorization);
-        (result, key)
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        collect_candidate_with_options(
+            candidate,
+            work_root,
+            key.as_ref(),
+            authorization,
+            media_options,
+        )
     })
     .await
     .map_err(|_| internal_error())?;
     let export = result?;
-    if remember_key {
-        let key = key.as_ref().ok_or_else(internal_error)?;
-        store_saved_key(&root, &saved_source_id, key)?;
-    }
     let summary = CollectionSummary {
         export_id: export.export_id.to_string(),
         generated_at: export.generated_at.to_rfc3339(),
@@ -351,67 +267,86 @@ async fn collect_source(
         content_sha256_prefix: export.content_sha256.chars().take(12).collect(),
     };
     *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
+    let _ = fs::remove_dir_all(&root);
     Ok(summary)
 }
 
-#[tauri::command]
-fn export_latest(
-    state: State<'_, AppState>,
-    format: ClientExportFormat,
-    selection_handle: String,
-) -> Result<ClientExportResult, CommandError> {
-    let target_root = consume_directory_grant(&state, &selection_handle, DirectoryPurpose::Export)?;
-    export_latest_to_root(&state, format, target_root)
+/// Collects the currently signed-in local WeCom profile for the embedded
+/// enterprise server. The snapshot and key-probe files only live under the
+/// system temporary directory and are removed before returning.
+pub fn collect_local_export(
+    include_media: bool,
+    data_redaction: bool,
+) -> Result<ClientExportV1, String> {
+    let candidate = WindowsSourceAdapter
+        .discover(None)
+        .map_err(|_| "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned())?;
+    let temporary_root =
+        std::env::temp_dir().join(format!("wecom-archive-local-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let encrypted = candidate
+            .databases
+            .iter()
+            .any(|database| database.encrypted);
+        let key = resolve_collection_key(&candidate, encrypted)?;
+        let export = collect_candidate_with_options(
+            candidate,
+            temporary_root.join("work"),
+            key.as_ref(),
+            CollectionAuthorization {
+                notice_version: LOCAL_NOTICE_VERSION.into(),
+                notice_displayed_at: Utc::now(),
+            },
+            MediaCollectionOptions {
+                include_files: include_media,
+                include_images: include_media,
+            },
+        )?;
+        Ok::<_, CommandError>(if data_redaction {
+            redact_sensitive_export(&export)
+        } else {
+            export
+        })
+    })();
+    let _ = fs::remove_dir_all(&temporary_root);
+    result.map_err(|error| error.message)
 }
 
 #[tauri::command]
-#[cfg(windows)]
-fn open_export_folder(state: State<'_, AppState>) -> Result<(), CommandError> {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let root = state
-        .last_export_root
+fn upload_latest_enterprise(state: State<'_, AppState>) -> Result<UploadResult, CommandError> {
+    let config = load_enterprise_collector_config()?;
+    let export = state
+        .latest_export
         .lock()
         .map_err(|_| internal_error())?
         .clone()
         .ok_or(CommandError {
-            code: "EXPORT_DIRECTORY_UNKNOWN",
-            message: "尚未完成导出，暂时没有可打开的导出文件夹。".into(),
+            code: "COLLECTION_RESULT_MISSING",
+            message: "没有可上传的采集结果，请先完成采集。".into(),
             recoverable: true,
         })?;
-    if !root.is_dir() {
-        return Err(CommandError {
-            code: "EXPORT_DIRECTORY_UNAVAILABLE",
-            message: "上次导出文件夹已不可用，请重新导出并选择目录。".into(),
-            recoverable: true,
-        });
-    }
-    Command::new("explorer.exe")
-        .arg(&root)
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|_| CommandError {
-            code: "EXPORT_DIRECTORY_OPEN_FAILED",
-            message: "无法打开导出文件夹。".into(),
-            recoverable: true,
-        })?;
-    Ok(())
-}
-
-#[tauri::command]
-#[cfg(not(windows))]
-fn open_export_folder(_state: State<'_, AppState>) -> Result<(), CommandError> {
-    Err(CommandError {
-        code: "PLATFORM_UNSUPPORTED",
-        message: "当前平台暂不支持打开导出文件夹。".into(),
-        recoverable: false,
+    let package = create_enterprise_package(&export, &config)?;
+    post_enterprise_package(&config.upload_url, config.upload_token.as_bytes(), &package)?;
+    Ok(UploadResult {
+        message_count: export.message_count,
     })
 }
 
-fn export_latest_to_root(
-    state: &State<'_, AppState>,
-    format: ClientExportFormat,
-    target_root: PathBuf,
-) -> Result<ClientExportResult, CommandError> {
+#[tauri::command]
+fn export_latest_enterprise(
+    state: State<'_, AppState>,
+) -> Result<OfflineExportResult, CommandError> {
+    let config = load_enterprise_collector_config()?;
+    if !config.offline_export_enabled {
+        return Err(CommandError {
+            code: "OFFLINE_EXPORT_DISABLED",
+            message: "管理员未启用采集端离线导出。".into(),
+            recoverable: true,
+        });
+    }
     let export = state
         .latest_export
         .lock()
@@ -422,91 +357,306 @@ fn export_latest_to_root(
             message: "没有可导出的采集结果，请先完成采集。".into(),
             recoverable: true,
         })?;
-    verify_export_root(&target_root)?;
-    let extension = match format {
-        ClientExportFormat::Json => "json",
-        ClientExportFormat::Csv => "csv",
-        ClientExportFormat::Html => "html",
-        ClientExportFormat::Txt => "txt",
-    };
-    let username = current_username_component();
-    let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let file_name =
-        build_client_export_file_name(&username, &timestamp, export.export_id, extension);
-    let target = target_root.join(&file_name);
-    let result = match format {
-        ClientExportFormat::Json => archive_transfer::write_json(&export, &target),
-        ClientExportFormat::Csv => archive_transfer::write_csv(&export, &target),
-        ClientExportFormat::Html => archive_transfer::write_html(&export, &target),
-        ClientExportFormat::Txt => archive_transfer::write_txt(&export, &target),
-    };
+    let package = create_enterprise_package(&export, &config)?;
+    let directory = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .ok_or_else(internal_error)?;
+    let file_name = format!(
+        "WeComArchive-{}-{}.wca",
+        Local::now().format("%Y%m%d-%H%M%S"),
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let target = directory.join(&file_name);
+    let partial = directory.join(format!(".{file_name}.partial"));
+    let result = (|| -> Result<(), std::io::Error> {
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&partial)?;
+        output.write_all(&package)?;
+        output.sync_all()?;
+        std::fs::hard_link(&partial, &target)
+    })();
+    let _ = fs::remove_file(&partial);
     result.map_err(|_| CommandError {
-        code: "CLIENT_EXPORT_FAILED",
-        message: "客户端导出失败；未完成文件已清理，也不会覆盖现有文件。".into(),
+        code: "OFFLINE_EXPORT_FAILED",
+        message: "加密文件导出失败，请确认采集端所在目录可写。".into(),
         recoverable: true,
     })?;
-    *state
-        .last_export_root
-        .lock()
-        .map_err(|_| internal_error())? = Some(target_root);
-    Ok(ClientExportResult {
+    Ok(OfflineExportResult {
         file_name,
-        format: extension,
+        directory: directory.display().to_string(),
         message_count: export.message_count,
     })
 }
 
-fn current_username_component() -> String {
-    std::env::var_os("USERNAME")
-        .and_then(|value| value.into_string().ok())
-        .map(|value| sanitize_filename_component(&value))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "本机用户".into())
+#[tauri::command]
+#[cfg(windows)]
+fn open_offline_export_directory() -> Result<(), CommandError> {
+    let directory = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .ok_or_else(internal_error)?;
+    Command::new("explorer.exe")
+        .arg(directory)
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .map_err(|_| CommandError {
+            code: "OFFLINE_EXPORT_DIRECTORY_OPEN_FAILED",
+            message: "无法打开加密文件所在目录。".into(),
+            recoverable: true,
+        })?;
+    Ok(())
 }
 
-fn sanitize_filename_component(value: &str) -> String {
-    let cleaned: String = value
-        .chars()
-        .take(48)
-        .map(|character| {
-            if character.is_control()
-                || matches!(
-                    character,
-                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
-                )
-            {
-                '_'
-            } else {
-                character
-            }
-        })
-        .collect();
-    let cleaned = cleaned.trim().trim_end_matches([' ', '.']).to_string();
-    let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
-    if reserved
-        .iter()
-        .any(|name| cleaned.eq_ignore_ascii_case(name))
-    {
-        format!("_{cleaned}")
-    } else {
-        cleaned
+#[tauri::command]
+#[cfg(not(windows))]
+fn open_offline_export_directory() -> Result<(), CommandError> {
+    Err(CommandError {
+        code: "PLATFORM_UNSUPPORTED",
+        message: "当前平台暂不支持打开导出目录。".into(),
+        recoverable: false,
+    })
+}
+
+fn post_enterprise_package(
+    endpoint: &str,
+    token: &[u8],
+    package: &[u8],
+) -> Result<(), CommandError> {
+    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+        return Err(CommandError {
+            code: "ENTERPRISE_UPLOAD_FAILED",
+            message: "企业上传地址无效。".into(),
+            recoverable: true,
+        });
     }
+    let mut child = Command::new("curl.exe")
+        .args([
+            "--fail-with-body",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "300",
+            "-X",
+            "POST",
+            "-H",
+            &format!("Authorization: Bearer {}", String::from_utf8_lossy(token)),
+            "-H",
+            "Content-Type: application/octet-stream",
+            "--data-binary",
+            "@-",
+            endpoint,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .map_err(|_| CommandError {
+            code: "ENTERPRISE_UPLOAD_FAILED",
+            message: "系统未找到 curl，无法上传企业加密包。".into(),
+            recoverable: true,
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(package).map_err(|_| CommandError {
+            code: "ENTERPRISE_UPLOAD_FAILED",
+            message: "企业加密包上传失败。".into(),
+            recoverable: true,
+        })?;
+    }
+    let output = child.wait_with_output().map_err(|_| CommandError {
+        code: "ENTERPRISE_UPLOAD_FAILED",
+        message: "未收到服务端上传结果。".into(),
+        recoverable: true,
+    })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let message = if detail.trim().is_empty() {
+            "服务端未接受企业加密包。".to_owned()
+        } else {
+            format!("服务端未接受企业加密包：{}", detail.trim())
+        };
+        return Err(CommandError {
+            code: "ENTERPRISE_UPLOAD_FAILED",
+            message,
+            recoverable: true,
+        });
+    }
+    Ok(())
 }
 
-fn build_client_export_file_name(
-    username: &str,
-    timestamp: &str,
-    export_id: uuid::Uuid,
-    extension: &str,
-) -> String {
-    format!(
-        "{username}-{timestamp}-client-export-{}.{}",
-        export_id.simple(),
-        extension
+fn load_enterprise_collector_config() -> Result<EnterpriseCollectorConfig, CommandError> {
+    let executable = std::env::current_exe().map_err(|_| internal_error())?;
+    let bytes = archive_transfer::read_enterprise_collector_config(&executable).map_err(|_| {
+        CommandError {
+            code: "ENTERPRISE_CONFIG_MISSING",
+            message: "采集端内未找到企业配置。".into(),
+            recoverable: false,
+        }
+    })?;
+    let config: EnterpriseCollectorConfig =
+        serde_json::from_slice(&bytes).map_err(|_| CommandError {
+            code: "ENTERPRISE_CONFIG_INVALID",
+            message: "企业采集配置无效。".into(),
+            recoverable: false,
+        })?;
+    let key = hex::decode(&config.public_key_hex).map_err(|_| CommandError {
+        code: "ENTERPRISE_CONFIG_INVALID",
+        message: "企业采集配置中的加密密钥无效。".into(),
+        recoverable: false,
+    })?;
+    let signing_public_key =
+        hex::decode(&config.signing_public_key_hex).map_err(|_| CommandError {
+            code: "ENTERPRISE_CONFIG_INVALID",
+            message: "企业采集配置中的签名公钥无效。".into(),
+            recoverable: false,
+        })?;
+    let signature = hex::decode(&config.signature_hex).map_err(|_| CommandError {
+        code: "ENTERPRISE_CONFIG_INVALID",
+        message: "企业采集配置中的签名无效。".into(),
+        recoverable: false,
+    })?;
+    let signing_payload = format!(
+        "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        config.organization_id,
+        config.organization_name,
+        config.collection_notice,
+        config.key_id,
+        config.public_key_hex,
+        "aes-256-gcm+rsa-oaep-sha256",
+        config.upload_url,
+        config.upload_token,
+        config.include_files,
+        config.include_images,
+        config.data_redaction,
+        config.offline_export_enabled
+    );
+    let signature_valid = source_windows::enterprise_crypto::verify(
+        &signing_public_key,
+        signing_payload.as_bytes(),
+        &signature,
     )
+    .is_ok()
+        || (!config.offline_export_enabled
+            && source_windows::enterprise_crypto::verify(
+                &signing_public_key,
+                format!(
+                    "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    config.organization_id,
+                    config.organization_name,
+                    config.collection_notice,
+                    config.key_id,
+                    config.public_key_hex,
+                    "aes-256-gcm+rsa-oaep-sha256",
+                    config.upload_url,
+                    config.upload_token,
+                    config.include_files,
+                    config.include_images,
+                    config.data_redaction
+                )
+                .as_bytes(),
+                &signature,
+            )
+            .is_ok());
+    if !signature_valid {
+        return Err(CommandError {
+            code: "ENTERPRISE_CONFIG_SIGNATURE_INVALID",
+            message: "企业采集配置签名校验失败。".into(),
+            recoverable: false,
+        });
+    }
+    if config.schema_version != "enterprise-collector.v1"
+        || config.organization_id.trim().is_empty()
+        || config.organization_name.trim().is_empty()
+        || config.collection_notice.trim().is_empty()
+        || config.key_id.trim().is_empty()
+        || config.upload_url.trim().is_empty()
+        || config.upload_token.trim().is_empty()
+        || key.len() < 64
+    {
+        return Err(CommandError {
+            code: "ENTERPRISE_CONFIG_INVALID",
+            message: "企业采集配置不完整或不允许离线运行。".into(),
+            recoverable: false,
+        });
+    }
+    Ok(config)
+}
+
+fn create_enterprise_package(
+    export: &ClientExportV1,
+    config: &EnterpriseCollectorConfig,
+) -> Result<Vec<u8>, CommandError> {
+    let public_key = hex::decode(&config.public_key_hex).map_err(|_| internal_error())?;
+    let redacted_export = if config.data_redaction {
+        redact_sensitive_export(export)
+    } else {
+        export.clone()
+    };
+    let plaintext =
+        Zeroizing::new(serde_json::to_vec(&redacted_export).map_err(|_| internal_error())?);
+    let encrypted =
+        source_windows::enterprise_crypto::encrypt(&public_key, &plaintext).map_err(|_| {
+            CommandError {
+                code: "ENTERPRISE_ENCRYPTION_FAILED",
+                message: "企业加密包生成失败；不会降级为明文导出。".into(),
+                recoverable: true,
+            }
+        })?;
+    archive_transfer::create_enterprise_package(
+        &redacted_export,
+        &config.organization_id,
+        &config.key_id,
+        &encrypted.wrapped_dek,
+        &encrypted.nonce,
+        &encrypted.ciphertext,
+        &encrypted.tag,
+    )
+    .map_err(|_| CommandError {
+        code: "ENTERPRISE_ENCRYPTION_FAILED",
+        message: "企业加密包生成失败；不会降级为明文导出。".into(),
+        recoverable: true,
+    })
+}
+
+fn redact_sensitive_export(export: &ClientExportV1) -> ClientExportV1 {
+    let mut redacted = export.clone();
+    for batch in &mut redacted.batches {
+        archive_transfer::redact_sensitive_messages(&mut batch.messages);
+        batch.content_sha256 = hex::encode(Sha256::digest(
+            serde_json::to_vec(&batch.messages).unwrap_or_default(),
+        ));
+    }
+    let checksum_value = if redacted.media_transport == "embedded_hex_v1" {
+        serde_json::to_vec(&(
+            &redacted.conversations,
+            &redacted.participants,
+            &redacted.batches,
+            &redacted.media_blobs,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            &redacted.conversations,
+            &redacted.participants,
+            &redacted.batches,
+        ))
+    };
+    redacted.content_sha256 = hex::encode(Sha256::digest(checksum_value.unwrap_or_default()));
+    redacted
+}
+
+#[cfg(test)]
+fn redact_sensitive_text(value: &str) -> String {
+    archive_transfer::redact_sensitive_text(value)
+}
+
+#[cfg(test)]
+fn redact_sensitive_json(value: &mut serde_json::Value) {
+    archive_transfer::redact_sensitive_json(value);
 }
 
 fn store_candidates(
@@ -524,43 +674,12 @@ fn store_candidates(
     Ok(safe)
 }
 
-fn consume_directory_grant(
-    state: &State<'_, AppState>,
-    handle: &str,
-    expected_purpose: DirectoryPurpose,
-) -> Result<PathBuf, CommandError> {
-    let grant = state
-        .directory_grants
-        .lock()
-        .map_err(|_| internal_error())?
-        .remove(handle)
-        .ok_or(CommandError {
-            code: "DIRECTORY_HANDLE_EXPIRED",
-            message: "目录授权已使用或失效，请重新选择。".into(),
-            recoverable: true,
-        })?;
-    if grant.purpose != expected_purpose {
-        return Err(CommandError {
-            code: "DIRECTORY_HANDLE_PURPOSE_MISMATCH",
-            message: "目录授权用途不匹配，请重新选择。".into(),
-            recoverable: true,
-        });
-    }
-    Ok(grant.path)
-}
-
 fn resolve_collection_key(
-    portable_root: &Path,
     candidate: &SourceCandidate,
     encrypted: bool,
 ) -> Result<Option<SourceKey>, CommandError> {
     if !encrypted {
         return Ok(None);
-    }
-    if let Ok(saved) = load_saved_key(portable_root, &candidate.source_id)
-        && key_opens_candidate(candidate, &saved)
-    {
-        return Ok(Some(saved));
     }
     let candidates = run_isolated_key_probe(candidate)?;
     for key in candidates {
@@ -768,132 +887,28 @@ fn probe_error(code: &'static str, message: &str) -> CommandError {
     }
 }
 
-fn saved_key_path(portable_root: &Path) -> PathBuf {
-    portable_root.join("secrets").join("source-keys.dpapi")
-}
-
-#[cfg(windows)]
-fn store_saved_key(
-    portable_root: &Path,
-    source_id: &str,
-    key: &SourceKey,
-) -> Result<(), CommandError> {
-    let source_bytes = source_id.as_bytes();
-    let source_length = u16::try_from(source_bytes.len()).map_err(|_| internal_error())?;
-    let mut payload = Zeroizing::new(Vec::with_capacity(
-        13 + source_bytes.len() + key.bytes.len(),
-    ));
-    payload.extend_from_slice(b"WCAK2");
-    payload.push(match key.kind {
-        SourceKeyKind::Passphrase => 1,
-        SourceKeyKind::DerivedAes128 => 2,
-        SourceKeyKind::DerivedAes256 => 3,
-        SourceKeyKind::RawWxSqlite3Key => 4,
-    });
-    payload.push(u8::from(key.legacy));
-    payload.extend_from_slice(&key.legacy_page_size.to_be_bytes());
-    payload.extend_from_slice(&source_length.to_be_bytes());
-    payload.extend_from_slice(source_bytes);
-    payload.extend_from_slice(&key.bytes);
-    source_windows::dpapi::store_current_user(&saved_key_path(portable_root), &payload).map_err(
-        |_| CommandError {
-            code: "KEY_SAVE_FAILED",
-            message: "采集已完成，但无法使用 Windows 当前用户保护保存密钥。".into(),
-            recoverable: true,
-        },
-    )
-}
-
-#[cfg(not(windows))]
-fn store_saved_key(
-    _portable_root: &Path,
-    _source_id: &str,
-    _key: &SourceKey,
-) -> Result<(), CommandError> {
-    Err(CommandError {
-        code: "KEY_SAVE_UNAVAILABLE",
-        message: "当前平台不支持 Windows DPAPI。".into(),
-        recoverable: true,
-    })
-}
-
-#[cfg(windows)]
-fn load_saved_key(
-    portable_root: &Path,
-    expected_source_id: &str,
-) -> Result<SourceKey, CommandError> {
-    let payload = source_windows::dpapi::load_current_user(&saved_key_path(portable_root))
-        .map_err(|_| internal_error())?;
-    if payload.len() < 7 {
-        return Err(internal_error());
-    }
-    let (kind, legacy, legacy_page_size, length_offset, source_offset) = match &payload[..5] {
-        b"WCAK1" => (SourceKeyKind::Passphrase, false, 0, 5_usize, 7_usize),
-        b"WCAK2" if payload.len() >= 13 => {
-            let kind = match payload[5] {
-                1 => SourceKeyKind::Passphrase,
-                2 => SourceKeyKind::DerivedAes128,
-                3 => SourceKeyKind::DerivedAes256,
-                4 => SourceKeyKind::RawWxSqlite3Key,
-                _ => return Err(internal_error()),
-            };
-            let legacy = match payload[6] {
-                0 => false,
-                1 => true,
-                _ => return Err(internal_error()),
-            };
-            let legacy_page_size =
-                u32::from_be_bytes(payload[7..11].try_into().map_err(|_| internal_error())?);
-            (kind, legacy, legacy_page_size, 11_usize, 13_usize)
-        }
-        _ => return Err(internal_error()),
-    };
-    let source_length =
-        u16::from_be_bytes([payload[length_offset], payload[length_offset + 1]]) as usize;
-    let key_offset = source_offset
-        .checked_add(source_length)
-        .ok_or_else(internal_error)?;
-    if key_offset >= payload.len()
-        || payload.get(source_offset..key_offset) != Some(expected_source_id.as_bytes())
-    {
-        return Err(internal_error());
-    }
-    match kind {
-        SourceKeyKind::Passphrase => Ok(SourceKey::passphrase(&payload[key_offset..])),
-        SourceKeyKind::DerivedAes128 => {
-            SourceKey::derived_aes128_with_config(&payload[key_offset..], legacy, legacy_page_size)
-        }
-        SourceKeyKind::DerivedAes256 => {
-            SourceKey::derived_aes256_with_config(&payload[key_offset..], legacy, legacy_page_size)
-        }
-        SourceKeyKind::RawWxSqlite3Key => {
-            if payload[key_offset..].len() == 16 {
-                Ok(SourceKey {
-                    kind: SourceKeyKind::RawWxSqlite3Key,
-                    bytes: Zeroizing::new(payload[key_offset..].to_vec()),
-                    legacy,
-                    legacy_page_size,
-                })
-            } else {
-                Err(internal_error())
-            }
-        }
-    }
-}
-
-#[cfg(not(windows))]
-fn load_saved_key(
-    _portable_root: &Path,
-    _expected_source_id: &str,
-) -> Result<SourceKey, CommandError> {
-    Err(internal_error())
-}
-
+#[cfg(test)]
 fn collect_candidate(
     candidate: SourceCandidate,
     work_root: PathBuf,
     key: Option<&SourceKey>,
     authorization: CollectionAuthorization,
+) -> Result<ClientExportV1, CommandError> {
+    collect_candidate_with_options(
+        candidate,
+        work_root,
+        key,
+        authorization,
+        MediaCollectionOptions::default(),
+    )
+}
+
+fn collect_candidate_with_options(
+    candidate: SourceCandidate,
+    work_root: PathBuf,
+    key: Option<&SourceKey>,
+    authorization: CollectionAuthorization,
+    media_options: MediaCollectionOptions,
 ) -> Result<ClientExportV1, CommandError> {
     if candidate
         .databases
@@ -914,16 +929,18 @@ fn collect_candidate(
             message: sanitize_error(&error.to_string()),
             recoverable: true,
         })?;
-    let result = read_snapshot_export(&candidate, &receipt, key, authorization);
+    let result =
+        read_snapshot_export_with_options(&candidate, &receipt, key, authorization, media_options);
     cleanup_snapshot(&work_root, &receipt.snapshot_root);
     result
 }
 
-fn read_snapshot_export(
+fn read_snapshot_export_with_options(
     candidate: &SourceCandidate,
     receipt: &archive_domain::SnapshotReceipt,
     key: Option<&SourceKey>,
     authorization: CollectionAuthorization,
+    media_options: MediaCollectionOptions,
 ) -> Result<ClientExportV1, CommandError> {
     let message_database = receipt
         .copied_files
@@ -966,6 +983,7 @@ fn read_snapshot_export(
         })?;
     let batch_id = uuid::Uuid::new_v4();
     let mut messages = Vec::new();
+    let mut media_blobs = Vec::new();
     let allowed_media_roots = candidate
         .media_roots
         .iter()
@@ -1029,7 +1047,12 @@ fn read_snapshot_export(
                 batch_id,
             )
             .map_err(|_| unsupported_source_schema())?;
-            resolve_media_metadata(candidate, &allowed_media_roots, &mut message);
+            media_blobs.extend(resolve_media_metadata_with_options(
+                candidate,
+                &allowed_media_roots,
+                &mut message,
+                media_options,
+            ));
             messages.push(message);
         }
     } else {
@@ -1091,7 +1114,12 @@ fn read_snapshot_export(
                 batch_id,
             )
             .map_err(|_| unsupported_source_schema())?;
-            resolve_media_metadata(candidate, &allowed_media_roots, &mut message);
+            media_blobs.extend(resolve_media_metadata_with_options(
+                candidate,
+                &allowed_media_roots,
+                &mut message,
+                media_options,
+            ));
             messages.push(message);
         }
     }
@@ -1112,6 +1140,7 @@ fn read_snapshot_export(
     }
 
     let mut display_names = DisplayNameIndex::default();
+    let mut group_announcements = Vec::new();
     collect_display_names(&connection, &mut display_names);
     let mut metadata_paths = receipt
         .copied_files
@@ -1133,8 +1162,56 @@ fn read_snapshot_export(
     for metadata_path in metadata_paths {
         if let Some(metadata) = open_snapshot_metadata_database(metadata_path, key) {
             collect_display_names(&metadata, &mut display_names);
+            collect_group_announcements(&metadata, &mut group_announcements);
         }
     }
+    for (conversation_id, body, sent_at_unix_ms) in group_announcements {
+        if messages.iter().any(|message| {
+            message.conversation_id == conversation_id
+                && message.body_text.as_deref() == Some(body.as_str())
+        }) {
+            continue;
+        }
+        let body_hash = hex::encode(Sha256::digest(body.as_bytes()));
+        let source_message_id = format!(
+            "group-announcement:{}:{}",
+            conversation_id,
+            &body_hash[..20]
+        );
+        let mut stable_hasher = Sha256::new();
+        stable_hasher.update(b"message.v1\0");
+        stable_hasher.update(candidate.source_id.as_bytes());
+        stable_hasher.update(b"\0");
+        stable_hasher.update(source_message_id.as_bytes());
+        messages.push(archive_domain::MessageV1 {
+            schema_version: archive_domain::MESSAGE_SCHEMA_VERSION.into(),
+            source_kind: "windows_local".into(),
+            stable_message_id: hex::encode(stable_hasher.finalize()),
+            source_instance_id: candidate.source_id.clone(),
+            source_message_id,
+            conversation_id,
+            sender_id: None,
+            sent_at: Utc
+                .timestamp_millis_opt(sent_at_unix_ms)
+                .single()
+                .unwrap_or_else(Utc::now),
+            direction: archive_domain::MessageDirection::System,
+            message_type: MessageType::System,
+            body_text: Some(body.clone()),
+            quoted_message_id: None,
+            lifecycle: archive_domain::LifecycleState::Active,
+            media: Vec::new(),
+            raw_type: "group_announcement".into(),
+            raw_payload: serde_json::json!({ "kind": "group_announcement", "text": body }),
+            parser_version: "windows-group-metadata/0.0.2".into(),
+            collection_batch_id: batch_id,
+        });
+    }
+    messages.sort_by(|left, right| {
+        left.sent_at
+            .cmp(&right.sent_at)
+            .then_with(|| left.stable_message_id.cmp(&right.stable_message_id))
+    });
     for message in &messages {
         if let (Some(sender_id), Some(name)) = (
             message.sender_id.as_ref(),
@@ -1202,22 +1279,28 @@ fn read_snapshot_export(
     let conversations = conversation_participants
         .into_iter()
         .map(|(conversation_id, participant_ids)| {
-            let display_name = display_names
-                .conversations
-                .get(&conversation_id)
-                .or_else(|| display_names.participants.get(&conversation_id))
-                .cloned()
-                .or_else(|| {
-                    direct_conversation_name(
-                        &conversation_id,
-                        self_sender_id.as_deref(),
-                        &display_names.participants,
-                    )
-                });
+            let conversation_type = conversation_type(&conversation_id, participant_ids.len());
+            let metadata_name = || {
+                display_names
+                    .conversations
+                    .get(&conversation_id)
+                    .or_else(|| display_names.participants.get(&conversation_id))
+                    .cloned()
+            };
+            let display_name = if conversation_type == "direct" {
+                direct_conversation_name(
+                    &conversation_id,
+                    &display_names.participants,
+                    &display_names.conversation_members,
+                )
+                .or_else(metadata_name)
+            } else {
+                metadata_name()
+            };
             ConversationV1 {
                 conversation_id,
                 display_name,
-                conversation_type: None,
+                conversation_type: Some(conversation_type.into()),
                 participant_ids,
             }
         })
@@ -1246,6 +1329,8 @@ fn read_snapshot_export(
     let content_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&messages).map_err(|_| internal_error())?,
     ));
+    media_blobs.sort_by(|left, right| left.content_hash.cmp(&right.content_hash));
+    media_blobs.dedup_by(|left, right| left.content_hash == right.content_hash);
     let collected_at = Utc::now();
     let batch = ArchiveBatchV1 {
         schema_version: archive_domain::BATCH_SCHEMA_VERSION.into(),
@@ -1280,11 +1365,12 @@ fn read_snapshot_export(
             legal_hold: false,
         },
     };
-    archive_transfer::create_export(
+    archive_transfer::create_export_with_media(
         candidate.client_version.as_deref().unwrap_or("unverified"),
         vec![batch],
         conversations,
         participants,
+        media_blobs,
     )
     .map_err(|_| CommandError {
         code: "COLLECTION_EXPORT_INVALID",
@@ -1345,14 +1431,33 @@ fn infer_self_sender_id(messages: &[archive_domain::MessageV1]) -> Option<String
 
 fn direct_conversation_name(
     conversation_id: &str,
-    self_sender_id: Option<&str>,
     participants: &BTreeMap<String, String>,
+    conversation_members: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> Option<String> {
-    conversation_id
-        .strip_prefix("S:")?
-        .split('_')
-        .filter(|participant_id| Some(*participant_id) != self_sender_id)
-        .find_map(|participant_id| participants.get(participant_id).cloned())
+    let scoped = conversation_members.get(conversation_id);
+    let mut names = Vec::new();
+    for participant_id in conversation_id.strip_prefix("S:")?.split('_') {
+        let Some(name) = participants
+            .get(participant_id)
+            .or_else(|| scoped.and_then(|members| members.get(participant_id)))
+        else {
+            continue;
+        };
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    (!names.is_empty()).then(|| names.join("、"))
+}
+
+fn conversation_type(conversation_id: &str, participant_count: usize) -> &'static str {
+    if conversation_id.starts_with("S:") {
+        "direct"
+    } else if conversation_id.starts_with("R:") || participant_count > 2 {
+        "group"
+    } else {
+        "direct"
+    }
 }
 
 fn preferred_scoped_member_name(
@@ -1569,6 +1674,49 @@ fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayN
     }
 }
 
+fn collect_group_announcements(
+    connection: &rusqlite::Connection,
+    target: &mut Vec<(String, String, i64)>,
+) {
+    let columns = table_columns(connection, "conversation_table");
+    if !columns.iter().any(|column| column == "id")
+        || !columns.iter().any(|column| column == "notice_content")
+    {
+        return;
+    }
+    let time_expression = if columns.iter().any(|column| column == "notice_time") {
+        "notice_time"
+    } else if columns.iter().any(|column| column == "modify_time") {
+        "modify_time"
+    } else {
+        "0"
+    };
+    let sql = format!(
+        "SELECT id, notice_content, {time_expression} FROM conversation_table WHERE notice_content IS NOT NULL"
+    );
+    let Ok(mut statement) = connection.prepare(&sql) else {
+        return;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            sqlite_value_to_string(row.get_ref(0)?),
+            sqlite_value_to_bytes(row.get_ref(1)?),
+            sqlite_value_to_i64(row.get_ref(2)?).unwrap_or_default(),
+        ))
+    }) else {
+        return;
+    };
+    for (conversation_id, raw_body, raw_time) in rows.filter_map(Result::ok) {
+        let Some(body) = decode_wecom_body(&raw_body) else {
+            continue;
+        };
+        if conversation_id.trim().is_empty() || is_opaque_identifier(&body) {
+            continue;
+        }
+        target.push((conversation_id, body, normalize_source_timestamp(raw_time)));
+    }
+}
+
 fn payload_display_name(payload: &serde_json::Value) -> Option<String> {
     ["sender_name", "display_name", "nickname", "nick_name"]
         .into_iter()
@@ -1653,14 +1801,14 @@ fn collect_name_rows_priority(
         let Some(name) = clean_display_name(&raw_name) else {
             continue;
         };
-        if !id.is_empty() && id != name {
-            if priorities
+        if !id.is_empty()
+            && id != name
+            && priorities
                 .get(id)
                 .is_none_or(|current| priority >= *current)
-            {
-                target.insert(id.to_owned(), name);
-                priorities.insert(id.to_owned(), priority);
-            }
+        {
+            target.insert(id.to_owned(), name);
+            priorities.insert(id.to_owned(), priority);
         }
     }
 }
@@ -1753,18 +1901,31 @@ fn sqlite_value_to_bytes(value: rusqlite::types::ValueRef<'_>) -> Vec<u8> {
 }
 
 fn decode_wecom_body(raw: &[u8]) -> Option<String> {
-    if let Ok(text) = std::str::from_utf8(raw) {
-        if text
+    if let Ok(text) = std::str::from_utf8(raw)
+        && text
             .chars()
             .all(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
-        {
-            return clean_message_text(text);
-        }
+    {
+        return clean_message_text(text);
     }
     let mut values = Vec::new();
     parse_protobuf_text(raw, 0, &mut values)?;
-    values.dedup();
+    let mut seen = std::collections::BTreeSet::new();
+    values.retain(|value| seen.insert(value.clone()));
+    if values.iter().any(|value| !is_opaque_identifier(value)) {
+        values.retain(|value| !is_opaque_identifier(value));
+    }
     (!values.is_empty()).then(|| values.into_iter().take(12).collect::<Vec<_>>().join("\n"))
+}
+
+fn is_opaque_identifier(value: &str) -> bool {
+    let compact = value.trim();
+    !compact.is_empty()
+        && (compact.chars().all(|character| character.is_ascii_digit())
+            || (compact.len() >= 24
+                && compact
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit() || character == '-')))
 }
 
 fn readable_message_payload(raw_type: &str, text: Option<String>) -> serde_json::Value {
@@ -1890,13 +2051,15 @@ fn normalize_source_timestamp(value: i64) -> i64 {
     }
 }
 
-fn resolve_media_metadata(
+fn resolve_media_metadata_with_options(
     candidate: &SourceCandidate,
     allowed_roots: &[PathBuf],
     message: &mut archive_domain::MessageV1,
-) {
+    options: MediaCollectionOptions,
+) -> Vec<archive_domain::MediaBlobV1> {
+    let mut blobs = Vec::new();
     if message.media.is_empty() {
-        return;
+        return blobs;
     }
     for media in &mut message.media {
         let source = PathBuf::from(&media.source_locator);
@@ -1912,6 +2075,30 @@ fn resolve_media_metadata(
         });
         match resolved.and_then(|path| media_store::hash_source(&path).ok()) {
             Some((hash, size)) => {
+                let should_embed = match message.message_type {
+                    archive_domain::MessageType::Image => options.include_images,
+                    archive_domain::MessageType::File => options.include_files,
+                    _ => false,
+                };
+                if should_embed {
+                    let source_path = PathBuf::from(&media.source_locator);
+                    let source_path = if source_path.is_absolute() {
+                        source_path
+                    } else {
+                        candidate.root_path.join(source_path)
+                    };
+                    if let Ok(bytes) = fs::read(&source_path)
+                        && bytes.len() as u64 == size
+                    {
+                        blobs.push(archive_domain::MediaBlobV1 {
+                            content_hash: hash.clone(),
+                            original_name: media.original_name.clone(),
+                            mime_type: media.mime_type.clone(),
+                            size_bytes: size,
+                            content_hex: hex::encode(bytes),
+                        });
+                    }
+                }
                 media.content_hash = Some(hash.clone());
                 media.size_bytes = Some(size);
                 media.source_locator = format!("sha256:{hash}");
@@ -1926,6 +2113,9 @@ fn resolve_media_metadata(
             }
         }
     }
+    blobs.sort_by(|left, right| left.content_hash.cmp(&right.content_hash));
+    blobs.dedup_by(|left, right| left.content_hash == right.content_hash);
+    blobs
 }
 
 fn cleanup_snapshot(work_root: &Path, snapshot_root: &Path) {
@@ -1943,94 +2133,6 @@ fn unsupported_source_schema() -> CommandError {
     CommandError {
         code: "SOURCE_SCHEMA_UNSUPPORTED",
         message: "数据结构与当前解析器不匹配；未生成不完整导出。".into(),
-        recoverable: true,
-    }
-}
-
-fn verify_export_root(root: &Path) -> Result<(), CommandError> {
-    if !root.is_dir() {
-        return Err(CommandError {
-            code: "EXPORT_DIRECTORY_UNAVAILABLE",
-            message: "所选导出目录不可用。".into(),
-            recoverable: true,
-        });
-    }
-    let probe = root.join(format!(
-        ".export-write-test-{}.partial",
-        uuid::Uuid::new_v4()
-    ));
-    let result = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&probe)
-        .and_then(|mut file| file.write_all(b"export-root-check"))
-        .and_then(|_| fs::remove_file(&probe));
-    if result.is_err() {
-        let _ = fs::remove_file(probe);
-        return Err(CommandError {
-            code: "EXPORT_DIRECTORY_NOT_WRITABLE",
-            message: "所选导出目录不可写。".into(),
-            recoverable: true,
-        });
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn clear_saved_key(state: State<'_, AppState>) -> Result<(), CommandError> {
-    let root = selected_portable_root(&state)?;
-    let path = root.join("secrets").join("source-keys.dpapi");
-    #[cfg(windows)]
-    source_windows::dpapi::clear(&path).map_err(|_| CommandError {
-        code: "KEY_CLEAR_FAILED",
-        message: "无法清除本机保存的授权密钥。".into(),
-        recoverable: true,
-    })?;
-    #[cfg(not(windows))]
-    if path.exists() {
-        fs::remove_file(path).map_err(|_| internal_error())?;
-    }
-    Ok(())
-}
-
-fn selected_portable_root(state: &State<'_, AppState>) -> Result<PathBuf, CommandError> {
-    if let Some(path) = state
-        .portable_root_override
-        .lock()
-        .map_err(|_| internal_error())?
-        .clone()
-    {
-        return Ok(path);
-    }
-    let executable = std::env::current_exe().map_err(|_| internal_error())?;
-    let parent = executable.parent().ok_or_else(internal_error)?;
-    Ok(parent.join("userData"))
-}
-
-fn verify_portable_root(root: &Path) -> Result<(), CommandError> {
-    fs::create_dir_all(root).map_err(|_| portable_root_error())?;
-    let probe = root.join(format!(".write-test-{}.partial", uuid::Uuid::new_v4()));
-    let result = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&probe)?;
-        file.write_all(b"portable-root-check")?;
-        file.sync_all()?;
-        fs::remove_file(&probe)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(probe);
-        return Err(portable_root_error());
-    }
-    Ok(())
-}
-
-fn portable_root_error() -> CommandError {
-    CommandError {
-        code: "PORTABLE_ROOT_NOT_WRITABLE",
-        message: "程序所在目录不可写，请选择一个可写的便携目录。".into(),
         recoverable: true,
     }
 }
@@ -2059,13 +2161,6 @@ fn sanitize_error(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn redacted_path(path: &Path) -> String {
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .map(|value| format!("…\\{value}"))
-        .unwrap_or_else(|| "已选择的便携目录".into())
 }
 
 pub fn run_key_probe() -> i32 {
@@ -2110,16 +2205,27 @@ pub fn run_key_probe() -> i32 {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .setup(|app| {
+            tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::App("index.html".into()),
+            )
+            .title("企业微信记录归档")
+            .inner_size(440.0, 360.0)
+            .min_inner_size(420.0, 340.0)
+            .resizable(true)
+            .center()
+            .build()?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             discover_sources,
-            pick_directory,
-            discover_selected_source,
-            set_portable_root,
             collect_source,
-            export_latest,
-            open_export_folder,
-            clear_saved_key,
+            upload_latest_enterprise,
+            export_latest_enterprise,
+            open_offline_export_directory,
         ])
         .run(tauri::generate_context!())
         .expect("desktop runtime failed");
@@ -2171,7 +2277,6 @@ mod tests {
         CollectionAuthorization {
             notice_version: "test-notice.v1".into(),
             notice_displayed_at: Utc::now(),
-            remember_key: false,
         }
     }
 
@@ -2230,11 +2335,18 @@ mod tests {
             Some("项目会话")
         );
         assert!(!names.conversations.contains_key("R:1"));
+        names.set_participant("self", "当前员工".into(), 100);
         assert_eq!(
-            direct_conversation_name("S:self_0000000000000000", Some("self"), &names.participants)
-                .as_deref(),
-            Some("联系人甲")
+            direct_conversation_name(
+                "S:self_0000000000000000",
+                &names.participants,
+                &names.conversation_members,
+            )
+            .as_deref(),
+            Some("当前员工、联系人甲")
         );
+        assert_eq!(conversation_type("S:self_0000000000000000", 4), "direct");
+        assert_eq!(conversation_type("R:group", 2), "group");
 
         let session = Connection::open_in_memory().unwrap();
         session
@@ -2263,20 +2375,82 @@ mod tests {
             decode_wecom_body(&[0x1e, 0x08, 0x00, 0x12, 0x1a, 0x0a, 0x18]),
             None
         );
+
+        let announcement =
+            "各位要坐班车的小伙伴们，大家好\n【坐车注意事项】：\n1.进群请及时更改群昵称";
+        let mut encoded = vec![0x0a, 16];
+        encoded.extend_from_slice(b"1688856080881486");
+        encoded.push(0x12);
+        write_test_varint(announcement.len() as u64, &mut encoded);
+        encoded.extend_from_slice(announcement.as_bytes());
+        assert_eq!(decode_wecom_body(&encoded).as_deref(), Some(announcement));
+    }
+
+    fn write_test_varint(mut value: u64, output: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            output.push(if value == 0 { byte } else { byte | 0x80 });
+            if value == 0 {
+                return;
+            }
+        }
     }
 
     #[test]
-    fn export_filename_starts_with_safe_username_date_and_time() {
-        let export_id = uuid::Uuid::nil();
-        let username = sanitize_filename_component("熊<测试>/.. ");
-        let file_name =
-            build_client_export_file_name(&username, "20260909-143015", export_id, "json");
+    fn reads_group_announcement_from_session_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE conversation_table (
+                    id TEXT,
+                    notice_content BLOB,
+                    notice_time INTEGER,
+                    modify_time INTEGER
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO conversation_table VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![
+                    "R:group",
+                    "各位同事请及时查看坐车注意事项",
+                    1_789_430_400_i64
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO conversation_table VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params!["R:id-only", "1688856080881486", 1_789_430_400_i64],
+            )
+            .unwrap();
 
-        assert!(file_name.starts_with("熊_测试__-20260909-143015-"));
-        assert!(!file_name.contains('/') && !file_name.contains('<') && !file_name.contains('>'));
-        assert!(!file_name.contains(".."));
-        assert!(file_name.ends_with(".json"));
-        assert_eq!(sanitize_filename_component("CON"), "_CON");
+        let mut announcements = Vec::new();
+        collect_group_announcements(&connection, &mut announcements);
+
+        assert_eq!(announcements.len(), 1);
+        assert_eq!(announcements[0].0, "R:group");
+        assert!(announcements[0].1.contains("坐车注意事项"));
+    }
+
+    #[test]
+    fn redacts_sensitive_message_text_before_enterprise_upload() {
+        let redacted = redact_sensitive_text("账号 admin，密码 secret-123");
+        assert_eq!(redacted, "账号 [敏感数据已脱敏]，密码 [敏感数据已脱敏]");
+        assert!(!redacted.contains("admin") && !redacted.contains("secret-123"));
+
+        let mut payload = serde_json::json!({
+            "password": "secret-456",
+            "profile": { "email": "person@example.com" },
+            "message": "普通内容"
+        });
+        redact_sensitive_json(&mut payload);
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(!serialized.contains("secret-456"));
+        assert!(!serialized.contains("person@example.com"));
+        assert!(serialized.contains("普通内容"));
     }
 
     #[test]
@@ -2554,6 +2728,31 @@ mod tests {
         assert!(
             export.message_count > 0,
             "authorized source contained no messages"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the user's explicit authorization and a running trusted WXWork.exe"]
+    fn authorized_real_collection_includes_group_metadata_without_exposing_content() {
+        let export = collect_local_export(false, false).unwrap();
+        let message_count = export
+            .batches
+            .iter()
+            .map(|batch| batch.messages.len())
+            .sum::<usize>();
+        let announcement_count = export
+            .batches
+            .iter()
+            .flat_map(|batch| &batch.messages)
+            .filter(|message| message.raw_type == "group_announcement")
+            .count();
+        assert!(message_count > 0, "authorized source contained no messages");
+        assert!(
+            announcement_count > 0,
+            "authorized source contained no readable group announcements"
+        );
+        eprintln!(
+            "authorized collection verified: {message_count} messages, {announcement_count} group announcements"
         );
     }
 }

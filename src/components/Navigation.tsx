@@ -1,6 +1,6 @@
-import { MessagesSquare, Settings, SquareArrowOutUpRight } from "lucide-react";
+import { Download, MessagesSquare, ServerCog, Settings } from "lucide-react";
 
-type Section = "conversations" | "exports" | "settings";
+type Section = "conversations" | "local-export" | "server-config" | "settings";
 
 interface NavigationProps {
   active: Section;
@@ -8,8 +8,9 @@ interface NavigationProps {
 }
 
 const items: Array<{ id: Section; label: string; icon: typeof MessagesSquare }> = [
+  { id: "local-export", label: "本机", icon: Download },
+  { id: "server-config", label: "采集端", icon: ServerCog },
   { id: "conversations", label: "会话", icon: MessagesSquare },
-  { id: "exports", label: "导出记录", icon: SquareArrowOutUpRight },
   { id: "settings", label: "设置", icon: Settings },
 ];
 

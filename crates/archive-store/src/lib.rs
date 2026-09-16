@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use archive_domain::{ArchiveBatchV1, ConversationV1, MessageType, MessageV1, ParticipantV1};
 use chrono::{DateTime, Utc};
@@ -46,6 +47,9 @@ pub struct ArchiveSummary {
     pub conversation_count: u64,
     pub message_count: u64,
     pub media_count: u64,
+    /// Monotonically increases whenever a collection batch is ingested, even
+    /// when that batch only revises existing messages.
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,10 +57,18 @@ pub struct ConversationListItem {
     pub conversation_id: String,
     pub display_name: Option<String>,
     pub conversation_type: Option<String>,
+    pub participant_names: Vec<String>,
     pub last_message_at: DateTime<Utc>,
     pub message_count: u64,
     pub media_count: u64,
     pub participant_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ParticipantListItem {
+    pub participant_id: String,
+    pub display_name: Option<String>,
+    pub participant_kind: Option<String>,
 }
 
 pub struct ArchiveStore {
@@ -75,6 +87,7 @@ impl ArchiveStore {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        connection.busy_timeout(Duration::from_secs(30))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
@@ -88,6 +101,7 @@ impl ArchiveStore {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        connection.busy_timeout(Duration::from_secs(30))?;
         connection.pragma_update(None, "query_only", true)?;
         Ok(Self { connection })
     }
@@ -224,14 +238,19 @@ impl ArchiveStore {
     }
 
     pub fn query_messages(&self, query: &MessageQuery) -> Result<Vec<MessageV1>, StoreError> {
-        let limit = query.limit.clamp(1, 500) as i64;
+        // Keep interactive requests bounded while allowing the export worker to
+        // read large archives in a few indexed pages instead of hundreds of
+        // progressively slower OFFSET queries.
+        let limit = query.limit.clamp(1, 50_000) as i64;
         let message_type = query.message_type.as_ref().map(enum_text).transpose()?;
-        let search = query
+        let search_text = query
             .text
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(fts_query);
+            .filter(|value| !value.is_empty());
+        let search = search_text.map(fts_query);
+        let media_search =
+            search_text.map(|value| format!("%{}%", value.replace('%', "\\%").replace('_', "\\_")));
 
         let mut statement = self.connection.prepare(
             "SELECT m.payload_json
@@ -247,9 +266,15 @@ impl ArchiveStore {
                AND (?7 IS NULL OR EXISTS (
                     SELECT 1 FROM message_fts f
                     WHERE f.stable_message_id = m.stable_message_id AND message_fts MATCH ?7
+               ) OR EXISTS (
+                    SELECT 1
+                    FROM message_media mm
+                    JOIN media media_search ON media_search.media_id = mm.media_id
+                    WHERE mm.stable_message_id = m.stable_message_id
+                      AND media_search.original_name LIKE ?8 ESCAPE '\\'
                ))
-             ORDER BY m.sent_at ASC, m.stable_message_id ASC
-             LIMIT ?8 OFFSET ?9",
+             ORDER BY m.sent_at DESC, m.stable_message_id DESC
+             LIMIT ?9 OFFSET ?10",
         )?;
 
         let rows = statement.query_map(
@@ -261,6 +286,7 @@ impl ArchiveStore {
                 message_type,
                 query.media_only as i64,
                 search,
+                media_search,
                 limit,
                 query.offset as i64,
             ],
@@ -272,6 +298,100 @@ impl ArchiveStore {
             Ok(serde_json::from_str(&json)?)
         })
         .collect()
+    }
+
+    pub fn count_messages(&self, query: &MessageQuery) -> Result<u64, StoreError> {
+        let message_type = query.message_type.as_ref().map(enum_text).transpose()?;
+        let search_text = query
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let search = search_text.map(fts_query);
+        let media_search =
+            search_text.map(|value| format!("%{}%", value.replace('%', "\\%").replace('_', "\\_")));
+        let count = self.connection.query_row(
+            "SELECT count(*)
+             FROM messages m
+             WHERE (?1 IS NULL OR m.conversation_id = ?1)
+               AND (?2 IS NULL OR m.sender_id = ?2)
+               AND (?3 IS NULL OR m.sent_at >= ?3)
+               AND (?4 IS NULL OR m.sent_at <= ?4)
+               AND (?5 IS NULL OR m.message_type = ?5)
+               AND (?6 = 0 OR EXISTS (
+                    SELECT 1 FROM message_media mm WHERE mm.stable_message_id = m.stable_message_id
+               ))
+               AND (?7 IS NULL OR EXISTS (
+                    SELECT 1 FROM message_fts f
+                    WHERE f.stable_message_id = m.stable_message_id AND message_fts MATCH ?7
+               ) OR EXISTS (
+                    SELECT 1
+                    FROM message_media mm
+                    JOIN media media_search ON media_search.media_id = mm.media_id
+                    WHERE mm.stable_message_id = m.stable_message_id
+                      AND media_search.original_name LIKE ?8 ESCAPE '\\'
+               ))",
+            params![
+                query.conversation_id,
+                query.participant_id,
+                query.starts_at.map(|value| value.to_rfc3339()),
+                query.ends_at.map(|value| value.to_rfc3339()),
+                message_type,
+                query.media_only as i64,
+                search,
+                media_search,
+            ],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    pub fn list_conversation_participants(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<ParticipantListItem>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT p.participant_id, p.display_name, p.participant_kind
+             FROM conversation_participants cp
+             JOIN participants p ON p.participant_id = cp.participant_id
+             WHERE cp.conversation_id = ?1
+             ORDER BY coalesce(p.display_name, p.participant_id) COLLATE NOCASE ASC",
+        )?;
+        let rows = statement.query_map([conversation_id], |row| {
+            Ok(ParticipantListItem {
+                participant_id: row.get(0)?,
+                display_name: row.get(1)?,
+                participant_kind: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn get_message(&self, stable_message_id: &str) -> Result<Option<MessageV1>, StoreError> {
+        let payload = self
+            .connection
+            .query_row(
+                "SELECT payload_json FROM messages WHERE stable_message_id = ?1",
+                [stable_message_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        payload
+            .map(|json| serde_json::from_str(&json).map_err(StoreError::from))
+            .transpose()
+    }
+
+    pub fn media_mime(&self, content_hash: &str) -> Result<Option<String>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT mime_type FROM media WHERE content_sha256 = ?1",
+                [content_hash],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+            .map(|value| value.flatten())
     }
 
     pub fn message_count(&self) -> Result<u64, StoreError> {
@@ -287,6 +407,7 @@ impl ArchiveStore {
             conversation_count: table_count(&self.connection, "conversations")?,
             message_count: table_count(&self.connection, "messages")?,
             media_count: table_count(&self.connection, "media")?,
+            revision: table_count(&self.connection, "audit_events")?,
         })
     }
 
@@ -331,6 +452,7 @@ impl ArchiveStore {
                     conversation_id: row.get(0)?,
                     display_name: row.get(1)?,
                     conversation_type: row.get(2)?,
+                    participant_names: Vec::new(),
                     last_message_at: parsed,
                     message_count: row.get::<_, i64>(4)? as u64,
                     media_count: row.get::<_, i64>(5)? as u64,
@@ -338,8 +460,62 @@ impl ArchiveStore {
                 })
             },
         )?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::from)
+        let mut conversations = rows.collect::<Result<Vec<_>, _>>()?;
+        for conversation in &mut conversations {
+            // The source identifier is authoritative for the conversation kind. Older
+            // archives may have been ingested before the explicit type was persisted,
+            // or may contain a stale participant-count inference.
+            if conversation.conversation_id.starts_with("S:") {
+                conversation.conversation_type = Some("direct".into());
+            } else if conversation.conversation_id.starts_with("R:") {
+                conversation.conversation_type = Some("group".into());
+            }
+
+            if conversation.conversation_type.as_deref() == Some("direct") {
+                let mut names = self
+                    .connection
+                    .prepare(
+                        "SELECT p.display_name
+                         FROM conversation_participants cp
+                         JOIN participants p ON p.participant_id = cp.participant_id
+                         WHERE cp.conversation_id = ?1
+                           AND p.display_name IS NOT NULL
+                           AND trim(p.display_name) <> ''
+                         ORDER BY cp.participant_id ASC",
+                    )?
+                    .query_map([conversation.conversation_id.as_str()], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // Direct conversations created by older source adapters may not have
+                // conversation_participants rows yet; recover the two IDs from S:a_b.
+                if names.is_empty()
+                    && let Some(member_ids) = conversation.conversation_id.strip_prefix("S:")
+                {
+                    names = member_ids
+                        .split('_')
+                        .filter(|member_id| !member_id.is_empty())
+                        .filter_map(|member_id| {
+                            self.connection
+                                .query_row(
+                                    "SELECT display_name FROM participants WHERE participant_id = ?1",
+                                    [member_id],
+                                    |row| row.get::<_, Option<String>>(0),
+                                )
+                                .optional()
+                                .ok()
+                                .flatten()
+                                .flatten()
+                                .filter(|name| !name.trim().is_empty())
+                        })
+                        .collect();
+                }
+                names.dedup();
+                conversation.participant_names = names;
+            }
+        }
+        Ok(conversations)
     }
 }
 
@@ -348,6 +524,7 @@ fn table_count(connection: &Connection, table: &str) -> Result<u64, StoreError> 
         "conversations" => "SELECT count(*) FROM conversations",
         "messages" => "SELECT count(*) FROM messages",
         "media" => "SELECT count(*) FROM media",
+        "audit_events" => "SELECT count(*) FROM audit_events",
         _ => return Err(StoreError::Invalid("invalid count target".into())),
     };
     Ok(connection.query_row(sql, [], |row| row.get::<_, i64>(0))? as u64)
@@ -363,6 +540,33 @@ fn merge_message(
     content_message.collection_batch_id = uuid::Uuid::nil();
     let content_json = serde_json::to_vec(&content_message)?;
     let content_hash = hex::encode(Sha256::digest(&content_json));
+    let duplicate: Option<String> = transaction
+        .query_row(
+            "SELECT payload_json
+             FROM messages
+             WHERE conversation_id = ?1
+               AND source_message_id = ?2
+               AND sender_id IS ?3
+               AND sent_at = ?4
+             LIMIT 1",
+            params![
+                message.conversation_id,
+                message.source_message_id,
+                message.sender_id,
+                message.sent_at.to_rfc3339(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if duplicate.as_deref().is_some_and(|payload| {
+        serde_json::from_str::<MessageV1>(payload)
+            .ok()
+            .and_then(|existing| canonical_message_hash(&existing).ok())
+            .is_some_and(|hash| hash == canonical_message_hash(message).unwrap_or_default())
+    }) {
+        summary.unchanged += 1;
+        return Ok(());
+    }
     let existing: Option<String> = transaction
         .query_row(
             "SELECT content_sha256 FROM messages WHERE stable_message_id = ?1",
@@ -499,13 +703,14 @@ fn merge_message(
         };
         transaction.execute(
             "INSERT INTO media (
-                media_id, content_sha256, original_name, mime_type, size_bytes, source_locator,
+                media_id, content_sha256, original_name, mime_type, size_bytes, archive_relative_path, source_locator,
                 integrity, missing_reason, first_batch_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(media_id) DO UPDATE SET
                 original_name = coalesce(excluded.original_name, media.original_name),
                 mime_type = coalesce(excluded.mime_type, media.mime_type),
                 size_bytes = coalesce(excluded.size_bytes, media.size_bytes),
+                archive_relative_path = coalesce(excluded.archive_relative_path, media.archive_relative_path),
                 integrity = excluded.integrity,
                 missing_reason = excluded.missing_reason",
             params![
@@ -514,6 +719,7 @@ fn merge_message(
                 media.original_name,
                 media.mime_type,
                 media.size_bytes.map(|value| value as i64),
+                media.content_hash.as_ref().map(|hash| format!("media/{hash}")),
                 media.source_locator,
                 enum_text(&media.integrity)?,
                 media.missing_reason,
@@ -527,6 +733,16 @@ fn merge_message(
         )?;
     }
     Ok(())
+}
+
+fn canonical_message_hash(message: &MessageV1) -> Result<String, serde_json::Error> {
+    let mut canonical = message.clone();
+    canonical.source_instance_id.clear();
+    canonical.source_message_id.clear();
+    canonical.stable_message_id.clear();
+    canonical.collection_batch_id = uuid::Uuid::nil();
+    let bytes = serde_json::to_vec(&canonical)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn enum_text<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
@@ -799,6 +1015,24 @@ mod tests {
         assert_eq!(second.unchanged, 1);
         let third = store.ingest_batch(&batch("第二版")).unwrap();
         assert_eq!(third.revised, 1);
+        assert_eq!(store.message_count().unwrap(), 1);
+        assert_eq!(store.summary().unwrap().revision, 3);
+    }
+
+    #[test]
+    fn merges_same_message_from_different_collectors() {
+        let directory = tempdir().unwrap();
+        let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+        let first = batch("同一条消息");
+        store.ingest_batch(&first).unwrap();
+        let mut second = batch("同一条消息");
+        second.batch_id = Uuid::new_v4();
+        second.source_instance_id = "collector-2".into();
+        second.collection_scope.source_ids = vec!["collector-2".into()];
+        second.messages[0].collection_batch_id = second.batch_id;
+        second.messages[0].source_instance_id = "collector-2".into();
+        second.messages[0].stable_message_id = "stable-one-from-collector-2".into();
+        assert_eq!(store.ingest_batch(&second).unwrap().unchanged, 1);
         assert_eq!(store.message_count().unwrap(), 1);
     }
 

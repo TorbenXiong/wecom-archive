@@ -23,6 +23,7 @@ message-parser.workspace = true
 media-store.workspace = true
 archive-transfer.workspace = true
 source-windows.workspace = true
+wecom-archive-server = { path = "../apps/server" }
 chrono.workspace = true
 hex.workspace = true
 rusqlite.workspace = true

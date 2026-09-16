@@ -1,4 +1,4 @@
-import { CalendarDays, ChevronDown, Search, UsersRound } from "lucide-react";
+import { CalendarDays, ChevronDown, Search, Upload, UsersRound } from "lucide-react";
 import { useDeferredValue, useMemo } from "react";
 import type { ConversationSummary, FilterState, MessageType } from "../domain/types";
 
@@ -9,9 +9,11 @@ interface ConversationListProps {
   participantOptions: Array<{ id: string; label: string }>;
   onFiltersChange: (filters: FilterState) => void;
   onSelect: (id: string) => void;
+  importing: boolean;
+  onImport: (file: File) => void;
 }
 
-export function ConversationList({ conversations, selectedId, filters, participantOptions, onFiltersChange, onSelect }: ConversationListProps) {
+export function ConversationList({ conversations, selectedId, filters, participantOptions, onFiltersChange, onSelect, importing, onImport }: ConversationListProps) {
   const deferredSearch = useDeferredValue(filters.search.trim().toLowerCase());
   const visible = useMemo(
     () => conversations.filter((conversation) =>
@@ -25,15 +27,15 @@ export function ConversationList({ conversations, selectedId, filters, participa
 
   return (
     <aside className="conversation-pane" aria-label="会话列表">
-      <div className="search-box">
-        <Search size={17} />
-        <input
-          aria-label="搜索会话或消息"
-          onChange={(event) => update("search", event.target.value)}
-          placeholder="搜索会话或消息"
-          value={filters.search}
-        />
-        <kbd>Ctrl F</kbd>
+      <div className="conversation-toolbar">
+        <div className="search-box">
+          <Search size={17} />
+          <input aria-label="搜索会话或消息" onChange={(event) => update("search", event.target.value)} placeholder="搜索会话或消息" value={filters.search} />
+        </div>
+        <label className={importing ? "conversation-import-button disabled" : "conversation-import-button"} title="支持采集端 .wca 加密包和本机导出的 JSON">
+          <Upload size={15} /><span>{importing ? "导入中" : "导入"}</span>
+          <input aria-label="导入会话" type="file" accept=".wca,.json" hidden disabled={importing} onChange={(event) => { const file = event.target.files?.[0]; if (file) onImport(file); event.currentTarget.value = ""; }} />
+        </label>
       </div>
       <div className="filter-row">
         <FilterSelect icon={<CalendarDays size={14} />} label="日期" value={filters.date} onChange={(value) => update("date", value)}>
@@ -48,7 +50,7 @@ export function ConversationList({ conversations, selectedId, filters, participa
         <label className="media-filter"><input type="checkbox" checked={filters.mediaOnly} onChange={(event) => update("mediaOnly", event.target.checked)} /><span />仅媒体</label>
       </div>
       <div className="conversation-scroll">
-        {visible.length === 0 ? <div className="conversation-empty">尚无归档数据，请使用企业版专属采集端。</div> : visible.map((conversation) => (
+        {visible.length === 0 ? <div className="conversation-empty">尚无归档数据，可采集本机或使用专属采集端。</div> : visible.map((conversation) => (
           <button
             aria-current={selectedId === conversation.id ? "true" : undefined}
             className={selectedId === conversation.id ? "conversation-item selected" : "conversation-item"}
@@ -58,7 +60,7 @@ export function ConversationList({ conversations, selectedId, filters, participa
           >
             <span className={`conversation-avatar ${conversation.accent}`}>{conversation.initials}</span>
             <span className="conversation-copy">
-              <span className="conversation-title-row"><strong>{conversation.title}</strong><time>{conversation.lastAt}</time></span>
+              <span className="conversation-title-row"><strong>{conversation.title}</strong><em className="conversation-kind-badge">{conversation.isGroup ? "群会话" : "私人会话"}</em><time>{conversation.lastAt}</time></span>
               <span className="conversation-last">{conversation.lastMessage}</span>
             </span>
             {conversation.unread > 0 && <span className="unread-count">{conversation.unread}</span>}

@@ -1,3 +1,4 @@
+pub mod enterprise_crypto;
 mod snapshot;
 
 #[cfg(windows)]

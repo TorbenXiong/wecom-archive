@@ -1,19 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::fs::File;
-use std::io::Read;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows::Win32::Security::Cryptography::{
+    CERT_HASH_PROP_ID, CertGetCertificateContextProperty,
+};
 use windows::Win32::Security::WinTrust::{
     WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO,
     WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
-    WTD_STATEACTION_VERIFY, WTD_UI_NONE, WinVerifyTrust,
+    WTD_STATEACTION_VERIFY, WTD_UI_NONE, WTHelperGetProvCertFromChain,
+    WTHelperGetProvSignerFromChain, WTHelperProvDataFromStateData, WinVerifyTrust,
 };
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -30,8 +31,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{PCWSTR, PWSTR};
 use zeroize::Zeroize;
 
-const TARGET_IMAGE_SHA256: &str =
-    "46fbd8d193e6c42aa9cac4b38cf857cd125127cb658129b7d166dee8f17d6db2";
+const TRUSTED_PUBLISHER_THUMBPRINTS: &[&str] = &["2bc94a2110f6f412ab416d53eb755664d320590c"];
 const MAX_SCAN_BYTES: u64 = 1024 * 1024 * 1024;
 const READ_CHUNK_BYTES: usize = 256 * 1024;
 const MAX_DERIVED_CANDIDATES: usize = 512;
@@ -236,7 +236,7 @@ fn verify_target_image(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.eq_ignore_ascii_case("WXWork.exe"))
         && verify_authenticode(path)
-        && file_sha256(path).is_some_and(|digest| digest == TARGET_IMAGE_SHA256)
+        && verify_publisher(path)
 }
 
 fn verify_authenticode(path: &Path) -> bool {
@@ -278,18 +278,94 @@ fn verify_authenticode(path: &Path) -> bool {
     status == 0
 }
 
-fn file_sha256(path: &Path) -> Option<String> {
-    let mut file = File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
+fn verify_publisher(path: &Path) -> bool {
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide.push(0);
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: PCWSTR(wide.as_ptr()),
+        ..Default::default()
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: WTD_REVOKE_NONE,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 {
+            pFile: &mut file_info,
+        },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    let status = unsafe {
+        WinVerifyTrust(
+            HWND::default(),
+            &mut action,
+            (&mut data as *mut WINTRUST_DATA).cast::<c_void>(),
+        )
+    };
+    let trusted = if status == 0 {
+        unsafe {
+            let provider = WTHelperProvDataFromStateData(data.hWVTStateData);
+            let signer = if provider.is_null() {
+                std::ptr::null_mut()
+            } else {
+                WTHelperGetProvSignerFromChain(provider, 0, false, 0)
+            };
+            let provider_cert = if signer.is_null() {
+                std::ptr::null_mut()
+            } else {
+                WTHelperGetProvCertFromChain(signer, 0)
+            };
+            let cert = if provider_cert.is_null() {
+                std::ptr::null()
+            } else {
+                (*provider_cert).pCert
+            };
+            certificate_thumbprint(cert).is_some_and(|thumbprint| {
+                TRUSTED_PUBLISHER_THUMBPRINTS
+                    .iter()
+                    .any(|expected| thumbprint.eq_ignore_ascii_case(expected))
+            })
         }
-        hasher.update(&buffer[..read]);
+    } else {
+        false
+    };
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    unsafe {
+        WinVerifyTrust(
+            HWND::default(),
+            &mut action,
+            (&mut data as *mut WINTRUST_DATA).cast::<c_void>(),
+        );
     }
-    Some(hex::encode(hasher.finalize()))
+    trusted
+}
+
+fn certificate_thumbprint(
+    certificate: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+) -> Option<String> {
+    if certificate.is_null() {
+        return None;
+    }
+    let mut size = 0_u32;
+    unsafe {
+        CertGetCertificateContextProperty(certificate, CERT_HASH_PROP_ID, None, &mut size).ok()?;
+    }
+    let mut bytes = vec![0_u8; size as usize];
+    unsafe {
+        CertGetCertificateContextProperty(
+            certificate,
+            CERT_HASH_PROP_ID,
+            Some(bytes.as_mut_ptr().cast()),
+            &mut size,
+        )
+        .ok()?;
+    }
+    bytes.truncate(size as usize);
+    Some(hex::encode(bytes))
 }
 
 #[allow(clippy::too_many_arguments)]

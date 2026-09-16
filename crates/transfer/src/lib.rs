@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use archive_domain::{
     ArchiveBatchV1, CLIENT_EXPORT_SCHEMA_VERSION, ClientExportV1, ConversationV1, DomainError,
-    ParticipantV1,
+    MediaBlobV1, ParticipantV1,
 };
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -29,14 +29,192 @@ pub enum TransferError {
     Json(#[from] serde_json::Error),
     #[error("client export CSV failed: {0}")]
     Csv(#[from] csv::Error),
+    #[error("enterprise package is invalid")]
+    InvalidEnterprisePackage,
+    #[error("enterprise package authentication failed")]
+    EnterpriseAuthenticationFailed,
+    #[error("enterprise package organization or key mismatch")]
+    EnterpriseKeyMismatch,
+    #[error("enterprise collector configuration is invalid")]
+    InvalidCollectorConfig,
+}
+
+pub const ENTERPRISE_PACKAGE_SCHEMA_VERSION: &str = "enterprise-package.v1";
+const ENTERPRISE_COLLECTOR_CONFIG_MAGIC: &[u8] = b"WCA-COLLECTOR-CONFIG-V1";
+const MAX_ENTERPRISE_COLLECTOR_CONFIG_BYTES: usize = 1024 * 1024;
+
+pub fn append_enterprise_collector_config(
+    executable: &Path,
+    config: &[u8],
+) -> Result<(), TransferError> {
+    if config.is_empty() || config.len() > MAX_ENTERPRISE_COLLECTOR_CONFIG_BYTES {
+        return Err(TransferError::InvalidCollectorConfig);
+    }
+    let mut output = OpenOptions::new().append(true).open(executable)?;
+    output.write_all(config)?;
+    output.write_all(&(config.len() as u64).to_le_bytes())?;
+    output.write_all(ENTERPRISE_COLLECTOR_CONFIG_MAGIC)?;
+    output.sync_all()?;
+    Ok(())
+}
+
+pub fn read_enterprise_collector_config(executable: &Path) -> Result<Vec<u8>, TransferError> {
+    let mut input = File::open(executable)?;
+    let file_len = input.metadata()?.len();
+    let trailer_len = 8_u64 + ENTERPRISE_COLLECTOR_CONFIG_MAGIC.len() as u64;
+    if file_len <= trailer_len {
+        return Err(TransferError::InvalidCollectorConfig);
+    }
+    input.seek(SeekFrom::End(-(trailer_len as i64)))?;
+    let mut length_bytes = [0_u8; 8];
+    input.read_exact(&mut length_bytes)?;
+    let config_len = u64::from_le_bytes(length_bytes);
+    let mut magic = vec![0_u8; ENTERPRISE_COLLECTOR_CONFIG_MAGIC.len()];
+    input.read_exact(&mut magic)?;
+    if magic != ENTERPRISE_COLLECTOR_CONFIG_MAGIC
+        || config_len == 0
+        || config_len > MAX_ENTERPRISE_COLLECTOR_CONFIG_BYTES as u64
+        || config_len > file_len - trailer_len
+    {
+        return Err(TransferError::InvalidCollectorConfig);
+    }
+    input.seek(SeekFrom::Start(file_len - trailer_len - config_len))?;
+    let mut config = vec![0_u8; config_len as usize];
+    input.read_exact(&mut config)?;
+    Ok(config)
+}
+
+/// Offline authenticated package used by an enterprise-generated collector.
+/// The package deliberately wraps the unchanged ClientExportV1 JSON so the
+/// server can decrypt it and reuse the existing validation and ingest path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnterprisePackageV1 {
+    pub schema_version: String,
+    pub organization_id: String,
+    pub key_id: String,
+    pub export_id: Uuid,
+    pub encryption: String,
+    pub wrapped_dek_hex: String,
+    pub nonce_hex: String,
+    pub ciphertext_hex: String,
+    pub plaintext_sha256: String,
+    pub authentication_tag_hex: String,
+}
+
+pub fn create_enterprise_package(
+    export: &ClientExportV1,
+    organization_id: &str,
+    key_id: &str,
+    wrapped_dek: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    authentication_tag: &[u8],
+) -> Result<Vec<u8>, TransferError> {
+    export.validate()?;
+    if organization_id.trim().is_empty()
+        || key_id.trim().is_empty()
+        || wrapped_dek.is_empty()
+        || nonce.len() != 12
+        || ciphertext.is_empty()
+        || authentication_tag.len() != 16
+    {
+        return Err(TransferError::InvalidEnterprisePackage);
+    }
+    let plaintext = serde_json::to_vec(export)?;
+    let plaintext_sha256 = hex::encode(Sha256::digest(&plaintext));
+    let package = EnterprisePackageV1 {
+        schema_version: ENTERPRISE_PACKAGE_SCHEMA_VERSION.into(),
+        organization_id: organization_id.into(),
+        key_id: key_id.into(),
+        export_id: export.export_id,
+        encryption: "aes-256-gcm+rsa-oaep-sha256".into(),
+        wrapped_dek_hex: hex::encode(wrapped_dek),
+        nonce_hex: hex::encode(nonce),
+        ciphertext_hex: hex::encode(ciphertext),
+        plaintext_sha256,
+        authentication_tag_hex: hex::encode(authentication_tag),
+    };
+    Ok(serde_json::to_vec(&package)?)
+}
+
+pub fn parse_enterprise_package(
+    package_bytes: &[u8],
+    expected_organization_id: &str,
+    expected_key_id: &str,
+) -> Result<EnterprisePackageV1, TransferError> {
+    let package =
+        parse_enterprise_package_for_organization(package_bytes, expected_organization_id)?;
+    if package.key_id != expected_key_id {
+        return Err(TransferError::EnterpriseKeyMismatch);
+    }
+    Ok(package)
+}
+
+pub fn parse_enterprise_package_for_organization(
+    package_bytes: &[u8],
+    expected_organization_id: &str,
+) -> Result<EnterprisePackageV1, TransferError> {
+    let package: EnterprisePackageV1 = serde_json::from_slice(package_bytes)
+        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
+    if package.schema_version != ENTERPRISE_PACKAGE_SCHEMA_VERSION
+        || package.encryption != "aes-256-gcm+rsa-oaep-sha256"
+        || package.organization_id != expected_organization_id
+    {
+        return Err(TransferError::EnterpriseKeyMismatch);
+    }
+    let wrapped_dek = hex::decode(&package.wrapped_dek_hex)
+        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
+    let nonce =
+        hex::decode(&package.nonce_hex).map_err(|_| TransferError::InvalidEnterprisePackage)?;
+    let ciphertext = hex::decode(&package.ciphertext_hex)
+        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
+    let tag = hex::decode(&package.authentication_tag_hex)
+        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
+    if wrapped_dek.is_empty() || nonce.len() != 12 || ciphertext.is_empty() || tag.len() != 16 {
+        return Err(TransferError::InvalidEnterprisePackage);
+    }
+    Ok(package)
+}
+
+pub fn validate_enterprise_plaintext(
+    package: &EnterprisePackageV1,
+    plaintext: &[u8],
+) -> Result<ClientExportV1, TransferError> {
+    if hex::encode(Sha256::digest(plaintext)) != package.plaintext_sha256 {
+        return Err(TransferError::EnterpriseAuthenticationFailed);
+    }
+    let export: ClientExportV1 = serde_json::from_slice(plaintext)?;
+    if export.export_id != package.export_id {
+        return Err(TransferError::InvalidEnterprisePackage);
+    }
+    export.validate()?;
+    Ok(export)
 }
 
 pub fn create_export(
     client_version: &str,
-    mut batches: Vec<ArchiveBatchV1>,
+    batches: Vec<ArchiveBatchV1>,
     conversations: Vec<ConversationV1>,
     participants: Vec<ParticipantV1>,
 ) -> Result<ClientExportV1, TransferError> {
+    create_export_with_media(
+        client_version,
+        batches,
+        conversations,
+        participants,
+        Vec::new(),
+    )
+}
+
+pub fn create_export_with_media(
+    client_version: &str,
+    mut batches: Vec<ArchiveBatchV1>,
+    conversations: Vec<ConversationV1>,
+    participants: Vec<ParticipantV1>,
+    media_blobs: Vec<MediaBlobV1>,
+) -> Result<ClientExportV1, TransferError> {
+    let embedded_media = !media_blobs.is_empty();
+    let mut media_blobs = media_blobs;
     sanitize_batches(&mut batches);
     let message_count = batches
         .iter()
@@ -52,13 +230,24 @@ pub fn create_export(
         .iter()
         .filter(|item| item.content_hash.is_none())
         .count() as u64;
-    let content_sha256 = hash_content(&conversations, &participants, &batches)?;
+    media_blobs.sort_by(|left, right| left.content_hash.cmp(&right.content_hash));
+    let content_sha256 = if embedded_media {
+        hash_content_with_media(&conversations, &participants, &batches, &media_blobs)?
+    } else {
+        hash_content(&conversations, &participants, &batches)?
+    };
     let export = ClientExportV1 {
         schema_version: CLIENT_EXPORT_SCHEMA_VERSION.into(),
         export_id: Uuid::new_v4(),
         generated_at: Utc::now(),
         client_version: client_version.into(),
-        media_transport: "metadata_only".into(),
+        media_transport: if embedded_media {
+            "embedded_hex_v1"
+        } else {
+            "metadata_only"
+        }
+        .into(),
+        media_blobs,
         conversations,
         participants,
         batches,
@@ -83,6 +272,699 @@ fn sanitize_batches(batches: &mut [ArchiveBatchV1]) {
                     .unwrap_or_else(|| "unavailable".into());
             }
         }
+    }
+}
+
+const SENSITIVE_LABELS: &[&str] = &[
+    "账号密码",
+    "开机密码",
+    "登录密码",
+    "支付密码",
+    "交易密码",
+    "解锁密码",
+    "初始密码",
+    "临时密码",
+    "密码",
+    "口令",
+    "短信验证码",
+    "动态验证码",
+    "验证码",
+    "动态码",
+    "pin码",
+    "访问令牌",
+    "刷新令牌",
+    "身份令牌",
+    "api令牌",
+    "令牌",
+    "access token",
+    "access_token",
+    "refresh token",
+    "refresh_token",
+    "id token",
+    "id_token",
+    "api key",
+    "api_key",
+    "apikey",
+    "client secret",
+    "client_secret",
+    "private key",
+    "private_key",
+    "secret key",
+    "secret_key",
+    "加密密钥",
+    "私钥",
+    "密钥",
+    "用户账号",
+    "登录账号",
+    "登陆账号",
+    "登录用户名",
+    "登录名",
+    "用户名",
+    "账号",
+    "账户",
+    "身份证号码",
+    "身份证号",
+    "身份证",
+    "银行卡号",
+    "银行账号",
+    "收款账号",
+    "信用卡号",
+    "卡号",
+    "手机号码",
+    "手机号",
+    "联系电话",
+    "电话号码",
+    "电话",
+    "电子邮箱",
+    "邮箱",
+    "微信号",
+    "qq号",
+    "password",
+    "passwd",
+    "passcode",
+    "pwd",
+    "username",
+    "user_name",
+    "account",
+    "mobile",
+    "phone",
+    "email",
+    "token",
+];
+
+const REDACTION_PLACEHOLDER: &str = "[敏感数据已脱敏]";
+
+pub fn redact_sensitive_text(value: &str) -> String {
+    redact_sensitive_text_with_exclusions(value, &[])
+}
+
+fn redact_sensitive_text_with_exclusions(value: &str, excluded_names: &[String]) -> String {
+    let mut redacted = value.to_owned();
+    let mut restorations = Vec::new();
+    for excluded in excluded_names.iter().filter(|name| !name.trim().is_empty()) {
+        if !redacted.contains(excluded) {
+            continue;
+        }
+        let sentinel = format!("\u{e000}文件名{}\u{e001}", restorations.len());
+        redacted = redacted.replace(excluded, &sentinel);
+        restorations.push((sentinel, excluded.clone()));
+    }
+    for label in SENSITIVE_LABELS {
+        redacted = redact_labeled_values(&redacted, label);
+    }
+    redacted = redact_email_tokens(&redacted);
+    redacted = redact_mixed_credential_tokens(&redacted);
+    for (sentinel, original) in restorations.into_iter().rev() {
+        redacted = redacted.replace(&sentinel, &original);
+    }
+    redacted
+}
+
+pub fn redact_sensitive_messages(messages: &mut [archive_domain::MessageV1]) {
+    let mut conversations: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        conversations
+            .entry(message.conversation_id.clone())
+            .or_default()
+            .push(index);
+    }
+    for indices in conversations.values_mut() {
+        indices.sort_by(|left, right| {
+            messages[*left]
+                .sent_at
+                .cmp(&messages[*right].sent_at)
+                .then_with(|| {
+                    messages[*left]
+                        .stable_message_id
+                        .cmp(&messages[*right].stable_message_id)
+                })
+        });
+        let mut pending_credential_context = None;
+        for index in indices.iter().copied() {
+            let sent_at = messages[index].sent_at;
+            let original = messages[index].body_text.clone().unwrap_or_default();
+            let excluded_names = messages[index]
+                .media
+                .iter()
+                .filter_map(|media| media.original_name.clone())
+                .collect::<Vec<_>>();
+            let context_is_current = pending_credential_context.is_some_and(|previous| {
+                let elapsed = sent_at.signed_duration_since(previous);
+                elapsed >= chrono::Duration::zero() && elapsed <= chrono::Duration::minutes(10)
+            });
+            let mut exact_values = Vec::new();
+            let mut redacted = redact_sensitive_text_with_exclusions(&original, &excluded_names);
+            if context_is_current
+                && let Some((contextual, values)) = redact_contextual_credential_pair(&original)
+            {
+                redacted = contextual;
+                exact_values = values;
+            }
+            redact_sensitive_json_with_exclusions(
+                &mut messages[index].raw_payload,
+                &excluded_names,
+            );
+            if !exact_values.is_empty() {
+                redact_exact_json_values(
+                    &mut messages[index].raw_payload,
+                    &original,
+                    &redacted,
+                    &exact_values,
+                );
+            }
+            if messages[index].body_text.is_some() {
+                messages[index].body_text = Some(redacted);
+            }
+            pending_credential_context =
+                announces_following_credentials(&original).then_some(sent_at);
+        }
+    }
+}
+
+pub fn redact_sensitive_json(value: &mut serde_json::Value) {
+    redact_sensitive_json_with_exclusions(value, &[]);
+}
+
+fn redact_sensitive_json_with_exclusions(value: &mut serde_json::Value, excluded_names: &[String]) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = redact_sensitive_text_with_exclusions(text, excluded_names)
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_sensitive_json_with_exclusions(item, excluded_names)),
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                if is_sensitive_label(key) {
+                    redact_all_json_values(item);
+                } else {
+                    redact_sensitive_json_with_exclusions(item, excluded_names);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_label(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    SENSITIVE_LABELS.iter().any(|label| lower.contains(label))
+}
+
+fn redact_labeled_values(value: &str, label: &str) -> String {
+    let mut redacted = value.to_owned();
+    let mut search_from = 0;
+    loop {
+        let lower = redacted.to_ascii_lowercase();
+        let Some(relative) = lower[search_from..].find(label) else {
+            break;
+        };
+        let label_start = search_from + relative;
+        let label_end = label_start + label.len();
+        let tail = &redacted[label_end..];
+        let mut value_start = label_end;
+        let mut saw_separator = false;
+        for (offset, character) in tail.char_indices() {
+            if character.is_whitespace() {
+                value_start = label_end + offset + character.len_utf8();
+                continue;
+            }
+            if matches!(character, ':' | '：' | '=' | '＝' | '是' | '为') {
+                saw_separator = true;
+                value_start = label_end + offset + character.len_utf8();
+                continue;
+            }
+            break;
+        }
+        let separator_tail = &redacted[value_start..];
+        if let Some(connector_len) = ["默认为", "默认是", "默认：", "默认:", "默认"]
+            .iter()
+            .find_map(|connector| {
+                separator_tail
+                    .starts_with(connector)
+                    .then_some(connector.len())
+            })
+        {
+            saw_separator = true;
+            value_start += connector_len;
+        }
+        let had_gap = value_start > label_end;
+        if !saw_separator && !had_gap {
+            search_from = label_end;
+            continue;
+        }
+        while let Some(character) = redacted[value_start..].chars().next() {
+            if character.is_whitespace() {
+                value_start += character.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let punctuation_end = redacted[value_start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                matches!(
+                    character,
+                    '。' | '；' | ';' | '，' | ',' | '\n' | '\r' | '&' | '＆' | '|'
+                )
+                .then_some(value_start + offset)
+            })
+            .unwrap_or(redacted.len());
+        let annotation_end = if label_accepts_compact_credential(label) {
+            redacted[value_start..]
+                .char_indices()
+                .find_map(|(offset, character)| {
+                    matches!(character, '(' | '（').then_some(value_start + offset)
+                })
+                .unwrap_or(redacted.len())
+        } else {
+            redacted.len()
+        };
+        let remaining_lower = redacted[value_start..].to_ascii_lowercase();
+        let next_label_end = SENSITIVE_LABELS
+            .iter()
+            .filter_map(|candidate| remaining_lower.find(candidate))
+            .filter(|offset| *offset > 0)
+            .map(|offset| value_start + offset)
+            .min()
+            .unwrap_or(redacted.len());
+        let mut value_end = punctuation_end.min(annotation_end).min(next_label_end);
+        while value_end > value_start {
+            let Some(character) = redacted[..value_end].chars().next_back() else {
+                break;
+            };
+            if character.is_whitespace() {
+                value_end -= character.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if value_start >= value_end {
+            search_from = label_end;
+            continue;
+        }
+        if !is_plausible_labeled_value(label, &redacted[value_start..value_end]) {
+            search_from = label_end;
+            continue;
+        }
+        redacted.replace_range(value_start..value_end, REDACTION_PLACEHOLDER);
+        search_from = value_start + REDACTION_PLACEHOLDER.len();
+    }
+    redacted
+}
+
+fn is_plausible_labeled_value(label: &str, candidate: &str) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidate == REDACTION_PLACEHOLDER || candidate.len() > 512 {
+        return false;
+    }
+    let lower_label = label.to_ascii_lowercase();
+    if lower_label.contains("验证码") || lower_label.contains("动态码") || lower_label == "pin码"
+    {
+        let digits = candidate.chars().filter(char::is_ascii_digit).count();
+        return (4..=8).contains(&digits)
+            && candidate
+                .chars()
+                .all(|character| character.is_ascii_digit() || character.is_whitespace());
+    }
+    if [
+        "手机号",
+        "手机号码",
+        "联系电话",
+        "电话号码",
+        "电话",
+        "身份证",
+        "身份证号",
+        "身份证号码",
+        "银行卡号",
+        "银行账号",
+        "收款账号",
+        "信用卡号",
+        "卡号",
+    ]
+    .iter()
+    .any(|kind| lower_label.contains(kind))
+    {
+        let digits = candidate.chars().filter(char::is_ascii_digit).count();
+        return (7..=19).contains(&digits)
+            && candidate.chars().all(|character| {
+                character.is_ascii_digit()
+                    || character.is_whitespace()
+                    || matches!(character, '+' | '-' | '(' | ')' | 'x' | 'X')
+            });
+    }
+    if lower_label.contains("邮箱") || lower_label == "email" {
+        return looks_like_email(candidate);
+    }
+    is_compact_credential(candidate)
+}
+
+fn label_accepts_compact_credential(label: &str) -> bool {
+    let lower_label = label.to_ascii_lowercase();
+    !(lower_label.contains("验证码")
+        || lower_label.contains("动态码")
+        || lower_label == "pin码"
+        || [
+            "手机号",
+            "手机号码",
+            "联系电话",
+            "电话号码",
+            "电话",
+            "身份证",
+            "身份证号",
+            "身份证号码",
+            "银行卡号",
+            "银行账号",
+            "收款账号",
+            "信用卡号",
+            "卡号",
+            "邮箱",
+            "email",
+        ]
+        .iter()
+        .any(|kind| lower_label.contains(kind)))
+}
+
+fn is_compact_credential(value: &str) -> bool {
+    let value = value.trim_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '"' | '\'' | '“' | '”')
+    });
+    !value.is_empty()
+        && value.len() <= 256
+        && value.is_ascii()
+        && !value.chars().any(char::is_whitespace)
+        && value
+            .chars()
+            .any(|character| character.is_ascii_alphanumeric())
+}
+
+fn announces_following_credentials(value: &str) -> bool {
+    let compact = value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let compact = compact.trim_end_matches(|character| {
+        matches!(character, '。' | '；' | ';' | '：' | ':' | '，' | ',')
+    });
+    [
+        "账号密码就是这个",
+        "账号密码是这个",
+        "账号密码如下",
+        "账号密码在下方",
+        "账号密码在下面",
+        "账号密码见下方",
+        "账号密码见下面",
+        "账号和密码如下",
+        "账号、密码如下",
+        "账号与密码如下",
+    ]
+    .iter()
+    .any(|announcement| compact.ends_with(announcement))
+}
+
+fn redact_contextual_credential_pair(value: &str) -> Option<(String, Vec<String>)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 256 || trimmed.contains('\n') || trimmed.contains('\r')
+    {
+        return None;
+    }
+    for connector in ["跟", "和", "／", "/"] {
+        let Some(position) = trimmed.find(connector) else {
+            continue;
+        };
+        let left = trimmed[..position].trim_matches(credential_wrapper);
+        let right = trimmed[position + connector.len()..].trim_matches(credential_wrapper);
+        if !is_compact_credential(left)
+            || !is_compact_credential(right)
+            || !looks_like_password(right)
+        {
+            continue;
+        }
+        let redacted = value.replacen(left, REDACTION_PLACEHOLDER, 1).replacen(
+            right,
+            REDACTION_PLACEHOLDER,
+            1,
+        );
+        return Some((redacted, vec![left.to_owned(), right.to_owned()]));
+    }
+    None
+}
+
+fn credential_wrapper(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '"' | '\'' | '“' | '”' | '(' | ')' | '（' | '）' | '。' | '，' | ',' | ';' | '；'
+        )
+}
+
+fn looks_like_password(value: &str) -> bool {
+    value.len() >= 6
+        && value.is_ascii()
+        && value
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+        && value.chars().any(|character| character.is_ascii_digit())
+}
+
+fn redact_mixed_credential_tokens(value: &str) -> String {
+    let mut spans = Vec::new();
+    let mut token_start = None;
+    for (offset, character) in value.char_indices() {
+        if is_mixed_credential_token_character(character) {
+            token_start.get_or_insert(offset);
+        } else if let Some(start) = token_start.take()
+            && should_redact_mixed_token(&value[start..offset])
+        {
+            spans.push((start, offset));
+        }
+    }
+    if let Some(start) = token_start
+        && should_redact_mixed_token(&value[start..])
+    {
+        spans.push((start, value.len()));
+    }
+    if spans.is_empty() {
+        return value.to_owned();
+    }
+    let mut redacted = value.to_owned();
+    for (start, end) in spans.into_iter().rev() {
+        redacted.replace_range(start..end, REDACTION_PLACEHOLDER);
+    }
+    redacted
+}
+
+fn is_mixed_credential_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '!' | '@'
+                | '#'
+                | '$'
+                | '%'
+                | '^'
+                | '&'
+                | '*'
+                | '-'
+                | '_'
+                | '+'
+                | '='
+                | '.'
+                | ':'
+                | '/'
+                | '\\'
+                | '?'
+                | '~'
+        )
+}
+
+fn should_redact_mixed_token(value: &str) -> bool {
+    let has_letter = value
+        .chars()
+        .any(|character| character.is_ascii_alphabetic());
+    let has_digit = value.chars().any(|character| character.is_ascii_digit());
+    let has_symbol = value
+        .chars()
+        .any(|character| !character.is_ascii_alphanumeric());
+    let has_strong_symbol = value.chars().any(|character| {
+        matches!(
+            character,
+            '!' | '@'
+                | '#'
+                | '$'
+                | '%'
+                | '^'
+                | '&'
+                | '*'
+                | '-'
+                | '_'
+                | '+'
+                | '='
+                | '/'
+                | '\\'
+                | '~'
+        )
+    });
+    value.len() >= 4
+        && value.len() <= 512
+        && ((has_letter && has_digit)
+            || (has_digit && has_symbol)
+            || (has_letter && has_strong_symbol))
+        && !looks_like_file_or_image_name(value)
+}
+
+fn looks_like_file_or_image_name(value: &str) -> bool {
+    let value = value.trim_end_matches('.');
+    let Some((stem, extension)) = value.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty() || extension.is_empty() {
+        return false;
+    }
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "bmp"
+            | "webp"
+            | "heic"
+            | "tif"
+            | "tiff"
+            | "svg"
+            | "ico"
+            | "pdf"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "txt"
+            | "csv"
+            | "json"
+            | "xml"
+            | "html"
+            | "htm"
+            | "md"
+            | "log"
+            | "sql"
+            | "db"
+            | "sqlite"
+            | "zip"
+            | "rar"
+            | "7z"
+            | "tar"
+            | "gz"
+            | "exe"
+            | "msi"
+            | "dll"
+            | "wca"
+    )
+}
+
+fn redact_email_tokens(value: &str) -> String {
+    let mut redacted = String::with_capacity(value.len());
+    let mut token = String::new();
+    let flush = |target: &mut String, token: &mut String| {
+        let sensitive = looks_like_email(token) && !looks_like_file_or_image_name(token);
+        if sensitive {
+            target.push_str(REDACTION_PLACEHOLDER);
+        } else {
+            target.push_str(token);
+        }
+        token.clear();
+    };
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || matches!(character, '@' | '.' | '_' | '-' | '+') {
+            token.push(character);
+        } else {
+            flush(&mut redacted, &mut token);
+            redacted.push(character);
+        }
+    }
+    flush(&mut redacted, &mut token);
+    redacted
+}
+
+fn looks_like_email(value: &str) -> bool {
+    let mut sections = value.split('@');
+    sections.next().is_some_and(|local| !local.is_empty())
+        && sections.next().is_some_and(|domain| domain.contains('.'))
+        && sections.next().is_none()
+}
+
+fn redact_exact_json_values(
+    value: &mut serde_json::Value,
+    original_text: &str,
+    redacted_text: &str,
+    exact_values: &[String],
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            if !original_text.is_empty() {
+                *text = text.replace(original_text, redacted_text);
+            }
+            for exact in exact_values {
+                *text = replace_exact_credential_token(text, exact);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_exact_json_values(item, original_text, redacted_text, exact_values);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                redact_exact_json_values(item, original_text, redacted_text, exact_values);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_exact_credential_token(value: &str, exact: &str) -> String {
+    if exact.is_empty() {
+        return value.to_owned();
+    }
+    let mut redacted = String::with_capacity(value.len());
+    let mut copied_until = 0;
+    for (start, _) in value.match_indices(exact) {
+        if start < copied_until {
+            continue;
+        }
+        let end = start + exact.len();
+        let left_is_part = value[..start]
+            .chars()
+            .next_back()
+            .is_some_and(is_credential_token_character);
+        let right_is_part = value[end..]
+            .chars()
+            .next()
+            .is_some_and(is_credential_token_character);
+        if left_is_part || right_is_part {
+            continue;
+        }
+        redacted.push_str(&value[copied_until..start]);
+        redacted.push_str(REDACTION_PLACEHOLDER);
+        copied_until = end;
+    }
+    redacted.push_str(&value[copied_until..]);
+    redacted
+}
+
+fn is_credential_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '+' | '@')
+}
+
+fn redact_all_json_values(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_all_json_values),
+        serde_json::Value::Object(map) => map.values_mut().for_each(redact_all_json_values),
+        serde_json::Value::Null => {}
+        _ => *value = serde_json::Value::String(REDACTION_PLACEHOLDER.into()),
     }
 }
 
@@ -117,6 +999,86 @@ pub fn write_json(export: &ClientExportV1, target: &Path) -> Result<(), Transfer
     let readable = readable_view(export)?;
     atomic_write(target, |writer| {
         serde_json::to_writer_pretty(writer, &readable)?;
+        Ok(())
+    })
+}
+
+/// Writes the complete versioned archive contract so the JSON can be imported
+/// again without losing directory metadata or embedded media. Extra readable
+/// name fields are ignored by the typed importer but make manual inspection
+/// useful without resolving participant IDs by hand.
+pub fn write_importable_json(export: &ClientExportV1, target: &Path) -> Result<(), TransferError> {
+    export.validate()?;
+    verify_checksum(export)?;
+    let participant_names = export
+        .participants
+        .iter()
+        .filter_map(|participant| {
+            participant
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| (participant.participant_id.clone(), name.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let conversation_names = export
+        .conversations
+        .iter()
+        .filter_map(|conversation| {
+            conversation
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| (conversation.conversation_id.clone(), name.to_owned()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut document = serde_json::to_value(export)?;
+    if let Some(root) = document.as_object_mut() {
+        root.insert(
+            "readable_names".into(),
+            serde_json::json!({
+                "participants": &participant_names,
+                "conversations": &conversation_names,
+            }),
+        );
+        if let Some(batches) = root
+            .get_mut("batches")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for batch in batches {
+                let Some(messages) = batch
+                    .get_mut("messages")
+                    .and_then(serde_json::Value::as_array_mut)
+                else {
+                    continue;
+                };
+                for message in messages {
+                    let Some(message) = message.as_object_mut() else {
+                        continue;
+                    };
+                    if let Some(sender_name) = message
+                        .get("sender_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|sender_id| participant_names.get(sender_id))
+                    {
+                        message.insert("sender_name".into(), sender_name.clone().into());
+                    }
+                    if let Some(conversation_name) = message
+                        .get("conversation_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|conversation_id| conversation_names.get(conversation_id))
+                    {
+                        message
+                            .insert("conversation_name".into(), conversation_name.clone().into());
+                    }
+                }
+            }
+        }
+    }
+    atomic_write(target, |writer| {
+        serde_json::to_writer_pretty(writer, &document)?;
         Ok(())
     })
 }
@@ -175,13 +1137,13 @@ fn readable_view(export: &ClientExportV1) -> Result<ReadableExport, serde_json::
         .collect();
     let mut self_sender_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for message in export.batches.iter().flat_map(|batch| &batch.messages) {
-        if message.direction == archive_domain::MessageDirection::Outgoing {
-            if let Some(sender_id) = &message.sender_id {
-                self_sender_ids
-                    .entry(message.conversation_id.clone())
-                    .or_default()
-                    .insert(sender_id.clone());
-            }
+        if message.direction == archive_domain::MessageDirection::Outgoing
+            && let Some(sender_id) = &message.sender_id
+        {
+            self_sender_ids
+                .entry(message.conversation_id.clone())
+                .or_default()
+                .insert(sender_id.clone());
         }
     }
     for conversation in &export.conversations {
@@ -327,8 +1289,8 @@ fn readable_view(export: &ClientExportV1) -> Result<ReadableExport, serde_json::
         })
         .collect();
     conversations.sort_by(|left, right| {
-        latest_message_time(right)
-            .cmp(latest_message_time(left))
+        latest_message_time(left)
+            .cmp(latest_message_time(right))
             .then_with(|| left.conversation_name.cmp(&right.conversation_name))
     });
     Ok(ReadableExport {
@@ -609,9 +1571,17 @@ pub fn read_json_slice(bytes: &[u8]) -> Result<ClientExportV1, TransferError> {
 }
 
 fn verify_checksum(export: &ClientExportV1) -> Result<(), TransferError> {
-    if hash_content(&export.conversations, &export.participants, &export.batches)?
-        == export.content_sha256
-    {
+    let checksum = if export.media_transport == "embedded_hex_v1" {
+        hash_content_with_media(
+            &export.conversations,
+            &export.participants,
+            &export.batches,
+            &export.media_blobs,
+        )?
+    } else {
+        hash_content(&export.conversations, &export.participants, &export.batches)?
+    };
+    if checksum == export.content_sha256 {
         Ok(())
     } else {
         Err(TransferError::ChecksumMismatch)
@@ -624,6 +1594,16 @@ fn hash_content(
     batches: &[ArchiveBatchV1],
 ) -> Result<String, serde_json::Error> {
     let bytes = serde_json::to_vec(&(conversations, participants, batches))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn hash_content_with_media(
+    conversations: &[ConversationV1],
+    participants: &[ParticipantV1],
+    batches: &[ArchiveBatchV1],
+    media_blobs: &[MediaBlobV1],
+) -> Result<String, serde_json::Error> {
+    let bytes = serde_json::to_vec(&(conversations, participants, batches, media_blobs))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
@@ -729,6 +1709,33 @@ mod tests {
         assert!(!pretty.contains("\"batches\""));
         assert!(!pretty.contains("\"raw_payload\""));
         assert!(pretty.ends_with("}\n") || pretty.ends_with('}'));
+    }
+
+    #[test]
+    fn importable_json_preserves_contract_and_exposes_readable_names() {
+        let export = message_export();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("importable.json");
+        write_importable_json(&export, &path).unwrap();
+
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            document["readable_names"]["participants"]["participant-1"],
+            "测试成员"
+        );
+        assert_eq!(
+            document["batches"][0]["messages"][0]["sender_name"],
+            "测试成员"
+        );
+        assert_eq!(
+            document["batches"][0]["messages"][0]["conversation_name"],
+            "合成会话 <test>"
+        );
+        let imported = read_json(&path).unwrap();
+        assert_eq!(imported.conversations, export.conversations);
+        assert_eq!(imported.participants, export.participants);
+        assert_eq!(imported.batches, export.batches);
     }
 
     #[test]
@@ -899,7 +1906,7 @@ mod tests {
     }
 
     #[test]
-    fn puts_recent_conversations_first() {
+    fn puts_earlier_conversations_first() {
         let mut export = message_export();
         let mut older_message = export.batches[0].messages[0].clone();
         older_message.source_message_id = "message-older".into();
@@ -927,8 +1934,186 @@ mod tests {
                 .iter()
                 .map(|conversation| conversation.conversation_name.as_str())
                 .collect::<Vec<_>>(),
-            ["合成会话 <test>", "较早会话"]
+            ["较早会话", "合成会话 <test>"]
         );
+    }
+
+    #[test]
+    fn embeds_and_reads_collector_configuration_from_one_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("collector.exe");
+        fs::write(&executable, b"portable-executable").unwrap();
+        let config = br#"{"schemaVersion":"enterprise-collector.v1"}"#;
+
+        append_enterprise_collector_config(&executable, config).unwrap();
+
+        assert_eq!(
+            read_enterprise_collector_config(&executable).unwrap(),
+            config
+        );
+        assert!(
+            fs::read(&executable)
+                .unwrap()
+                .starts_with(b"portable-executable")
+        );
+        assert!(matches!(
+            read_enterprise_collector_config(&directory.path().join("missing.exe")),
+            Err(TransferError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn puts_earlier_messages_first_within_a_conversation() {
+        let mut export = message_export();
+        let mut older_message = export.batches[0].messages[0].clone();
+        older_message.source_message_id = "message-older".into();
+        older_message.stable_message_id = "message-older".into();
+        older_message.sent_at -= chrono::Duration::days(1);
+        export.batches[0].messages.push(older_message);
+        let export = create_export(
+            "fixture",
+            export.batches,
+            export.conversations,
+            export.participants,
+        )
+        .unwrap();
+
+        let readable = readable_view(&export).unwrap();
+        assert!(
+            readable.conversations[0].messages[0].sent_at
+                < readable.conversations[0].messages[1].sent_at
+        );
+    }
+
+    #[test]
+    fn redacts_only_the_sensitive_value_in_readable_text() {
+        assert_eq!(
+            redact_sensitive_text("企业微信截图_1789453808453.png"),
+            "企业微信截图_1789453808453.png"
+        );
+        assert_eq!(
+            redact_sensitive_text(
+                "附件 backup-2026.zip、mail-user@example.com.txt，图片 photo_20260915-01.jpg"
+            ),
+            "附件 backup-2026.zip、mail-user@example.com.txt，图片 photo_20260915-01.jpg"
+        );
+        assert_eq!(
+            redact_sensitive_text("1688856739848194"),
+            "1688856739848194"
+        );
+        assert_eq!(
+            redact_sensitive_text("临时值 Pvtech-123，请及时修改"),
+            "临时值 [敏感数据已脱敏]，请及时修改"
+        );
+        assert_eq!(
+            redact_sensitive_text("无标签值 abc123、abc_def、2026-09-15"),
+            "无标签值 [敏感数据已脱敏]、[敏感数据已脱敏]、[敏感数据已脱敏]"
+        );
+        assert_eq!(
+            redact_sensitive_text("普通英文 hello world."),
+            "普通英文 hello world."
+        );
+        assert_eq!(
+            redact_sensitive_text("开机密码：pvtech123。请下班前修改。"),
+            "开机密码：[敏感数据已脱敏]。请下班前修改。"
+        );
+        assert_eq!(
+            redact_sensitive_text("联系电话 13800138000，邮箱 user@example.com"),
+            "联系电话 [敏感数据已脱敏]，邮箱 [敏感数据已脱敏]"
+        );
+        let redacted = redact_sensitive_text(
+            "用户名为：admin；访问令牌是 abc.def；验证码 083921；银行卡号 6222-0201-2345-6789",
+        );
+        assert_eq!(
+            redacted,
+            "用户名为：[敏感数据已脱敏]；访问令牌是 [敏感数据已脱敏]；验证码 [敏感数据已脱敏]；银行卡号 [敏感数据已脱敏]"
+        );
+        assert_eq!(
+            redact_sensitive_text("手机号 +86 138 0013 8000，讨论密码策略和账号体系。"),
+            "手机号 [敏感数据已脱敏]，讨论密码策略和账号体系。"
+        );
+        assert_eq!(
+            redact_sensitive_text("账号密码：[敏感数据已脱敏]；密码默认Pvtech-123 （请及时修改）"),
+            "账号密码：[敏感数据已脱敏]；密码默认[敏感数据已脱敏] （请及时修改）"
+        );
+    }
+
+    #[test]
+    fn redacts_a_credential_pair_announced_by_the_previous_message() {
+        let export = message_export();
+        let mut announcement = export.batches[0].messages[0].clone();
+        announcement.source_message_id = "credential-announcement".into();
+        announcement.stable_message_id = "credential-announcement".into();
+        announcement.body_text = Some("账号密码就是这个".into());
+        announcement.raw_payload = serde_json::json!({ "content": "账号密码就是这个" });
+
+        let mut credentials = announcement.clone();
+        credentials.source_message_id = "credential-values".into();
+        credentials.stable_message_id = "credential-values".into();
+        credentials.sent_at += chrono::Duration::seconds(7);
+        credentials.body_text = Some("sa跟Pvtech-123".into());
+        credentials.raw_payload = serde_json::json!({
+            "content": "sa跟Pvtech-123",
+            "short_value": "sa",
+            "unrelated_word": "message"
+        });
+        let mut messages = vec![credentials, announcement];
+
+        redact_sensitive_messages(&mut messages);
+
+        assert_eq!(
+            messages[0].body_text.as_deref(),
+            Some("[敏感数据已脱敏]跟[敏感数据已脱敏]")
+        );
+        assert_eq!(
+            messages[0].raw_payload["content"],
+            "[敏感数据已脱敏]跟[敏感数据已脱敏]"
+        );
+        assert_eq!(
+            messages[0].raw_payload["short_value"],
+            REDACTION_PLACEHOLDER
+        );
+        assert_eq!(messages[0].raw_payload["unrelated_word"], "message");
+    }
+
+    #[test]
+    fn preserves_media_names_while_redacting_other_mixed_tokens() {
+        let export = message_export();
+        let mut message = export.batches[0].messages[0].clone();
+        message.media[0].original_name = Some("截图ABC-123".into());
+        message.body_text = Some("附件：截图ABC-123；临时值 Pvtech-123".into());
+        message.raw_payload = serde_json::json!({
+            "content": "附件：截图ABC-123；临时值 Pvtech-123"
+        });
+
+        redact_sensitive_messages(std::slice::from_mut(&mut message));
+
+        assert_eq!(
+            message.body_text.as_deref(),
+            Some("附件：截图ABC-123；临时值 [敏感数据已脱敏]")
+        );
+        assert_eq!(
+            message.raw_payload["content"],
+            "附件：截图ABC-123；临时值 [敏感数据已脱敏]"
+        );
+    }
+
+    #[test]
+    fn redacts_sensitive_json_strings_and_numbers() {
+        let mut payload = serde_json::json!({
+            "password": "secret-123",
+            "profile": {
+                "mobile": 13800138000_u64,
+                "api_key": ["first-key", "second-key"],
+                "message": "普通内容"
+            }
+        });
+        redact_sensitive_json(&mut payload);
+        assert_eq!(payload["password"], REDACTION_PLACEHOLDER);
+        assert_eq!(payload["profile"]["mobile"], REDACTION_PLACEHOLDER);
+        assert_eq!(payload["profile"]["api_key"][0], REDACTION_PLACEHOLDER);
+        assert_eq!(payload["profile"]["api_key"][1], REDACTION_PLACEHOLDER);
+        assert_eq!(payload["profile"]["message"], "普通内容");
     }
 
     #[test]

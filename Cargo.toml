@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 license = "MIT"
 authors = ["Torben Xiong"]
@@ -48,7 +48,6 @@ uuid = { version = "=1.26.0", features = ["serde", "v4", "v7"] }
 walkdir = "=2.5.0"
 windows = "=0.62.2"
 zeroize = { version = "=1.9.0", features = ["derive"] }
-zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 
 [profile.release]
 codegen-units = 1
