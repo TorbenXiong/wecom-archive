@@ -49,7 +49,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "archive-domain"
-version = "0.1.0"
+version = "0.0.2"
 dependencies = [
  "chrono",
  "serde",
@@ -60,25 +60,22 @@ dependencies = [
 
 [[package]]
 name = "archive-export"
-version = "0.1.0"
+version = "0.0.2"
 dependencies = [
  "archive-domain",
  "chrono",
  "csv",
- "hex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
- "walkdir",
- "zip",
 ]
 
 [[package]]
 name = "archive-store"
-version = "0.1.0"
+version = "0.0.2"
 dependencies = [
  "archive-domain",
  "chrono",
@@ -94,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "archive-transfer"
-version = "0.1.0"
+version = "0.0.2"
 dependencies = [
  "archive-domain",
  "chrono",
@@ -2045,7 +2042,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "media-store"
-version = "0.1.0"
+version = "0.0.2"
 dependencies = [
  "archive-domain",
  "hex",
@@ -2072,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "message-parser"
-version = "0.1.0"
+version = "0.0.2"
 dependencies = [
  "archive-domain",
  "chrono",
@@ -3278,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "source-windows"
-version = "0.1.0"
+version = "0.0.2"
 dependencies = [
  "archive-domain",
  "hex",
@@ -4083,12 +4080,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
-name = "typed-path"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
-
-[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4446,7 +4437,7 @@ dependencies = [
 
 [[package]]
 name = "wecom-archive-desktop"
-version = "0.1.0"
+version = "0.0.2"
 dependencies = [
  "archive-domain",
  "archive-transfer",
@@ -4470,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "wecom-archive-server"
-version = "0.1.0"
+version = "0.0.2"
 dependencies = [
  "archive-domain",
  "archive-export",
@@ -5099,20 +5090,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zip"
-version = "8.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap 2.14.2",
- "memchr",
- "typed-path",
- "zopfli",
-]
-
-[[package]]
 name = "zlib-rs"
 version = "0.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5123,15 +5100,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[package]]
-name = "zopfli"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05cd8797d63865425ff89b5c4a48804f35ba0ce8d125800027ad6017d2b5249"
-dependencies = [
- "bumpalo",
- "crc32fast",
- "log",
- "simd-adler32",
-]

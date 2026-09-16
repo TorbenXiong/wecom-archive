@@ -22,6 +22,7 @@ export interface ConversationSummary {
   messageCount: number;
   mediaCount: number;
   participantCount: number;
+  isGroup: boolean;
 }
 
 export interface MessageItem {
@@ -34,8 +35,10 @@ export interface MessageItem {
   timeLabel: string;
   direction: MessageDirection;
   type: MessageType;
+  rawType?: string;
   body?: string;
   quote?: {
+    id: string;
     sender: string;
     time: string;
     body: string;
@@ -44,8 +47,15 @@ export interface MessageItem {
     name: string;
     meta: string;
     kind: "document" | "image" | "audio" | "video";
+    contentHash?: string;
   };
   lifecycle: "active" | "recalled";
+}
+
+export interface ParticipantItem {
+  id: string;
+  name: string;
+  kind?: string;
 }
 
 export interface SourceCandidate {
@@ -61,15 +71,9 @@ export interface SourceCandidate {
 }
 
 export interface BootstrapState {
-  portableRoot: string;
-  portableRootWritable: boolean;
-  sourceKeySaved: boolean;
-  automaticRefresh: boolean;
-  runtimeNetworkEnabled: boolean;
-  implementationStage: string;
-  enterpriseMode: boolean;
   organizationName?: string;
   collectionNotice?: string;
+  offlineExportEnabled?: boolean;
 }
 
 export interface FilterState {

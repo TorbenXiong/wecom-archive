@@ -188,6 +188,8 @@ pub struct ClientExportV1 {
     pub generated_at: DateTime<Utc>,
     pub client_version: String,
     pub media_transport: String,
+    #[serde(default)]
+    pub media_blobs: Vec<MediaBlobV1>,
     pub conversations: Vec<ConversationV1>,
     pub participants: Vec<ParticipantV1>,
     pub batches: Vec<ArchiveBatchV1>,
@@ -205,10 +207,27 @@ impl ClientExportV1 {
         if self.client_version.trim().is_empty() {
             return Err(DomainError::MissingField("client_version"));
         }
-        if self.media_transport != "metadata_only" {
+        if !matches!(
+            self.media_transport.as_str(),
+            "metadata_only" | "embedded_hex_v1"
+        ) {
             return Err(DomainError::UnsupportedMediaTransport(
                 self.media_transport.clone(),
             ));
+        }
+        if self.media_transport == "metadata_only" && !self.media_blobs.is_empty() {
+            return Err(DomainError::InvalidRelationship(
+                "metadata-only export cannot carry media blobs",
+            ));
+        }
+        let mut media_blob_ids = std::collections::BTreeSet::new();
+        for blob in &self.media_blobs {
+            if blob.content_hash.trim().is_empty() || blob.content_hex.trim().is_empty() {
+                return Err(DomainError::MissingField("media_blob"));
+            }
+            if !media_blob_ids.insert(blob.content_hash.as_str()) {
+                return Err(DomainError::DuplicateIdentifier("media_blob.content_hash"));
+            }
         }
         let conversation_ids = self
             .conversations
@@ -300,6 +319,15 @@ pub struct ParticipantV1 {
     pub participant_id: String,
     pub display_name: Option<String>,
     pub participant_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaBlobV1 {
+    pub content_hash: String,
+    pub original_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub size_bytes: u64,
+    pub content_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

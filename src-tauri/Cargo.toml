@@ -14,10 +14,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "WeComArchive"
 path = "src/main.rs"
 
-[[bin]]
-name = "WeComArchiveEnterprise"
-path = "src/enterprise_main.rs"
-
 [build-dependencies]
 tauri-build.workspace = true
 

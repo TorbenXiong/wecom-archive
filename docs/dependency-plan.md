@@ -1,6 +1,6 @@
-# 首次依赖解析清单
+# 依赖清单
 
-本文记录首轮 manifest 中的直接依赖。所有版本均精确锁定；执行 `pnpm install` 或 `cargo fetch/build/test` 后，还会由注册表解析传递依赖并生成锁文件。
+本文记录主要直接依赖。所有版本均精确锁定，完整解析结果以 `pnpm-lock.yaml` 和 `Cargo.lock` 为准。
 
 ## npm registry (`https://registry.npmjs.org`)
 
@@ -48,10 +48,9 @@
 | `thiserror` | `2.0.20` | 类型化错误 |
 | `uuid` | `1.26.0` | 稳定批次/任务 ID |
 | `chrono` | `0.4.45` | 时间 |
-| `sha2` | `0.11.0` | 内容寻址与 manifest hash |
+| `sha2` | `0.11.0` | 内容寻址、完整性和签名摘要 |
 | `hex` | `0.4.3` | hash 编码 |
 | `rusqlite` | `0.40.2` | 归档 SQLite/FTS5 |
-| `zip` | `8.6.0` | 全量导出 ZIP |
 | `csv` | `1.4.0` | CSV 流式输出 |
 | `futures-util` | `0.3.34` | 服务端流式接收客户端 JSON |
 | `walkdir` | `2.5.0` | 受控目录扫描 |
@@ -59,9 +58,9 @@
 | `zeroize` | `1.9.0` | 敏感内存清零 |
 | `tempfile` | `3.27.0` | 安全 staging 与测试夹具 |
 
-解析将创建根目录 `Cargo.lock`，下载 crate 源码到当前用户 Cargo 缓存；构建还会写入 `target/`。不会修改系统或用户环境变量。
+构建写入 `target/`，不会修改系统或用户环境变量。
 
-## 原生加密库（尚不在本轮解析）
+## 原生加密库
 
 SQLite3MultipleCiphers `2.5.1` 已从官方发布包
 `sqlite3mc-2.5.1-sqlite-3.53.4-amalgamation.zip` 获取，并以

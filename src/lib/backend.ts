@@ -13,11 +13,6 @@ interface SourceCandidateWire {
   }>;
 }
 
-export interface DirectorySelection {
-  handle: string;
-  displayPath: string;
-}
-
 export interface CollectionSummary {
   exportId: string;
   generatedAt: string;
@@ -27,11 +22,13 @@ export interface CollectionSummary {
   contentSha256Prefix: string;
 }
 
-export type ClientExportFormat = "json" | "csv" | "html" | "txt" | "wca";
+export interface UploadResult {
+  messageCount: number;
+}
 
-export interface ClientExportResult {
+export interface OfflineExportResult {
   fileName: string;
-  format: ClientExportFormat;
+  directory: string;
   messageCount: number;
 }
 
@@ -73,13 +70,9 @@ function parseBackendError(reason: unknown): BackendCommandError {
 }
 
 const browserBootstrap: BootstrapState = {
-  portableRoot: "…\\userData",
-  portableRootWritable: true,
-  sourceKeySaved: false,
-  automaticRefresh: true,
-  runtimeNetworkEnabled: false,
-  implementationStage: "browser-preview",
-  enterpriseMode: false,
+  organizationName: "示例组织",
+  collectionNotice: "仅采集您有权归档的企业微信记录。",
+  offlineExportEnabled: true,
 };
 
 export const backend = {
@@ -122,21 +115,6 @@ export const backend = {
     }));
   },
 
-  async pickDirectory(purpose: "source" | "export" | "portable_root"): Promise<DirectorySelection | undefined> {
-    if (!this.isNative()) return { handle: `preview-${purpose}`, displayPath: "…\\已选择目录" };
-    return (await invoke<DirectorySelection | null>("pick_directory", { purpose })) ?? undefined;
-  },
-
-  async discoverSelectedSource(selectionHandle: string): Promise<SourceCandidate[]> {
-    if (!this.isNative()) return this.discoverSources("…\\已选择目录");
-    return invoke<SourceCandidate[]>("discover_selected_source", { selectionHandle });
-  },
-
-  async setPortableRoot(selectionHandle: string): Promise<BootstrapState> {
-    if (!this.isNative()) return browserBootstrap;
-    return invoke<BootstrapState>("set_portable_root", { selectionHandle });
-  },
-
   async collectSourceAutomatically(sourceId: string): Promise<CollectionSummary> {
     if (!this.isNative()) {
       return {
@@ -153,20 +131,18 @@ export const backend = {
     });
   },
 
-  async exportLatest(format: ClientExportFormat, selectionHandle: string): Promise<ClientExportResult> {
-    if (!this.isNative()) {
-      return { fileName: `client-export-preview.${format}`, format, messageCount: 238 };
-    }
-    return invoke<ClientExportResult>("export_latest", { format, selectionHandle });
+  async uploadLatest(): Promise<UploadResult> {
+    if (!this.isNative()) return { messageCount: 238 };
+    return invoke<UploadResult>("upload_latest_enterprise");
   },
 
-  async openExportFolder(): Promise<void> {
-    if (!this.isNative()) return;
-    await invoke("open_export_folder");
+  async exportLatestEncrypted(): Promise<OfflineExportResult> {
+    if (!this.isNative()) return { fileName: "WeComArchive-preview.wca", directory: "…\\采集端目录", messageCount: 238 };
+    return invoke<OfflineExportResult>("export_latest_enterprise");
   },
 
-  async clearSavedKey(): Promise<void> {
+  async openOfflineExportDirectory(): Promise<void> {
     if (!this.isNative()) return;
-    await invoke("clear_saved_key");
+    await invoke("open_offline_export_directory");
   },
 };

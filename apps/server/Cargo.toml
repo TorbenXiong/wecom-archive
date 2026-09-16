@@ -7,10 +7,6 @@ authors.workspace = true
 rust-version.workspace = true
 build = "build.rs"
 
-[[bin]]
-name = "WeComArchiveServer"
-path = "src/main.rs"
-
 [dependencies]
 archive-domain.workspace = true
 archive-export.workspace = true
