@@ -1,6 +1,6 @@
 {
   "name": "wecom-archive",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "description": "Windows WeCom archive workspace and collector",
   "license": "MIT",

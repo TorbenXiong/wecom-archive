@@ -53,7 +53,7 @@ pub fn normalize(row: RawMessageRow, batch_id: Uuid) -> Result<MessageV1, ParseE
         .or_else(|| row.payload.get("reply_to"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let media = extract_media(&row.payload);
+    let media = extract_media(&row.payload, &message_type);
 
     Ok(MessageV1 {
         schema_version: MESSAGE_SCHEMA_VERSION.into(),
@@ -148,10 +148,18 @@ fn clean_readable_text(value: &str) -> Option<String> {
     (!cleaned.is_empty()).then(|| cleaned.to_owned())
 }
 
-fn extract_media(payload: &Value) -> Vec<MediaRefV1> {
+fn extract_media(payload: &Value, message_type: &MessageType) -> Vec<MediaRefV1> {
+    if !matches!(
+        message_type,
+        MessageType::Image | MessageType::File | MessageType::Audio | MessageType::Video
+    ) {
+        return vec![];
+    }
     let Some(locator) = payload
         .get("media_path")
         .or_else(|| payload.get("file_path"))
+        .or_else(|| payload.get("local_path"))
+        .or_else(|| payload.get("path"))
         .and_then(Value::as_str)
     else {
         return vec![];
@@ -162,10 +170,12 @@ fn extract_media(payload: &Value) -> Vec<MediaRefV1> {
         original_name: payload
             .get("name")
             .or_else(|| payload.get("filename"))
+            .or_else(|| payload.get("file_name"))
             .and_then(Value::as_str)
             .map(str::to_owned),
         mime_type: payload
             .get("mime")
+            .or_else(|| payload.get("mime_type"))
             .and_then(Value::as_str)
             .map(str::to_owned),
         size_bytes: payload.get("size").and_then(Value::as_u64),
@@ -229,5 +239,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(message.body_text.as_deref(), Some("你好\n世界"));
+    }
+
+    #[test]
+    fn reads_common_local_media_path_aliases_only_for_media_messages() {
+        let image = normalize(
+            row(
+                "image",
+                json!({"local_path":"Image/2026/photo.png", "file_name":"photo.png", "mime_type":"image/png"}),
+            ),
+            Uuid::nil(),
+        )
+        .unwrap();
+        assert_eq!(image.media.len(), 1);
+        assert_eq!(image.media[0].source_locator, "Image/2026/photo.png");
+        assert_eq!(image.media[0].original_name.as_deref(), Some("photo.png"));
+
+        let text = normalize(
+            row(
+                "text",
+                json!({"text":"普通消息", "local_path":"C:/private/profile"}),
+            ),
+            Uuid::nil(),
+        )
+        .unwrap();
+        assert!(text.media.is_empty());
     }
 }

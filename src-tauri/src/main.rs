@@ -16,7 +16,7 @@ fn main() {
 
     let server = Arc::new(
         wecom_archive_server::start_desktop_server_with_local_collector(
-            wecom_archive_desktop::collect_local_export,
+            wecom_archive_desktop::collect_local_export_with_progress,
         )
         .unwrap_or_else(|message| exit_with_error(&message)),
     );

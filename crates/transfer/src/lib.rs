@@ -456,7 +456,7 @@ fn redact_sensitive_json_with_exclusions(value: &mut serde_json::Value, excluded
         serde_json::Value::Object(map) => {
             for (key, item) in map {
                 if is_sensitive_label(key) {
-                    redact_all_json_values(item);
+                    redact_sensitive_labeled_json_values(item, key, excluded_names);
                 } else {
                     redact_sensitive_json_with_exclusions(item, excluded_names);
                 }
@@ -649,9 +649,10 @@ fn is_compact_credential(value: &str) -> bool {
     let value = value.trim_matches(|character: char| {
         character.is_whitespace() || matches!(character, '"' | '\'' | '“' | '”')
     });
-    !value.is_empty()
+    value.chars().count() >= 6
         && value.len() <= 256
         && value.is_ascii()
+        && !is_date_like(value)
         && !value.chars().any(char::is_whitespace)
         && value
             .chars()
@@ -806,8 +807,9 @@ fn should_redact_mixed_token(value: &str) -> bool {
                 | '~'
         )
     });
-    value.len() >= 4
+    value.chars().count() >= 6
         && value.len() <= 512
+        && !is_date_like(value)
         && ((has_letter && has_digit)
             || (has_digit && has_symbol)
             || (has_letter && has_strong_symbol))
@@ -959,13 +961,100 @@ fn is_credential_token_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | '+' | '@')
 }
 
-fn redact_all_json_values(value: &mut serde_json::Value) {
+fn redact_sensitive_labeled_json_values(
+    value: &mut serde_json::Value,
+    label: &str,
+    excluded_names: &[String],
+) {
     match value {
-        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_all_json_values),
-        serde_json::Value::Object(map) => map.values_mut().for_each(redact_all_json_values),
+        serde_json::Value::String(text) => {
+            if is_plausible_labeled_value(label, text) {
+                *text = REDACTION_PLACEHOLDER.into();
+            } else {
+                *text = redact_sensitive_text_with_exclusions(text, excluded_names);
+            }
+        }
+        serde_json::Value::Number(number) => {
+            let candidate = number.to_string();
+            if candidate.chars().count() >= 6 && !is_date_like(&candidate) {
+                *value = serde_json::Value::String(REDACTION_PLACEHOLDER.into());
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_sensitive_labeled_json_values(item, label, excluded_names)),
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                if is_sensitive_label(key) {
+                    redact_sensitive_labeled_json_values(item, key, excluded_names);
+                } else {
+                    redact_sensitive_json_with_exclusions(item, excluded_names);
+                }
+            }
+        }
         serde_json::Value::Null => {}
-        _ => *value = serde_json::Value::String(REDACTION_PLACEHOLDER.into()),
+        serde_json::Value::Bool(_) => {}
     }
+}
+
+fn is_date_like(value: &str) -> bool {
+    let value = value.trim();
+    if is_time_like(value) {
+        return true;
+    }
+    let date = value
+        .split_once('T')
+        .map(|(date, _)| date)
+        .or_else(|| value.split_once(' ').map(|(date, _)| date))
+        .unwrap_or(value)
+        .trim_end_matches('日');
+    if date.len() == 8 && date.chars().all(|character| character.is_ascii_digit()) {
+        let Ok(year) = date[..4].parse::<u16>() else {
+            return false;
+        };
+        let Ok(month) = date[4..6].parse::<u8>() else {
+            return false;
+        };
+        let Ok(day) = date[6..].parse::<u8>() else {
+            return false;
+        };
+        return (1900..=2999).contains(&year)
+            && (1..=12).contains(&month)
+            && (1..=31).contains(&day);
+    }
+    let normalized = date.replace(['/', '.', '年', '月'], "-");
+    let parts = normalized.split('-').collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0].len() != 4 {
+        return false;
+    }
+    let Ok(year) = parts[0].parse::<u16>() else {
+        return false;
+    };
+    let Ok(month) = parts[1].parse::<u8>() else {
+        return false;
+    };
+    let Ok(day) = parts[2].parse::<u8>() else {
+        return false;
+    };
+    (1900..=2999).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+fn is_time_like(value: &str) -> bool {
+    let parts = value.split(':').collect::<Vec<_>>();
+    if !(2..=3).contains(&parts.len()) || parts.iter().any(|part| part.len() != 2) {
+        return false;
+    }
+    let Ok(hour) = parts[0].parse::<u8>() else {
+        return false;
+    };
+    let Ok(minute) = parts[1].parse::<u8>() else {
+        return false;
+    };
+    let second = parts
+        .get(2)
+        .and_then(|part| part.parse::<u8>().ok())
+        .unwrap_or(0);
+    hour <= 23 && minute <= 59 && second <= 59
 }
 
 fn sanitize_json(value: &mut serde_json::Value, key: Option<&str>) {
@@ -1008,6 +1097,14 @@ pub fn write_json(export: &ClientExportV1, target: &Path) -> Result<(), Transfer
 /// name fields are ignored by the typed importer but make manual inspection
 /// useful without resolving participant IDs by hand.
 pub fn write_importable_json(export: &ClientExportV1, target: &Path) -> Result<(), TransferError> {
+    write_importable_json_formatted(export, target, true)
+}
+
+pub fn write_importable_json_formatted(
+    export: &ClientExportV1,
+    target: &Path,
+    pretty: bool,
+) -> Result<(), TransferError> {
     export.validate()?;
     verify_checksum(export)?;
     let participant_names = export
@@ -1078,7 +1175,11 @@ pub fn write_importable_json(export: &ClientExportV1, target: &Path) -> Result<(
         }
     }
     atomic_write(target, |writer| {
-        serde_json::to_writer_pretty(writer, &document)?;
+        if pretty {
+            serde_json::to_writer_pretty(writer, &document)?;
+        } else {
+            serde_json::to_writer(writer, &document)?;
+        }
         Ok(())
     })
 }
@@ -1736,6 +1837,16 @@ mod tests {
         assert_eq!(imported.conversations, export.conversations);
         assert_eq!(imported.participants, export.participants);
         assert_eq!(imported.batches, export.batches);
+
+        let compact_path = directory.path().join("compact.json");
+        write_importable_json_formatted(&export, &compact_path, false).unwrap();
+        let compact = fs::read_to_string(&compact_path).unwrap();
+        assert!(!compact.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&compact).unwrap(),
+            document
+        );
+        assert_eq!(read_json(&compact_path).unwrap(), imported);
     }
 
     #[test]
@@ -2007,7 +2118,7 @@ mod tests {
         );
         assert_eq!(
             redact_sensitive_text("无标签值 abc123、abc_def、2026-09-15"),
-            "无标签值 [敏感数据已脱敏]、[敏感数据已脱敏]、[敏感数据已脱敏]"
+            "无标签值 [敏感数据已脱敏]、[敏感数据已脱敏]、2026-09-15"
         );
         assert_eq!(
             redact_sensitive_text("普通英文 hello world."),
@@ -2026,7 +2137,7 @@ mod tests {
         );
         assert_eq!(
             redacted,
-            "用户名为：[敏感数据已脱敏]；访问令牌是 [敏感数据已脱敏]；验证码 [敏感数据已脱敏]；银行卡号 [敏感数据已脱敏]"
+            "用户名为：admin；访问令牌是 [敏感数据已脱敏]；验证码 [敏感数据已脱敏]；银行卡号 [敏感数据已脱敏]"
         );
         assert_eq!(
             redact_sensitive_text("手机号 +86 138 0013 8000，讨论密码策略和账号体系。"),
@@ -2063,16 +2174,10 @@ mod tests {
 
         assert_eq!(
             messages[0].body_text.as_deref(),
-            Some("[敏感数据已脱敏]跟[敏感数据已脱敏]")
+            Some("sa跟[敏感数据已脱敏]")
         );
-        assert_eq!(
-            messages[0].raw_payload["content"],
-            "[敏感数据已脱敏]跟[敏感数据已脱敏]"
-        );
-        assert_eq!(
-            messages[0].raw_payload["short_value"],
-            REDACTION_PLACEHOLDER
-        );
+        assert_eq!(messages[0].raw_payload["content"], "sa跟[敏感数据已脱敏]");
+        assert_eq!(messages[0].raw_payload["short_value"], "sa");
         assert_eq!(messages[0].raw_payload["unrelated_word"], "message");
     }
 
@@ -2114,6 +2219,40 @@ mod tests {
         assert_eq!(payload["profile"]["api_key"][0], REDACTION_PLACEHOLDER);
         assert_eq!(payload["profile"]["api_key"][1], REDACTION_PLACEHOLDER);
         assert_eq!(payload["profile"]["message"], "普通内容");
+    }
+
+    #[test]
+    fn preserves_dates_and_short_account_or_password_values() {
+        assert_eq!(
+            redact_sensitive_text("账号：admin；密码：a1b2；日期：2026-09-15"),
+            "账号：admin；密码：a1b2；日期：2026-09-15"
+        );
+        assert_eq!(
+            redact_sensitive_text("账号：admin1；密码：a1b2c3"),
+            "账号：[敏感数据已脱敏]；密码：[敏感数据已脱敏]"
+        );
+        assert_eq!(
+            redact_sensitive_text("账号：2026/09/15；密码：2026年09月15日"),
+            "账号：2026/09/15；密码：2026年09月15日"
+        );
+        assert_eq!(
+            redact_sensitive_text("账号：20260915；记录时间 2026-09-15 10:20:30"),
+            "账号：20260915；记录时间 2026-09-15 10:20:30"
+        );
+
+        let mut payload = serde_json::json!({
+            "account": "admin",
+            "password": "a1b2",
+            "token": "abcdef",
+            "profile": { "password": "2026-09-15", "mobile": 12345, "account": 20260915 }
+        });
+        redact_sensitive_json(&mut payload);
+        assert_eq!(payload["account"], "admin");
+        assert_eq!(payload["password"], "a1b2");
+        assert_eq!(payload["token"], REDACTION_PLACEHOLDER);
+        assert_eq!(payload["profile"]["password"], "2026-09-15");
+        assert_eq!(payload["profile"]["mobile"], 12345);
+        assert_eq!(payload["profile"]["account"], 20260915);
     }
 
     #[test]

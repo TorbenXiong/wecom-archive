@@ -52,8 +52,12 @@ function installApiMock() {
     if (url.includes("/imports/json")) {
       return Response.json({ exportId: "json-export-1", batchCount: 1, inserted: 2, unchanged: 0, revised: 0 });
     }
+    if (url.includes("/collections/local/progress")) {
+      return Response.json({ running: true, percent: 52, stage: "扫描媒体目录", detail: "正在建立图片和文件索引，不会修改源目录。" });
+    }
     if (url.includes("/collections/local")) {
-      return Response.json({ exportId: "local-export-1", batchCount: 1, inserted: 3, unchanged: 1, revised: 1 });
+      const includeMedia = new URL(url, "http://localhost").searchParams.get("include_media") === "true";
+      return Response.json({ exportId: "local-export-1", batchCount: 1, inserted: 3, unchanged: 1, revised: 1, mediaCount: includeMedia ? 5 : 0, missingMediaCount: includeMedia ? 1 : 0 });
     }
     if (url.includes("/exports/local")) {
       return Response.json({ exportId: "local-file-1", fileName: "local-export.csv", directory: "D:\\serverData\\exports", messageCount: 238, mediaCount: 0, missingMediaCount: 0, manifestSha256: "hash" });
@@ -66,6 +70,8 @@ function installApiMock() {
 async function connect() {
   fireEvent.change(screen.getByLabelText("服务端访问令牌"), { target: { value: accessToken } });
   fireEvent.click(screen.getByRole("button", { name: "验证并进入工作台" }));
+  await screen.findByRole("heading", { name: "快速导出本机记录", level: 2 });
+  fireEvent.click(screen.getByRole("button", { name: "会话" }));
   await screen.findByRole("heading", { name: "真实 API 会话", level: 1 });
 }
 
@@ -76,6 +82,19 @@ afterEach(() => {
 });
 
 describe("archive workspace", () => {
+  it("opens the export directory from both page toolbars and shows failures", async () => {
+    installApiMock();
+    render(<App />);
+    await connect();
+    fireEvent.click(screen.getByRole("button", { name: "导出目录" }));
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith("/exports/open-directory"))).toBe(true));
+    fireEvent.click(screen.getByRole("button", { name: "本机" }));
+    vi.mocked(fetch).mockResolvedValueOnce(Response.json({ message: "无法打开导出目录。" }, { status: 500 }));
+    fireEvent.click(screen.getByRole("button", { name: "导出目录" }));
+    expect(await screen.findByText("无法打开导出目录。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "导出目录" })).toBeEnabled();
+  });
+
   it("shows startup progress instead of the access form while automatic authentication is pending", async () => {
     installApiMock();
     const apiFetch = vi.mocked(fetch).getMockImplementation()!;
@@ -94,7 +113,9 @@ describe("archive workspace", () => {
     expect(screen.queryByText("连接归档工作台")).not.toBeInTheDocument();
 
     releaseRequests();
-    expect(await screen.findByRole("heading", { name: "真实 API 会话", level: 1 })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "快速导出本机记录", level: 2 })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "本机" })).toHaveClass("active");
+    for (const name of ["数据脱敏", "简化信息", "美化信息"]) expect(screen.getByRole("checkbox", { name })).toBeChecked();
     expect(screen.queryByText("正在启动归档工作台")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("服务端访问令牌")).not.toBeInTheDocument();
     expect(window.location.hash).toBe("");
@@ -178,6 +199,8 @@ describe("archive workspace", () => {
     render(<App />);
     fireEvent.change(screen.getByLabelText("服务端访问令牌"), { target: { value: accessToken } });
     fireEvent.click(screen.getByRole("button", { name: "验证并进入工作台" }));
+    await screen.findByRole("heading", { name: "快速导出本机记录", level: 2 });
+    fireEvent.click(screen.getByRole("button", { name: "会话" }));
     await screen.findByRole("heading", { name: "人员甲、人员乙", level: 1 });
     expect(screen.getAllByText("私人会话").length).toBeGreaterThan(0);
     expect(await screen.findByText(/共 201 条消息/)).toBeInTheDocument();
@@ -241,14 +264,26 @@ describe("archive workspace", () => {
     expect(await screen.findByText("会话导入完成：新增 2 条消息。"),).toBeInTheDocument();
   });
 
-  it("collects the local client from the conversation toolbar and merges it into the archive", async () => {
+  it("collects text-only messages from the conversation footer and merges them into the archive", async () => {
     installApiMock();
     render(<App />);
     await connect();
     fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /仅文本消息/ }));
     expect(screen.getByRole("dialog", { name: "正在采集本机数据" })).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "本机采集进度" })).toBeInTheDocument();
     expect(await screen.findByText("本机采集完成：新增 3 条，更新 1 条消息。")).toBeInTheDocument();
-    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/collections/local"))).toBe(true);
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/collections/local?include_media=false"))).toBe(true);
+  });
+
+  it("can include images and files in a local collection", async () => {
+    installApiMock();
+    render(<App />);
+    await connect();
+    fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /包含图片和文件/ }));
+    expect(await screen.findByText("本机采集完成：新增 3 条，更新 1 条消息；采集媒体 5 项，1 项源文件未找到。")).toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/collections/local?include_media=true"))).toBe(true);
   });
 
   it("keeps a fast local export flow with format and redaction controls", async () => {
@@ -262,10 +297,40 @@ describe("archive workspace", () => {
     expect(screen.queryByText("本机数据")).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "本机导出", level: 1 })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "CSV" }));
-    fireEvent.click(screen.getByLabelText("数据脱敏"));
+    const redaction = screen.getByRole("checkbox", { name: "数据脱敏" });
+    const simplify = screen.getByRole("checkbox", { name: "简化信息" });
+    const pretty = screen.getByRole("checkbox", { name: "美化信息" });
+    expect(redaction).toBeChecked();
+    expect(simplify).toBeChecked();
+    expect(pretty).toBeChecked();
+    expect(redaction.closest("label")?.getAttribute("title")).toContain("疑似凭据片段");
+    expect(simplify.closest("label")?.getAttribute("title")).toContain("去掉系统 ID");
+    expect(pretty.closest("label")?.getAttribute("title")).toContain("易读排版");
+    expect(redaction.closest(".export-presentation-options")?.querySelectorAll("label")).toHaveLength(3);
+    expect(screen.queryByText(/简化 JSON 仅供阅读/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/关闭时紧凑输出/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "开始导出" }));
     expect(await screen.findByText(/本机导出完成：local-export.csv/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "打开导出目录" })).toBeInTheDocument();
+    const exportCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith("/exports/local"));
+    expect(JSON.parse(String(exportCall?.[1]?.body))).toEqual({ format: "csv", dataRedaction: true, simplify: true, pretty: true });
+  });
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])("sends independent server export options simplify=%s pretty=%s", async (simplify, pretty) => {
+    installApiMock();
+    render(<App />);
+    await connect();
+    fireEvent.click(screen.getByRole("button", { name: "导出" }));
+    expect(screen.getByRole("checkbox", { name: "简化信息" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "美化信息" })).toBeChecked();
+    if (!simplify) fireEvent.click(screen.getByRole("checkbox", { name: "简化信息" }));
+    if (!pretty) fireEvent.click(screen.getByRole("checkbox", { name: "美化信息" }));
+    fireEvent.click(screen.getByRole("button", { name: "开始导出" }));
+    await waitFor(() => {
+      const exportCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith("/exports"));
+      expect(exportCall).toBeDefined();
+      expect(JSON.parse(String(exportCall?.[1]?.body))).toMatchObject({ simplify, pretty, dataRedaction: true });
+    });
   });
 
   it("imports a local JSON archive from the conversation page", async () => {
@@ -305,6 +370,8 @@ describe("archive workspace", () => {
     render(<App />);
     fireEvent.change(screen.getByLabelText("服务端访问令牌"), { target: { value: accessToken } });
     fireEvent.click(screen.getByRole("button", { name: "验证并进入工作台" }));
+    await screen.findByRole("heading", { name: "快速导出本机记录", level: 2 });
+    fireEvent.click(screen.getByRole("button", { name: "会话" }));
     await screen.findByRole("heading", { name: "自动刷新会话", level: 1 });
     expect(await screen.findByText("刷新前消息")).toBeInTheDocument();
     revision = 2;
@@ -341,9 +408,9 @@ describe("archive workspace", () => {
     render(<App />);
     await connect();
     fireEvent.click(screen.getByRole("button", { name: "导出" }));
-    expect(screen.getByRole("checkbox", { name: "数据脱敏" })).not.toBeChecked();
-    fireEvent.click(screen.getByRole("checkbox", { name: "数据脱敏" }));
     expect(screen.getByRole("checkbox", { name: "数据脱敏" })).toBeChecked();
+    fireEvent.click(screen.getByRole("checkbox", { name: "数据脱敏" }));
+    expect(screen.getByRole("checkbox", { name: "数据脱敏" })).not.toBeChecked();
     fireEvent.click(screen.getByText("全部档案"));
     fireEvent.click(screen.getByText("开始导出"));
     expect(screen.getByRole("heading", { name: "确认导出全部档案" })).toBeInTheDocument();

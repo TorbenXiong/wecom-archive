@@ -1,18 +1,16 @@
-import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, FileText, Image, LoaderCircle, Megaphone, MoreVertical, Search, SlidersHorizontal, UploadCloud } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, FileText, Image, Megaphone, MoreVertical, Search, SlidersHorizontal, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ConversationSummary, MessageItem, ParticipantItem } from "../domain/types";
-import { getMediaObjectUrl } from "../lib/server-api";
+import { getMediaObjectUrl, openMediaFile } from "../lib/server-api";
 import { ParticipantCard } from "./ParticipantCard";
+import { ExportDirectoryButton } from "./ExportDirectoryButton";
 
 interface MessageTimelineProps {
   token: string;
   conversation: ConversationSummary;
   messages: MessageItem[];
   participants: ParticipantItem[];
-  onExport: () => void;
-  localCollectionAvailable?: boolean;
-  collectingLocal?: boolean;
-  onCollectLocal?: () => void;
+  onOpenDirectoryFailed?: (error: unknown) => void;
   status?: string;
   pageIndex?: number;
   pageSize?: number;
@@ -22,6 +20,8 @@ interface MessageTimelineProps {
   onPageSizeChange?: (pageSize: number) => void;
   onPreviousPage?: () => void;
   onNextPage?: () => void;
+  targetMessageId?: string;
+  onTargetLocated?: () => void;
 }
 
 export function MessageTimeline({
@@ -30,10 +30,7 @@ export function MessageTimeline({
   messages,
   participants,
   status,
-  onExport,
-  localCollectionAvailable,
-  collectingLocal,
-  onCollectLocal,
+  onOpenDirectoryFailed,
   pageIndex = 0,
   pageSize = 200,
   totalMessages = conversation.messageCount,
@@ -42,6 +39,8 @@ export function MessageTimeline({
   onPageSizeChange,
   onPreviousPage,
   onNextPage,
+  targetMessageId,
+  onTargetLocated,
 }: MessageTimelineProps) {
   const [sortAscending, setSortAscending] = useState(true);
   const [messageSearch, setMessageSearch] = useState("");
@@ -95,25 +94,44 @@ export function MessageTimeline({
   }, [ordered.length]);
 
   const scrollToEdge = (edge: "top" | "bottom") => {
-    const items = scrollRef.current?.querySelectorAll<HTMLElement>("[data-message-id]");
-    const target = items?.[edge === "top" ? 0 : items.length - 1];
-    target?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    const element = scrollRef.current;
+    element?.scrollTo({ top: edge === "top" ? 0 : element.scrollHeight, behavior: "smooth" });
   };
+
+  useEffect(() => {
+    if (targetMessageId) return;
+    const element = scrollRef.current;
+    if (!element) return;
+    if (typeof element.scrollTo === "function") element.scrollTo({ top: 0, behavior: "auto" });
+    else element.scrollTop = 0;
+  }, [pageIndex]);
+
+  useEffect(() => {
+    if (!targetMessageId) return;
+    const target = Array.from(scrollRef.current?.querySelectorAll<HTMLElement>("[data-message-id]") || [])
+      .find((item) => item.dataset.messageId === targetMessageId);
+    if (!target) return;
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    setHighlightedMessageId(targetMessageId);
+    onTargetLocated?.();
+    window.setTimeout(() => setHighlightedMessageId((current) => current === targetMessageId ? undefined : current), 2200);
+  }, [ordered, onTargetLocated, targetMessageId]);
 
   return (
     <section className="timeline-pane" aria-label="消息时间线">
       <header className="timeline-header">
         <div className="timeline-heading"><h1>{conversation.title}</h1><em className="conversation-kind-badge">{conversation.isGroup ? "群会话" : "私人会话"}</em><label className="message-search"><Search size={16} /><input value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="搜索当前会话消息…" /></label></div>
         <div className="timeline-actions">
-          {localCollectionAvailable && <button className="timeline-collect-button" type="button" disabled={collectingLocal} onClick={onCollectLocal}>{collectingLocal ? <LoaderCircle className="spin" size={15} /> : <UploadCloud size={15} />}{collectingLocal ? "采集中…" : "采集本机"}</button>}
           <button type="button" onClick={() => setSortAscending((value) => !value)}><SlidersHorizontal size={15} />按时间{sortAscending ? "升序" : "降序"}</button>
-          <button className="timeline-export-button" type="button" onClick={onExport}><Download size={15} />导出</button>
+          {onOpenDirectoryFailed && <ExportDirectoryButton token={token} onFailed={onOpenDirectoryFailed} />}
           <button className="icon-button" type="button" aria-label="更多操作"><MoreVertical size={18} /></button>
         </div>
       </header>
       <div className="date-divider">{boundaryDate && <span>{sortAscending ? `较早消息在前 · ${boundaryDate}` : `最近消息 · ${boundaryDate}`}</span>}</div>
-      <div className="message-scroll" ref={scrollRef}>
-        {ordered.length === 0 ? <div className="empty-state"><span>{status || "当前条件下没有消息"}</span>{localCollectionAvailable && !conversation.id && <button className="primary-button" type="button" disabled={collectingLocal} onClick={onCollectLocal}><UploadCloud size={17} />采集本机企业微信</button>}</div> : ordered.map((message) => <MessageRow key={message.id} token={token} message={message} highlighted={highlightedMessageId === message.id} onShowParticipant={() => showParticipant(message)} onLocateQuote={locateMessage} />)}
+      <div className="message-scroll-frame">
+        <div className="message-scroll" ref={scrollRef}>
+          {ordered.length === 0 ? <div className="empty-state"><span>{status || "当前条件下没有消息"}</span></div> : ordered.map((message) => <MessageRow key={message.id} token={token} message={message} highlighted={highlightedMessageId === message.id} onShowParticipant={() => showParticipant(message)} onLocateQuote={locateMessage} />)}
+        </div>
         {showTopJump && <button className="latest-position-button at-top" type="button" onClick={() => scrollToEdge("top")} aria-label="到最上面" title="到最上面"><ChevronUp size={17} />到最上面</button>}
         {showBottomJump && <button className="latest-position-button" type="button" onClick={() => scrollToEdge("bottom")} aria-label="到最下面" title="到最下面"><ChevronDown size={17} />到最下面</button>}
       </div>
@@ -149,28 +167,48 @@ function isOpaqueSystemIdentifier(value?: string): boolean {
 function MessageRow({ token, message, highlighted, onShowParticipant, onLocateQuote }: { token: string; message: MessageItem; highlighted: boolean; onShowParticipant: () => void; onLocateQuote: (messageId: string) => void }) {
   if (message.direction === "system") {
     const announcement = message.rawType === "group_announcement" || message.body?.includes("公告");
-    return <div className={announcement ? "system-message announcement-message" : "system-message"} data-message-id={message.id}><time>{message.timeLabel}</time><span>{announcement && <Megaphone size={14} />}{message.body || "系统消息"}</span></div>;
+    return <article className={highlighted ? "message-row system-message-row highlighted" : "message-row system-message-row"} data-message-id={message.id}>
+      <div className="message-content">
+        <div className="message-meta"><span className="system-sender-name">{message.senderName || "系统"}</span><time className="message-time">{formatFullTimestamp(message.sentAt)}</time></div>
+        <div className={announcement ? "message-bubble announcement-message" : "message-bubble"}><p>{announcement && <Megaphone size={14} />}{message.body || "系统消息"}</p></div>
+      </div>
+    </article>;
   }
+  const body = message.body?.trim();
+  const attachmentOnly = Boolean(
+    message.attachment
+      && !message.quote
+      && (message.type === "image" || message.type === "file")
+      && (!body || body === message.attachment.name.trim()),
+  );
   return (
     <article className={highlighted ? "message-row highlighted" : "message-row"} data-message-id={message.id}>
-      <time className="message-time">{message.timeLabel}</time>
-      <button className="sender-avatar" type="button" title={`查看 ${message.senderName} 的资料`} onClick={onShowParticipant}>{message.senderInitial}</button>
       <div className="message-content">
-        <button className="sender-name" type="button" onClick={onShowParticipant}>{message.senderName}</button>
-        <div className="message-bubble">
-          {message.quote && <button className="quote-block" type="button" onClick={() => onLocateQuote(message.quote!.id)} title="定位到原消息"><span><strong>{message.quote.sender}</strong>{message.quote.time && <> · {message.quote.time}</>}</span><p>{message.quote.body}</p></button>}
-          {message.body && <p>{message.body}</p>}
-          {message.attachment && <Attachment token={token} attachment={message.attachment} />}
-        </div>
+        <div className="message-meta"><button className="sender-name" type="button" onClick={onShowParticipant}>{message.senderName}</button><time className="message-time">{formatFullTimestamp(message.sentAt)}</time></div>
+        {attachmentOnly
+          ? <div className="message-attachment-only"><Attachment token={token} attachment={message.attachment!} /></div>
+          : <div className="message-bubble">
+            {message.quote && <button className="quote-block" type="button" onClick={() => onLocateQuote(message.quote!.id)} title="定位到原消息"><span><strong>{message.quote.sender}</strong>{message.quote.time && <> · {message.quote.time}</>}</span><p>{message.quote.body}</p></button>}
+            {message.body && <p>{message.body}</p>}
+            {message.attachment && <Attachment token={token} attachment={message.attachment} />}
+          </div>}
       </div>
     </article>
   );
+}
+
+function formatFullTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function Attachment({ token, attachment }: { token: string; attachment: NonNullable<MessageItem["attachment"]> }) {
   const [objectUrl, setObjectUrl] = useState<string>();
   const [loading, setLoading] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
   useEffect(() => {
     let cancelled = false;
     if (attachment.kind === "image" && attachment.contentHash) {
@@ -188,25 +226,35 @@ function Attachment({ token, attachment }: { token: string; attachment: NonNulla
   const open = async () => {
     if (!attachment.contentHash || loading) return;
     setLoading(true);
+    setUnavailable(false);
     try {
-      const url = objectUrl || await getMediaObjectUrl(token, attachment.contentHash);
-      if (!objectUrl) setObjectUrl(url);
-      window.open(url, "_blank", "noopener,noreferrer");
+      if (attachment.kind === "image") {
+        const url = objectUrl || await getMediaObjectUrl(token, attachment.contentHash);
+        if (!objectUrl) setObjectUrl(url);
+        setPreviewOpen(true);
+      } else {
+        await openMediaFile(token, attachment.contentHash, attachment.name);
+      }
+    } catch {
+      setUnavailable(true);
     } finally {
       setLoading(false);
     }
   };
   if (attachment.kind === "image") {
-    return <button className="image-preview" type="button" aria-label={`查看图片 ${attachment.name}`} onClick={() => void open()} disabled={!attachment.contentHash || loading || unavailable}>
-      {objectUrl ? <img src={objectUrl} alt={attachment.name} /> : <div className="mini-layout"><span /><span /><span /><span /></div>}
-      <div><Image size={15} />{loading ? "正在读取…" : unavailable ? "未上传图片内容" : attachment.meta}</div>
-    </button>;
+    return <>
+      <button className="image-preview" type="button" aria-label={`查看图片 ${attachment.name}`} onClick={() => void open()} disabled={!attachment.contentHash || loading || unavailable}>
+        {objectUrl ? <img src={objectUrl} alt={attachment.name} /> : <div className="mini-layout"><span /><span /><span /><span /></div>}
+        <div><Image size={15} />{loading ? "正在读取…" : unavailable ? "未上传图片内容" : attachment.meta}</div>
+      </button>
+      {previewOpen && objectUrl && <div className="media-preview-backdrop" role="presentation" onMouseDown={() => setPreviewOpen(false)}><section className="media-preview-dialog" role="dialog" aria-modal="true" aria-label={`图片预览 ${attachment.name}`} onMouseDown={(event) => event.stopPropagation()}><button type="button" aria-label="关闭图片预览" onClick={() => setPreviewOpen(false)}><X size={20} /></button><img src={objectUrl} alt={attachment.name} /><span>{attachment.name}</span></section></div>}
+    </>;
   }
   return (
-    <div className="file-card">
+    <button className={unavailable ? "file-card unavailable" : "file-card"} type="button" onClick={() => void open()} disabled={!attachment.contentHash || loading} aria-label={`打开附件 ${attachment.name}`} title={attachment.contentHash ? `打开 ${attachment.name}` : "源文件不可用"}>
       <span className="file-icon"><FileText size={20} /></span>
-      <span><strong>{attachment.name}</strong><small>{attachment.meta}</small></span>
-      <button type="button" aria-label="查看附件" title="查看附件" onClick={() => void open()} disabled={!attachment.contentHash || loading}><Download size={17} /></button>
-    </div>
+      <span><strong>{attachment.name}</strong><small>{loading ? "正在打开…" : unavailable ? "打开失败，请重试" : attachment.meta}</small></span>
+      <Download size={17} />
+    </button>
   );
 }

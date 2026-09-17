@@ -1,7 +1,14 @@
 import { fireEvent, render, screen } from "@testing-library/react";
-import { vi } from "vitest";
+import { beforeEach, vi } from "vitest";
 import { MessageTimeline } from "./MessageTimeline";
 import type { ConversationSummary, MessageItem } from "../domain/types";
+
+const mediaApi = vi.hoisted(() => ({
+  getMediaObjectUrl: vi.fn(() => new Promise<string>(() => undefined)),
+  openMediaFile: vi.fn(async () => ({ opened: true })),
+}));
+
+vi.mock("../lib/server-api", () => mediaApi);
 
 const conversation: ConversationSummary = {
   id: "conversation-1",
@@ -47,22 +54,24 @@ const messages: MessageItem[] = [
 ];
 
 describe("message timeline", () => {
+  beforeEach(() => {
+    mediaApi.getMediaObjectUrl.mockClear();
+    mediaApi.openMediaFile.mockClear();
+  });
+
   it("shows messages in chronological order and offers floating jumps to both edges", () => {
-    const originalScrollIntoView = Element.prototype.scrollIntoView;
-    const scrollIntoView = vi.fn();
-    Element.prototype.scrollIntoView = scrollIntoView;
-    try {
-      const { container } = render(
+    const { container } = render(
         <MessageTimeline
           token="test-token"
           conversation={conversation}
           messages={messages}
           participants={[]}
-          onExport={vi.fn()}
         />,
       );
       const scroll = container.querySelector<HTMLElement>(".message-scroll");
       expect(scroll).not.toBeNull();
+      const scrollTo = vi.fn();
+      Object.defineProperty(scroll, "scrollTo", { configurable: true, value: scrollTo });
       Object.defineProperty(scroll, "scrollHeight", { configurable: true, value: 800 });
       Object.defineProperty(scroll, "clientHeight", { configurable: true, value: 300 });
       Object.defineProperty(scroll, "scrollTop", { configurable: true, writable: true, value: 120 });
@@ -76,9 +85,57 @@ describe("message timeline", () => {
       const jumpButton = screen.getByRole("button", { name: "到最下面" });
       expect(jumpButton).toBeInTheDocument();
       fireEvent.click(jumpButton);
-      expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "smooth", block: "nearest" });
-    } finally {
-      Element.prototype.scrollIntoView = originalScrollIntoView;
-    }
+      expect(scrollTo).toHaveBeenCalledWith({ behavior: "smooth", top: 800 });
+      fireEvent.click(screen.getByRole("button", { name: "到最上面" }));
+      expect(scrollTo).toHaveBeenCalledWith({ behavior: "smooth", top: 0 });
+  });
+
+  it("shows sender and full timestamp on one line without an avatar", () => {
+    const { container } = render(
+      <MessageTimeline token="test-token" conversation={conversation} messages={messages} participants={[]} />,
+    );
+    expect(container.querySelector(".sender-avatar")).toBeNull();
+    const firstMeta = container.querySelector(".message-meta");
+    expect(firstMeta).not.toBeNull();
+    expect(firstMeta?.querySelector(".sender-name")).toHaveTextContent("成员二");
+    expect(firstMeta?.querySelector(".message-time")?.textContent).toMatch(/^2026-09-15.+:\d{2}:00$/);
+  });
+
+  it("returns to the top after changing pages", () => {
+    const { container, rerender } = render(
+      <MessageTimeline token="test-token" conversation={conversation} messages={messages} participants={[]} pageIndex={0} />,
+    );
+    const scroll = container.querySelector<HTMLElement>(".message-scroll")!;
+    const scrollTo = vi.fn();
+    Object.defineProperty(scroll, "scrollTo", { configurable: true, value: scrollTo });
+    rerender(<MessageTimeline token="test-token" conversation={conversation} messages={messages} participants={[]} pageIndex={1} />);
+    expect(scrollTo).toHaveBeenCalledWith({ behavior: "auto", top: 0 });
+  });
+
+  it("renders attachment-only image and file messages without a message bubble and opens files", () => {
+    const attachmentMessages: MessageItem[] = [
+      {
+        ...messages[0],
+        id: "image-message",
+        type: "image",
+        body: undefined,
+        attachment: { name: "photo.png", meta: "12 KB · 完整", kind: "image", contentHash: "image-hash" },
+      },
+      {
+        ...messages[1],
+        id: "file-message",
+        type: "file",
+        body: "report.pdf",
+        attachment: { name: "report.pdf", meta: "20 KB · 完整", kind: "document", contentHash: "file-hash" },
+      },
+    ];
+    const { container } = render(
+      <MessageTimeline token="test-token" conversation={conversation} messages={attachmentMessages} participants={[]} />,
+    );
+
+    expect(container.querySelectorAll(".message-attachment-only")).toHaveLength(2);
+    expect(container.querySelector(".message-bubble")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "打开附件 report.pdf" }));
+    expect(mediaApi.openMediaFile).toHaveBeenCalledWith("test-token", "file-hash", "report.pdf");
   });
 });
