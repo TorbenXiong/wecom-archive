@@ -346,6 +346,46 @@ impl ArchiveStore {
         Ok(count.max(0) as u64)
     }
 
+    pub fn message_offset_in_conversation(
+        &self,
+        stable_message_id: &str,
+    ) -> Result<Option<u64>, StoreError> {
+        let target = self
+            .connection
+            .query_row(
+                "SELECT conversation_id, sent_at FROM messages WHERE stable_message_id = ?1",
+                [stable_message_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((conversation_id, sent_at)) = target else {
+            return Ok(None);
+        };
+        let offset = self.connection.query_row(
+            "SELECT count(*) FROM messages
+             WHERE conversation_id = ?1
+               AND (sent_at > ?2 OR (sent_at = ?2 AND stable_message_id > ?3))",
+            params![conversation_id, sent_at, stable_message_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(Some(offset.max(0) as u64))
+    }
+
+    pub fn conversation_display_name(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT display_name FROM conversations WHERE conversation_id = ?1",
+                [conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     pub fn list_conversation_participants(
         &self,
         conversation_id: &str,
@@ -1017,6 +1057,39 @@ mod tests {
         assert_eq!(third.revised, 1);
         assert_eq!(store.message_count().unwrap(), 1);
         assert_eq!(store.summary().unwrap().revision, 3);
+    }
+
+    #[test]
+    fn locates_message_offset_in_descending_conversation_order() {
+        let directory = tempdir().unwrap();
+        let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+        let mut input = batch("第一条");
+        for (index, seconds) in [1_i64, 2].into_iter().enumerate() {
+            let mut message = input.messages[0].clone();
+            message.source_message_id = format!("message-{}", index + 2);
+            message.stable_message_id = format!("stable-{}", index + 2);
+            message.sent_at += chrono::Duration::seconds(seconds);
+            message.body_text = Some(format!("第{}条", index + 2));
+            input.messages.push(message);
+        }
+        store.ingest_batch(&input).unwrap();
+
+        assert_eq!(
+            store.message_offset_in_conversation("stable-3").unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            store.message_offset_in_conversation("stable-2").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            store.message_offset_in_conversation("stable-one").unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            store.message_offset_in_conversation("missing").unwrap(),
+            None
+        );
     }
 
     #[test]

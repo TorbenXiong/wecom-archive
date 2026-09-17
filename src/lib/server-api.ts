@@ -53,6 +53,11 @@ export interface ServerMessage {
   raw_type: string;
 }
 
+export interface GlobalSearchResult extends ServerMessage {
+  conversation_name?: string;
+  offset_in_conversation: number;
+}
+
 export interface ServerParticipant {
   participant_id: string;
   display_name?: string;
@@ -75,6 +80,15 @@ export interface ServerImportResult {
   inserted: number;
   unchanged: number;
   revised: number;
+  mediaCount: number;
+  missingMediaCount: number;
+}
+
+export interface LocalCollectionProgress {
+  running: boolean;
+  percent: number;
+  stage: string;
+  detail: string;
 }
 
 export interface EnterpriseConfig {
@@ -107,6 +121,8 @@ export interface ServerExportRequest {
   messageType?: MessageType;
   mediaOnly?: boolean;
   dataRedaction?: boolean;
+  simplify?: boolean;
+  pretty?: boolean;
 }
 
 export interface ServerExportResult {
@@ -122,6 +138,8 @@ export interface ServerExportResult {
 export interface LocalExportRequest {
   format: "json" | "csv" | "html" | "pdf";
   dataRedaction: boolean;
+  simplify?: boolean;
+  pretty?: boolean;
 }
 
 interface ServerError {
@@ -148,8 +166,13 @@ export function getArchiveSummary(token: string): Promise<ServerArchiveSummary> 
   return request<ServerArchiveSummary>("/api/v1/archive/summary", token);
 }
 
-export function collectLocalArchive(token: string): Promise<ServerImportResult> {
-  return request<ServerImportResult>("/api/v1/collections/local", token, { method: "POST" });
+export function collectLocalArchive(token: string, includeMedia: boolean): Promise<ServerImportResult> {
+  const parameters = new URLSearchParams({ include_media: String(includeMedia) });
+  return request<ServerImportResult>(`/api/v1/collections/local?${parameters}`, token, { method: "POST" });
+}
+
+export function getLocalCollectionProgress(token: string, signal?: AbortSignal): Promise<LocalCollectionProgress> {
+  return request<LocalCollectionProgress>("/api/v1/collections/local/progress", token, { signal });
 }
 
 export function listConversations(token: string, signal?: AbortSignal): Promise<ServerConversation[]> {
@@ -180,6 +203,11 @@ export function countMessages(token: string, query: Omit<MessageQuery, "limit" |
   if (query.messageType) parameters.set("message_type", query.messageType);
   if (query.mediaOnly) parameters.set("media_only", "true");
   return request<{ total: number }>(`/api/v1/messages/count?${parameters}`, token, { signal });
+}
+
+export function searchMessages(token: string, text: string, signal?: AbortSignal): Promise<GlobalSearchResult[]> {
+  const parameters = new URLSearchParams({ q: text, limit: "50" });
+  return request<GlobalSearchResult[]>(`/api/v1/search/messages?${parameters}`, token, { signal });
 }
 
 export async function importClientJson(file: File, token: string): Promise<ServerImportResult> {
@@ -250,6 +278,11 @@ export async function getMediaObjectUrl(token: string, contentHash: string): Pro
   });
   if (!response.ok) throw new Error("媒体内容尚未上传或不可用。");
   return URL.createObjectURL(await response.blob());
+}
+
+export function openMediaFile(token: string, contentHash: string, name: string): Promise<{ opened: boolean }> {
+  const parameters = new URLSearchParams({ name });
+  return request<{ opened: boolean }>(`/api/v1/media/${encodeURIComponent(contentHash)}/open?${parameters}`, token, { method: "POST" });
 }
 
 export function createServerExport(token: string, exportRequest: ServerExportRequest): Promise<ServerExportResult> {

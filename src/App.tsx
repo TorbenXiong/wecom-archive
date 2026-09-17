@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { LoaderCircle } from "lucide-react";
 import { ConversationList } from "./components/ConversationList";
 import { DetailPanel } from "./components/DetailPanel";
@@ -8,12 +8,13 @@ import { Navigation } from "./components/Navigation";
 import { ExportDialog, LocalCollectionDialog, ServerAccessGate, Toast } from "./components/Overlays";
 import { SettingsPage } from "./components/SettingsPage";
 import { ServerConfigPage } from "./components/ServerConfigPage";
-import type { ConversationSummary, ExportFormat, ExportScope, FilterState, MessageItem, ParticipantItem } from "./domain/types";
+import type { ConversationSummary, ExportFormat, ExportScope, MessageItem, ParticipantItem } from "./domain/types";
 import {
   collectLocalArchive,
   countMessages,
   createServerExport,
   getArchiveSummary,
+  getLocalCollectionProgress,
   importClientJson,
   importEnterprisePackage,
   listConversationParticipants,
@@ -23,13 +24,14 @@ import {
   type ServerArchiveSummary,
   type ServerConversation,
   type ServerExportResult,
+  type GlobalSearchResult,
+  type LocalCollectionProgress,
   type ServerMessage,
 } from "./lib/server-api";
 import "./styles.css";
 
 type Section = "conversations" | "local-export" | "server-config" | "settings";
 
-const defaultFilters: FilterState = { search: "", date: "all", participant: "all", type: "all", mediaOnly: false };
 const emptySummary: ServerArchiveSummary = { conversation_count: 0, message_count: 0, media_count: 0, revision: 0, local_collection_available: false };
 const DEFAULT_MESSAGE_PAGE_SIZE = 200;
 const emptyConversation: ConversationSummary = {
@@ -59,21 +61,25 @@ export default function App() {
   const [messagePageSize, setMessagePageSize] = useState(DEFAULT_MESSAGE_PAGE_SIZE);
   const [messageTotal, setMessageTotal] = useState(0);
   const [participants, setParticipants] = useState<ParticipantItem[]>([]);
-  const [section, setSection] = useState<Section>("conversations");
+  const [section, setSection] = useState<Section>("local-export");
   const [selectedId, setSelectedId] = useState("");
-  const [filters, setFilters] = useState(defaultFilters);
+  const [targetMessageId, setTargetMessageId] = useState<string>();
   const [scope, setScope] = useState<ExportScope>("current_conversation");
   const [format, setFormat] = useState<ExportFormat>("json");
-  const [exportDataRedaction, setExportDataRedaction] = useState(false);
+  const [exportDataRedaction, setExportDataRedaction] = useState(true);
+  const [exportSimplify, setExportSimplify] = useState(true);
+  const [exportPretty, setExportPretty] = useState(true);
   const [showExport, setShowExport] = useState(false);
   const [detailCollapsed, setDetailCollapsed] = useState(false);
   const [messageStatus, setMessageStatus] = useState("等待选择会话");
   const [toast, setToast] = useState<{ message: string; tone: "success" | "error"; actionLabel?: string; onAction?: () => void }>();
   const [importing, setImporting] = useState(false);
   const [collectingLocal, setCollectingLocal] = useState(false);
+  const [collectionProgress, setCollectionProgress] = useState<LocalCollectionProgress>({ running: false, percent: 0, stage: "准备采集", detail: "正在初始化本机采集任务。" });
   const [refreshVersion, setRefreshVersion] = useState(0);
   const archiveRevision = useRef(0);
-  const deferredSearch = useDeferredValue(filters.search.trim());
+  const skipNextPageReset = useRef(false);
+  const selectedConversationOverride = useRef<ConversationSummary | undefined>(undefined);
 
   const loadDirectory = async (accessToken: string) => {
     const [nextSummary, rows] = await Promise.all([
@@ -81,6 +87,8 @@ export default function App() {
       listConversations(accessToken),
     ]);
     const nextConversations = rows.map(mapConversation);
+    const override = selectedConversationOverride.current;
+    if (override && !nextConversations.some((item) => item.id === override.id)) nextConversations.push(override);
     const changed = nextSummary.revision !== archiveRevision.current;
     archiveRevision.current = nextSummary.revision;
     setSummary(nextSummary);
@@ -124,15 +132,16 @@ export default function App() {
     }
   };
 
-  const collectLocal = async () => {
+  const collectLocal = async (includeMedia: boolean) => {
     if (!token || collectingLocal || !summary.local_collection_available) return;
     setCollectingLocal(true);
+    setCollectionProgress({ running: true, percent: 2, stage: "准备采集", detail: includeMedia ? "正在准备采集文本、图片和文件。" : "正在准备仅采集文本消息。" });
     try {
-      const result = await collectLocalArchive(token);
+      const result = await collectLocalArchive(token, includeMedia);
       await loadDirectory(token);
       setRefreshVersion((current) => current + 1);
       setToast({
-        message: `本机采集完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条，更新 ${result.revised.toLocaleString("zh-CN")} 条消息。`,
+        message: `本机采集完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条，更新 ${result.revised.toLocaleString("zh-CN")} 条消息${includeMedia ? `；采集媒体 ${result.mediaCount.toLocaleString("zh-CN")} 项${result.missingMediaCount > 0 ? `，${result.missingMediaCount.toLocaleString("zh-CN")} 项源文件未找到` : ""}` : ""}。`,
         tone: "success",
       });
     } catch (error) {
@@ -141,6 +150,29 @@ export default function App() {
       setCollectingLocal(false);
     }
   };
+
+  useEffect(() => {
+    if (!token || !collectingLocal) return;
+    const controller = new AbortController();
+    let polling = false;
+    const refreshProgress = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        setCollectionProgress(await getLocalCollectionProgress(token, controller.signal));
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+      } finally {
+        polling = false;
+      }
+    };
+    void refreshProgress();
+    const interval = window.setInterval(() => void refreshProgress(), 350);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [collectingLocal, token]);
 
   const showExportCompleted = (result: ServerExportResult, label: string) => {
     if (!token) return;
@@ -172,13 +204,7 @@ export default function App() {
     }
     const controller = new AbortController();
     setMessageStatus("正在读取服务端归档…");
-    const query = {
-      conversationId: selectedId,
-      participantId: filters.participant === "all" ? undefined : filters.participant,
-      text: deferredSearch || undefined,
-      messageType: filters.type === "all" ? undefined : filters.type,
-      mediaOnly: filters.mediaOnly,
-    };
+    const query = { conversationId: selectedId };
     Promise.all([
       listMessages(token, { ...query, limit: messagePageSize, offset: messagePage * messagePageSize }, controller.signal),
       countMessages(token, query, controller.signal),
@@ -199,11 +225,16 @@ export default function App() {
       setMessageStatus(reason instanceof Error ? reason.message : "消息读取失败");
     });
     return () => controller.abort();
-  }, [deferredSearch, filters.mediaOnly, filters.participant, filters.type, messagePage, messagePageSize, refreshVersion, selectedId, token]);
+  }, [messagePage, messagePageSize, refreshVersion, selectedId, token]);
 
   useEffect(() => {
+    if (skipNextPageReset.current) {
+      skipNextPageReset.current = false;
+      return;
+    }
     setMessagePage(0);
-  }, [deferredSearch, filters.mediaOnly, filters.participant, filters.type, messagePageSize, selectedId]);
+    setTargetMessageId(undefined);
+  }, [messagePageSize, selectedId]);
 
   useEffect(() => {
     if (!token || !selectedId) {
@@ -226,13 +257,17 @@ export default function App() {
 
   const selectedConversation = conversations.find((item) => item.id === selectedId) ?? emptyConversation;
   const isFullPageSection = section === "server-config" || section === "settings" || section === "local-export";
-  const participantOptions = useMemo(() => {
-    const values = new Map<string, string>();
-    for (const message of messages) {
-      if (message.senderId !== "system") values.set(message.senderId, message.senderName);
+  const openSearchResult = (result: GlobalSearchResult) => {
+    if (!conversations.some((conversation) => conversation.id === result.conversation_id)) {
+      const conversation = mapSearchConversation(result);
+      selectedConversationOverride.current = conversation;
+      setConversations((current) => [...current, conversation]);
     }
-    return [...values].map(([id, label]) => ({ id, label }));
-  }, [messages]);
+    skipNextPageReset.current = result.conversation_id !== selectedId;
+    setSelectedId(result.conversation_id);
+    setMessagePage(Math.floor(result.offset_in_conversation / messagePageSize));
+    setTargetMessageId(result.stable_message_id);
+  };
 
   if (!token && autoConnecting) return <div className="access-shell startup-shell">
     <main className="access-main">
@@ -249,14 +284,14 @@ export default function App() {
     <div className={section === "local-export" ? "workspace-grid local-export-mode" : isFullPageSection ? "workspace-grid settings-mode" : !selectedConversation.isGroup ? "workspace-grid no-detail" : detailCollapsed ? "workspace-grid detail-collapsed" : "workspace-grid"}>
       <Navigation active={section} onSelect={setSection} />
       {section === "server-config" ? <ServerConfigPage token={token} onTokenChanged={setToken} /> : section === "settings" ? <SettingsPage /> : section === "local-export" ? <LocalExportPage token={token} onCompleted={(result) => showExportCompleted(result, "本机导出完成")} onFailed={(error) => setToast({ message: error instanceof Error ? error.message : "本机导出失败。", tone: "error" })} /> : <>
-        <ConversationList conversations={conversations} selectedId={selectedId} filters={filters} participantOptions={participantOptions} onFiltersChange={setFilters} onSelect={setSelectedId} importing={importing} onImport={(file) => void importPackage(file)} />
-        <MessageTimeline token={token} conversation={selectedConversation} messages={messages} participants={participants} status={messageStatus} pageIndex={messagePage} pageSize={messagePageSize} totalMessages={messageTotal} totalPages={Math.max(1, Math.ceil(messageTotal / messagePageSize))} onPageSizeChange={(size) => setMessagePageSize(size)} onPageChange={(page) => setMessagePage(page)} onPreviousPage={() => setMessagePage((current) => Math.max(0, current - 1))} onNextPage={() => setMessagePage((current) => current + 1)} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal} onCollectLocal={() => void collectLocal()} onExport={() => setShowExport(true)} />
+        <ConversationList token={token} conversations={conversations} selectedId={selectedId} onSelect={(id) => { selectedConversationOverride.current = undefined; setTargetMessageId(undefined); setSelectedId(id); }} onOpenSearchResult={openSearchResult} onExport={() => setShowExport(true)} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal} onCollectLocal={(includeMedia) => void collectLocal(includeMedia)} importing={importing} onImport={(file) => void importPackage(file)} />
+        <MessageTimeline token={token} conversation={selectedConversation} messages={messages} participants={participants} status={messageStatus} targetMessageId={targetMessageId} onTargetLocated={() => setTargetMessageId(undefined)} pageIndex={messagePage} pageSize={messagePageSize} totalMessages={messageTotal} totalPages={Math.max(1, Math.ceil(messageTotal / messagePageSize))} onPageSizeChange={(size) => setMessagePageSize(size)} onPageChange={(page) => setMessagePage(page)} onPreviousPage={() => setMessagePage((current) => Math.max(0, current - 1))} onNextPage={() => setMessagePage((current) => current + 1)} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} />
         {selectedConversation.isGroup && <DetailPanel conversation={selectedConversation} participants={participants} messages={messages} collapsed={detailCollapsed} onToggleCollapsed={() => setDetailCollapsed((current) => !current)} />}
       </>}
     </div>
     <footer className="status-bar"><span>已归档 {summary.message_count.toLocaleString("zh-CN")} 条消息 · {summary.media_count.toLocaleString("zh-CN")} 项媒体 · {summary.conversation_count.toLocaleString("zh-CN")} 个会话</span><span><i />受控访问 · 审计已启用</span></footer>
-    {showExport && <ExportDialog scope={scope} format={format} dataRedaction={exportDataRedaction} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" ? summary.message_count : scope === "current_filter" ? messages.length : selectedConversation.messageCount} mediaCount={scope === "entire_archive" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onClose={() => setShowExport(false)} onConfirm={async () => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, participantId: filters.participant === "all" ? undefined : filters.participant, text: filters.search.trim() || undefined, messageType: filters.type === "all" ? undefined : filters.type, mediaOnly: filters.mediaOnly, dataRedaction: exportDataRedaction }); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
-    {collectingLocal && <LocalCollectionDialog />}
+    {showExport && <ExportDialog scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" ? summary.message_count : scope === "current_filter" ? messages.length : selectedConversation.messageCount} mediaCount={scope === "entire_archive" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onClose={() => setShowExport(false)} onConfirm={async () => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty }); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
+    {collectingLocal && <LocalCollectionDialog progress={collectionProgress} />}
     {toast && <Toast tone={toast.tone} actionLabel={toast.actionLabel} onAction={toast.onAction} onClose={() => setToast(undefined)}>{toast.message}</Toast>}
   </div>;
 }
@@ -287,6 +322,23 @@ function mapConversation(row: ServerConversation, index: number): ConversationSu
     mediaCount: row.media_count,
     participantCount: row.participant_count,
     isGroup,
+  };
+}
+
+function mapSearchConversation(result: GlobalSearchResult): ConversationSummary {
+  const title = result.conversation_name?.trim() || `会话 ${shortIdentifier(result.conversation_id)}`;
+  return {
+    id: result.conversation_id,
+    title,
+    initials: Array.from(title).slice(0, 2).join(""),
+    accent: "blue",
+    lastMessage: "来自全局搜索",
+    lastAt: formatConversationTime(result.sent_at),
+    unread: 0,
+    messageCount: 0,
+    mediaCount: 0,
+    participantCount: 0,
+    isGroup: result.conversation_id.startsWith("R:"),
   };
 }
 

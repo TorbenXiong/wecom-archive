@@ -94,6 +94,120 @@ struct MediaCollectionOptions {
     include_images: bool,
 }
 
+struct MediaResolver {
+    roots: Vec<PathBuf>,
+    files_by_key: BTreeMap<String, Vec<PathBuf>>,
+}
+
+impl MediaResolver {
+    fn new(candidate: &SourceCandidate, options: MediaCollectionOptions) -> Self {
+        let roots = candidate
+            .media_roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .collect::<Vec<_>>();
+        let mut files_by_key = BTreeMap::new();
+        if options.include_files || options.include_images {
+            for root in &roots {
+                index_media_directory(root, root, 0, &mut files_by_key);
+            }
+            for paths in files_by_key.values_mut() {
+                paths.sort();
+                paths.dedup();
+            }
+        }
+        Self {
+            roots,
+            files_by_key,
+        }
+    }
+
+    fn resolve(&self, candidate_root: &Path, locator: &str) -> Option<PathBuf> {
+        let locator_path = PathBuf::from(locator);
+        let direct_candidates = if locator_path.is_absolute() {
+            vec![locator_path]
+        } else {
+            std::iter::once(candidate_root.join(&locator_path))
+                .chain(self.roots.iter().map(|root| root.join(&locator_path)))
+                .collect()
+        };
+        for candidate in direct_candidates {
+            if let Some(path) = self.authorized_file(candidate) {
+                return Some(path);
+            }
+        }
+        media_lookup_keys(locator).into_iter().find_map(|key| {
+            self.files_by_key
+                .get(&key)
+                .and_then(|paths| paths.first())
+                .cloned()
+        })
+    }
+
+    fn authorized_file(&self, candidate: PathBuf) -> Option<PathBuf> {
+        let path = candidate.canonicalize().ok()?;
+        (path.is_file() && self.roots.iter().any(|root| path.starts_with(root))).then_some(path)
+    }
+}
+
+fn index_media_directory(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    index: &mut BTreeMap<String, Vec<PathBuf>>,
+) {
+    if depth > 12 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            index_media_directory(root, &path, depth + 1, index);
+        } else if file_type.is_file() {
+            let mut keys = media_lookup_keys(&entry.file_name().to_string_lossy());
+            if let Ok(relative) = path.strip_prefix(root) {
+                keys.extend(media_lookup_keys(&relative.to_string_lossy()));
+            }
+            for key in keys {
+                index.entry(key).or_default().push(path.clone());
+            }
+        }
+    }
+}
+
+fn media_lookup_keys(value: &str) -> Vec<String> {
+    let normalized = value
+        .trim()
+        .trim_matches(|character: char| matches!(character, '"' | '\'' | '<' | '>'))
+        .replace('\\', "/");
+    let mut keys = Vec::new();
+    if !normalized.is_empty() {
+        keys.push(normalized.to_ascii_lowercase());
+    }
+    if let Some(name) = normalized
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+    {
+        keys.push(name.to_ascii_lowercase());
+        if let Some((stem, _)) = name.rsplit_once('.') {
+            keys.push(stem.to_ascii_lowercase());
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SourceKeyKind {
     Passphrase,
@@ -253,6 +367,8 @@ async fn collect_source(
             key.as_ref(),
             authorization,
             media_options,
+            None,
+            None,
         )
     })
     .await
@@ -278,12 +394,37 @@ pub fn collect_local_export(
     include_media: bool,
     data_redaction: bool,
 ) -> Result<ClientExportV1, String> {
+    collect_local_export_internal(
+        include_media,
+        data_redaction,
+        std::sync::Arc::new(|_, _, _| {}),
+        None,
+    )
+}
+
+pub fn collect_local_export_with_progress(
+    include_media: bool,
+    data_redaction: bool,
+    progress: wecom_archive_server::LocalCollectionProgressReporter,
+    media_sink: wecom_archive_server::LocalCollectionMediaSink,
+) -> Result<ClientExportV1, String> {
+    collect_local_export_internal(include_media, data_redaction, progress, Some(&media_sink))
+}
+
+fn collect_local_export_internal(
+    include_media: bool,
+    data_redaction: bool,
+    progress: wecom_archive_server::LocalCollectionProgressReporter,
+    media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
+) -> Result<ClientExportV1, String> {
+    progress(6, "发现数据源", "正在查找当前登录的企业微信数据。");
     let candidate = WindowsSourceAdapter
         .discover(None)
         .map_err(|_| "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned())?
         .into_iter()
         .next()
         .ok_or_else(|| "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned())?;
+    progress(15, "读取授权", "已发现数据源，正在准备只读访问。");
     let temporary_root =
         std::env::temp_dir().join(format!("wecom-archive-local-{}", uuid::Uuid::new_v4()));
     let result = (|| {
@@ -292,6 +433,7 @@ pub fn collect_local_export(
             .iter()
             .any(|database| database.encrypted);
         let key = resolve_collection_key(&candidate, encrypted)?;
+        progress(25, "创建快照", "正在只读复制数据库及一致性文件。");
         let export = collect_candidate_with_options(
             candidate,
             temporary_root.join("work"),
@@ -304,7 +446,10 @@ pub fn collect_local_export(
                 include_files: include_media,
                 include_images: include_media,
             },
+            media_sink,
+            Some(&progress),
         )?;
+        progress(88, "整理采集结果", "正在校验消息及媒体内容完整性。");
         Ok::<_, CommandError>(if data_redaction {
             redact_sensitive_export(&export)
         } else {
@@ -900,6 +1045,8 @@ fn collect_candidate(
         key,
         authorization,
         MediaCollectionOptions::default(),
+        None,
+        None,
     )
 }
 
@@ -909,6 +1056,8 @@ fn collect_candidate_with_options(
     key: Option<&SourceKey>,
     authorization: CollectionAuthorization,
     media_options: MediaCollectionOptions,
+    media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
+    progress: Option<&wecom_archive_server::LocalCollectionProgressReporter>,
 ) -> Result<ClientExportV1, CommandError> {
     if candidate
         .databases
@@ -922,6 +1071,12 @@ fn collect_candidate_with_options(
             recoverable: true,
         });
     }
+    report_collection_progress(
+        progress,
+        30,
+        "创建快照",
+        "正在复制数据库、WAL 和 SHM 文件。",
+    );
     let receipt = WindowsSourceAdapter
         .snapshot(&candidate, work_root.clone())
         .map_err(|error| CommandError {
@@ -929,8 +1084,21 @@ fn collect_candidate_with_options(
             message: sanitize_error(&error.to_string()),
             recoverable: true,
         })?;
-    let result =
-        read_snapshot_export_with_options(&candidate, &receipt, key, authorization, media_options);
+    report_collection_progress(
+        progress,
+        42,
+        "打开快照",
+        "数据库快照已完成，正在安全打开副本。",
+    );
+    let result = read_snapshot_export_with_options(
+        &candidate,
+        &receipt,
+        key,
+        authorization,
+        media_options,
+        media_sink,
+        progress,
+    );
     cleanup_snapshot(&work_root, &receipt.snapshot_root);
     result
 }
@@ -941,7 +1109,15 @@ fn read_snapshot_export_with_options(
     key: Option<&SourceKey>,
     authorization: CollectionAuthorization,
     media_options: MediaCollectionOptions,
+    media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
+    progress: Option<&wecom_archive_server::LocalCollectionProgressReporter>,
 ) -> Result<ClientExportV1, CommandError> {
+    report_collection_progress(
+        progress,
+        46,
+        "解析数据库",
+        "正在打开只读快照并识别消息结构。",
+    );
     let message_database = receipt
         .copied_files
         .iter()
@@ -984,11 +1160,16 @@ fn read_snapshot_export_with_options(
     let batch_id = uuid::Uuid::new_v4();
     let mut messages = Vec::new();
     let mut media_blobs = Vec::new();
-    let allowed_media_roots = candidate
-        .media_roots
-        .iter()
-        .filter_map(|root| root.canonicalize().ok())
-        .collect::<Vec<_>>();
+    if media_options.include_files || media_options.include_images {
+        report_collection_progress(
+            progress,
+            52,
+            "扫描媒体目录",
+            "正在建立图片和文件索引，不会修改源目录。",
+        );
+    }
+    let media_resolver = MediaResolver::new(candidate, media_options);
+    report_collection_progress(progress, 60, "读取消息", "正在解析聊天消息及附件引用。");
     let has_normalized = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='messages')",
@@ -1047,12 +1228,14 @@ fn read_snapshot_export_with_options(
                 batch_id,
             )
             .map_err(|_| unsupported_source_schema())?;
+            ensure_media_reference(&mut message, media_options);
             media_blobs.extend(resolve_media_metadata_with_options(
                 candidate,
-                &allowed_media_roots,
+                &media_resolver,
                 &mut message,
                 media_options,
-            ));
+                media_sink,
+            )?);
             messages.push(message);
         }
     } else {
@@ -1098,7 +1281,7 @@ fn read_snapshot_export_with_options(
         for row in rows {
             let (source_message_id, conversation_id, sender_id, sent_at_unix_ms, raw_type, content) =
                 row.map_err(|_| unsupported_source_schema())?;
-            let payload = readable_message_payload(&raw_type, decode_wecom_body(&content));
+            let payload = readable_message_payload(&raw_type, &content);
             let mut message = normalize(
                 RawMessageRow {
                     source_instance_id: candidate.source_id.clone(),
@@ -1114,15 +1297,24 @@ fn read_snapshot_export_with_options(
                 batch_id,
             )
             .map_err(|_| unsupported_source_schema())?;
+            ensure_media_reference(&mut message, media_options);
             media_blobs.extend(resolve_media_metadata_with_options(
                 candidate,
-                &allowed_media_roots,
+                &media_resolver,
                 &mut message,
                 media_options,
-            ));
+                media_sink,
+            )?);
             messages.push(message);
         }
     }
+
+    report_collection_progress(
+        progress,
+        76,
+        "整理消息",
+        "正在整理会话、发送人及群成员信息。",
+    );
 
     let inferred_self_sender_id = infer_self_sender_id(&messages);
     if let Some(self_sender_id) = inferred_self_sender_id.as_deref() {
@@ -1207,6 +1399,12 @@ fn read_snapshot_export_with_options(
             collection_batch_id: batch_id,
         });
     }
+    messages.retain(|message| match message.message_type {
+        MessageType::Image => media_options.include_images,
+        MessageType::File => media_options.include_files,
+        MessageType::Audio | MessageType::Video => false,
+        _ => true,
+    });
     messages.sort_by(|left, right| {
         left.sent_at
             .cmp(&right.sent_at)
@@ -1329,6 +1527,12 @@ fn read_snapshot_export_with_options(
     let content_sha256 = hex::encode(Sha256::digest(
         serde_json::to_vec(&messages).map_err(|_| internal_error())?,
     ));
+    report_collection_progress(
+        progress,
+        84,
+        "校验媒体",
+        "正在校验已采集图片和文件的完整性。",
+    );
     media_blobs.sort_by(|left, right| left.content_hash.cmp(&right.content_hash));
     media_blobs.dedup_by(|left, right| left.content_hash == right.content_hash);
     let collected_at = Utc::now();
@@ -1372,11 +1576,25 @@ fn read_snapshot_export_with_options(
         participants,
         media_blobs,
     )
-    .map_err(|_| CommandError {
+    .map_err(|error| CommandError {
         code: "COLLECTION_EXPORT_INVALID",
-        message: "采集结果未通过本地完整性校验。".into(),
+        message: format!(
+            "采集结果未通过本地完整性校验：{}",
+            sanitize_error(&error.to_string())
+        ),
         recoverable: false,
     })
+}
+
+fn report_collection_progress(
+    progress: Option<&wecom_archive_server::LocalCollectionProgressReporter>,
+    percent: u8,
+    stage: &str,
+    detail: &str,
+) {
+    if let Some(progress) = progress {
+        progress(percent, stage, detail);
+    }
 }
 
 #[derive(Default)]
@@ -1901,21 +2119,26 @@ fn sqlite_value_to_bytes(value: rusqlite::types::ValueRef<'_>) -> Vec<u8> {
 }
 
 fn decode_wecom_body(raw: &[u8]) -> Option<String> {
-    if let Ok(text) = std::str::from_utf8(raw)
-        && text
-            .chars()
-            .all(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
-    {
-        return clean_message_text(text);
-    }
-    let mut values = Vec::new();
-    parse_protobuf_text(raw, 0, &mut values)?;
+    let mut values = decode_wecom_values(raw);
     let mut seen = std::collections::BTreeSet::new();
     values.retain(|value| seen.insert(value.clone()));
     if values.iter().any(|value| !is_opaque_identifier(value)) {
         values.retain(|value| !is_opaque_identifier(value));
     }
     (!values.is_empty()).then(|| values.into_iter().take(12).collect::<Vec<_>>().join("\n"))
+}
+
+fn decode_wecom_values(raw: &[u8]) -> Vec<String> {
+    if let Ok(text) = std::str::from_utf8(raw)
+        && text
+            .chars()
+            .all(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+    {
+        return clean_message_text(text).into_iter().collect();
+    }
+    let mut values = Vec::new();
+    let _ = parse_protobuf_text(raw, 0, &mut values);
+    values
 }
 
 fn is_opaque_identifier(value: &str) -> bool {
@@ -1928,15 +2151,202 @@ fn is_opaque_identifier(value: &str) -> bool {
                     .all(|character| character.is_ascii_hexdigit() || character == '-')))
 }
 
-fn readable_message_payload(raw_type: &str, text: Option<String>) -> serde_json::Value {
-    let Some(text) = text else {
-        return serde_json::json!({});
-    };
-    match raw_type.trim() {
-        "15" | "16" => serde_json::json!({"name": text}),
-        "13" => serde_json::json!({"title": text}),
-        _ => serde_json::json!({"text": text}),
+fn readable_message_payload(raw_type: &str, raw: &[u8]) -> serde_json::Value {
+    if let Ok(serde_json::Value::Object(mut payload)) =
+        serde_json::from_slice::<serde_json::Value>(raw)
+    {
+        let values = payload
+            .values()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        enrich_media_payload(raw_type, &mut payload, &values);
+        return serde_json::Value::Object(payload);
     }
+    let values = decode_wecom_values(raw);
+    let text = decode_wecom_body(raw);
+    let mut payload = serde_json::Map::new();
+    if let Some(text) = text {
+        let key = match raw_type.trim() {
+            "15" | "16" => "name",
+            "13" => "title",
+            _ => "text",
+        };
+        payload.insert(key.into(), serde_json::Value::String(text));
+    }
+    enrich_media_payload(raw_type, &mut payload, &values);
+    serde_json::Value::Object(payload)
+}
+
+fn enrich_media_payload(
+    raw_type: &str,
+    payload: &mut serde_json::Map<String, serde_json::Value>,
+    values: &[String],
+) {
+    if is_media_message_type(raw_type)
+        && !["media_path", "file_path", "local_path", "path"]
+            .iter()
+            .any(|key| {
+                payload
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+            })
+        && let Some(locator) = media_locator_candidate(raw_type, values)
+    {
+        let file_name = locator
+            .replace('\\', "/")
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+        payload.insert("media_path".into(), serde_json::Value::String(locator));
+        if let Some(file_name) = file_name {
+            payload.insert("name".into(), serde_json::Value::String(file_name));
+        }
+    }
+    if raw_type.trim() == "49"
+        && ["media_path", "file_path", "local_path", "path"]
+            .iter()
+            .any(|key| {
+                payload
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+            })
+    {
+        payload
+            .entry("kind")
+            .or_insert_with(|| serde_json::Value::String("file".into()));
+    }
+}
+
+fn is_media_message_type(raw_type: &str) -> bool {
+    matches!(
+        raw_type.trim().to_ascii_lowercase().as_str(),
+        "3" | "4"
+            | "14"
+            | "29"
+            | "image"
+            | "img"
+            | "15"
+            | "16"
+            | "49"
+            | "49:file"
+            | "file"
+            | "attachment"
+    )
+}
+
+fn media_locator_candidate(raw_type: &str, values: &[String]) -> Option<String> {
+    let allow_plain_name = matches!(
+        raw_type.trim().to_ascii_lowercase().as_str(),
+        "15" | "16" | "49" | "49:file" | "file" | "attachment"
+    );
+    let mut candidates = values
+        .iter()
+        .flat_map(|value| {
+            std::iter::once(value.as_str()).chain(value.split(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '"' | '\'' | '<' | '>' | '=' | ';' | ',')
+            }))
+        })
+        .filter_map(|value| {
+            let candidate = value.trim().trim_matches(|character: char| {
+                matches!(character, '"' | '\'' | '[' | ']' | '(' | ')')
+            });
+            let score = media_locator_score(candidate, allow_plain_name);
+            (score > 0).then(|| (score, candidate.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates.into_iter().next().map(|(_, value)| value)
+}
+
+fn media_locator_score(value: &str, allow_plain_name: bool) -> u8 {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 1024 {
+        return 0;
+    }
+    let normalized = value.replace('\\', "/");
+    let name = normalized.rsplit('/').next().unwrap_or_default();
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    let known_extension = extension.as_deref().is_some_and(|extension| {
+        matches!(
+            extension,
+            "jpg"
+                | "jpeg"
+                | "png"
+                | "gif"
+                | "webp"
+                | "bmp"
+                | "heic"
+                | "pdf"
+                | "doc"
+                | "docx"
+                | "xls"
+                | "xlsx"
+                | "ppt"
+                | "pptx"
+                | "txt"
+                | "csv"
+                | "zip"
+                | "rar"
+                | "7z"
+                | "mp3"
+                | "wav"
+                | "mp4"
+                | "mov"
+                | "dat"
+        )
+    });
+    if normalized.contains('/') && known_extension {
+        6
+    } else if known_extension {
+        5
+    } else if normalized.contains('/') {
+        4
+    } else if matches!(value.len(), 32 | 40 | 64)
+        && value.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        3
+    } else if allow_plain_name
+        && value.len() <= 260
+        && !value
+            .chars()
+            .any(|character| matches!(character, '\n' | '\r' | '\t'))
+    {
+        1
+    } else {
+        0
+    }
+}
+
+fn ensure_media_reference(
+    message: &mut archive_domain::MessageV1,
+    options: MediaCollectionOptions,
+) {
+    let enabled = match message.message_type {
+        MessageType::Image => options.include_images,
+        MessageType::File => options.include_files,
+        _ => false,
+    };
+    if !enabled || !message.media.is_empty() {
+        return;
+    }
+    message.media.push(archive_domain::MediaRefV1 {
+        content_hash: None,
+        original_name: (message.message_type == MessageType::File)
+            .then(|| message.body_text.clone())
+            .flatten(),
+        mime_type: None,
+        size_bytes: None,
+        source_locator: message.source_message_id.clone(),
+        integrity: MediaIntegrity::Missing,
+        missing_reason: Some("media_locator_not_present_in_message_payload".into()),
+    });
 }
 
 fn parse_protobuf_text(raw: &[u8], depth: usize, values: &mut Vec<String>) -> Option<()> {
@@ -2005,17 +2415,6 @@ fn readable_protobuf_segment(raw: &[u8]) -> Option<String> {
     }
     let text = std::str::from_utf8(raw).ok()?;
     let text = clean_message_text(text)?;
-    let compact = text
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<String>();
-    if compact.len() >= 32
-        && compact
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-    {
-        return None;
-    }
     Some(text)
 }
 
@@ -2053,41 +2452,37 @@ fn normalize_source_timestamp(value: i64) -> i64 {
 
 fn resolve_media_metadata_with_options(
     candidate: &SourceCandidate,
-    allowed_roots: &[PathBuf],
+    resolver: &MediaResolver,
     message: &mut archive_domain::MessageV1,
     options: MediaCollectionOptions,
-) -> Vec<archive_domain::MediaBlobV1> {
+    media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
+) -> Result<Vec<archive_domain::MediaBlobV1>, CommandError> {
     let mut blobs = Vec::new();
     if message.media.is_empty() {
-        return blobs;
+        return Ok(blobs);
     }
     for media in &mut message.media {
-        let source = PathBuf::from(&media.source_locator);
-        let candidate_path = if source.is_absolute() {
-            source
-        } else {
-            candidate.root_path.join(source)
-        };
-        let resolved = candidate_path.canonicalize().ok().filter(|path| {
-            allowed_roots
-                .iter()
-                .any(|allowed_root| path.starts_with(allowed_root))
-        });
-        match resolved.and_then(|path| media_store::hash_source(&path).ok()) {
+        let resolved = resolver
+            .resolve(&candidate.root_path, &media.source_locator)
+            .or_else(|| resolver.resolve(&candidate.root_path, &message.source_message_id));
+        match resolved
+            .as_deref()
+            .and_then(|path| media_store::hash_source(path).ok())
+        {
             Some((hash, size)) => {
                 let should_embed = match message.message_type {
                     archive_domain::MessageType::Image => options.include_images,
                     archive_domain::MessageType::File => options.include_files,
                     _ => false,
                 };
-                if should_embed {
-                    let source_path = PathBuf::from(&media.source_locator);
-                    let source_path = if source_path.is_absolute() {
-                        source_path
-                    } else {
-                        candidate.root_path.join(source_path)
-                    };
-                    if let Ok(bytes) = fs::read(&source_path)
+                if should_embed && let Some(source_path) = resolved.as_deref() {
+                    if let Some(sink) = media_sink {
+                        sink(source_path, &hash, size).map_err(|_| CommandError {
+                            code: "MEDIA_STORE_FAILED",
+                            message: "媒体文件写入归档失败。".into(),
+                            recoverable: true,
+                        })?;
+                    } else if let Ok(bytes) = fs::read(source_path)
                         && bytes.len() as u64 == size
                     {
                         blobs.push(archive_domain::MediaBlobV1 {
@@ -2115,7 +2510,7 @@ fn resolve_media_metadata_with_options(
     }
     blobs.sort_by(|left, right| left.content_hash.cmp(&right.content_hash));
     blobs.dedup_by(|left, right| left.content_hash == right.content_hash);
-    blobs
+    Ok(blobs)
 }
 
 fn cleanup_snapshot(work_root: &Path, snapshot_root: &Path) {
@@ -2384,6 +2779,18 @@ mod tests {
         write_test_varint(announcement.len() as u64, &mut encoded);
         encoded.extend_from_slice(announcement.as_bytes());
         assert_eq!(decode_wecom_body(&encoded).as_deref(), Some(announcement));
+
+        let locator = "2026/09/photo-0123456789abcdef.png";
+        let mut image = vec![0x0a];
+        write_test_varint(locator.len() as u64, &mut image);
+        image.extend_from_slice(locator.as_bytes());
+        let payload = readable_message_payload("3", &image);
+        assert_eq!(payload["media_path"], locator);
+        assert_eq!(payload["name"], "photo-0123456789abcdef.png");
+
+        let file_payload = readable_message_payload("49", br#"{"name":"report.pdf"}"#);
+        assert_eq!(file_payload["media_path"], "report.pdf");
+        assert_eq!(file_payload["kind"], "file");
     }
 
     fn write_test_varint(mut value: u64, output: &mut Vec<u8>) {
@@ -2438,8 +2845,8 @@ mod tests {
     #[test]
     fn redacts_sensitive_message_text_before_enterprise_upload() {
         let redacted = redact_sensitive_text("账号 admin，密码 secret-123");
-        assert_eq!(redacted, "账号 [敏感数据已脱敏]，密码 [敏感数据已脱敏]");
-        assert!(!redacted.contains("admin") && !redacted.contains("secret-123"));
+        assert_eq!(redacted, "账号 admin，密码 [敏感数据已脱敏]");
+        assert!(redacted.contains("admin") && !redacted.contains("secret-123"));
 
         let mut payload = serde_json::json!({
             "password": "secret-456",
@@ -2541,6 +2948,125 @@ mod tests {
         let serialized = serde_json::to_string(&export).unwrap();
         assert!(!serialized.contains("private"));
         assert_eq!(fs::read_dir(work_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn media_mode_resolves_nested_files_and_text_mode_excludes_media_messages() {
+        let directory = TestDirectory::new();
+        let source_root = directory.0.join("source");
+        let media_root = source_root.join("FileStorage");
+        let nested_media = media_root.join("2026").join("09");
+        fs::create_dir_all(&nested_media).unwrap();
+        let media_bytes = b"synthetic image bytes";
+        fs::write(nested_media.join("photo-fixture.png"), media_bytes).unwrap();
+        let message_path = source_root.join("message.db");
+        let connection = Connection::open(&message_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE messages (
+                    source_message_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    sender_id TEXT,
+                    sent_at_unix_ms INTEGER NOT NULL,
+                    outgoing INTEGER,
+                    raw_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    recalled INTEGER NOT NULL
+                );
+                INSERT INTO messages VALUES (
+                    'text-1', 'conversation-1', 'participant-1', 1700000000000, 0,
+                    'text', '{\"text\":\"保留的文本\"}', 0
+                );
+                INSERT INTO messages VALUES (
+                    'image-1', 'conversation-1', 'participant-1', 1700000001000, 0,
+                    'image', '{\"media_path\":\"photo-fixture.png\",\"name\":\"photo-fixture.png\"}', 0
+                );",
+            )
+            .unwrap();
+        drop(connection);
+        let candidate = SourceCandidate {
+            source_id: "source".into(),
+            display_path: "source".into(),
+            root_path: source_root,
+            databases: vec![archive_domain::SourceDatabase {
+                kind: "message".into(),
+                path: message_path,
+                wal_path: None,
+                shm_path: None,
+                encrypted: false,
+                page_size_hint: Some(4096),
+            }],
+            media_roots: vec![media_root],
+            client_version: None,
+            capability: SourceCapability::ProbeRequired,
+        };
+
+        let with_media = collect_candidate_with_options(
+            candidate.clone(),
+            directory.0.join("work-media"),
+            None,
+            authorization(),
+            MediaCollectionOptions {
+                include_files: true,
+                include_images: true,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(with_media.message_count, 2);
+        assert_eq!(with_media.media_count, 1);
+        assert_eq!(with_media.media_blobs.len(), 1);
+        assert_eq!(
+            hex::decode(&with_media.media_blobs[0].content_hex).unwrap(),
+            media_bytes
+        );
+
+        let streamed_files = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_files = std::sync::Arc::clone(&streamed_files);
+        let media_sink: wecom_archive_server::LocalCollectionMediaSink =
+            std::sync::Arc::new(move |path, hash, size| {
+                captured_files.lock().unwrap().push((
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    hash.to_owned(),
+                    size,
+                ));
+                Ok(())
+            });
+        let streamed_media = collect_candidate_with_options(
+            candidate.clone(),
+            directory.0.join("work-streamed-media"),
+            None,
+            authorization(),
+            MediaCollectionOptions {
+                include_files: true,
+                include_images: true,
+            },
+            Some(&media_sink),
+            None,
+        )
+        .unwrap();
+        assert_eq!(streamed_media.media_count, 1);
+        assert!(streamed_media.media_blobs.is_empty());
+        assert_eq!(streamed_media.media_transport, "metadata_only");
+        assert_eq!(streamed_files.lock().unwrap().len(), 1);
+
+        let text_only = collect_candidate_with_options(
+            candidate,
+            directory.0.join("work-text"),
+            None,
+            authorization(),
+            MediaCollectionOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(text_only.message_count, 1);
+        assert_eq!(
+            text_only.batches[0].messages[0].message_type,
+            MessageType::Text
+        );
+        assert!(text_only.media_blobs.is_empty());
     }
 
     #[test]
@@ -2753,6 +3279,40 @@ mod tests {
         );
         eprintln!(
             "authorized collection verified: {message_count} messages, {announcement_count} group announcements"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the user's explicit authorization and a running trusted WXWork.exe"]
+    fn authorized_real_collection_includes_media_without_exposing_content() {
+        let streamed_files = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let streamed_count = std::sync::Arc::clone(&streamed_files);
+        let media_sink: wecom_archive_server::LocalCollectionMediaSink =
+            std::sync::Arc::new(move |_, _, _| {
+                streamed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            });
+        let export = collect_local_export_internal(
+            true,
+            false,
+            std::sync::Arc::new(|_, _, _| {}),
+            Some(&media_sink),
+        )
+        .unwrap();
+        assert!(
+            export.message_count > 0,
+            "authorized source contained no messages"
+        );
+        assert!(
+            export.media_count > 0,
+            "authorized source contained no media references"
+        );
+        assert!(export.media_blobs.is_empty());
+        eprintln!(
+            "authorized media collection verified: {} media references, {} streamed files, {} missing files",
+            export.media_count,
+            streamed_files.load(std::sync::atomic::Ordering::Relaxed),
+            export.missing_media_count
         );
     }
 }

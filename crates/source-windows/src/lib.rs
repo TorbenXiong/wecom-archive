@@ -8,7 +8,7 @@ pub mod dpapi;
 #[cfg(windows)]
 pub mod probe;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -102,11 +102,7 @@ fn discover_under(root: &Path) -> Vec<SourceCandidate> {
                 .and_then(|name| name.to_str())
                 .map(|name| format!("…\\{name}"))
                 .unwrap_or_else(|| "已选择的数据目录".into());
-            let media_roots = ["File", "Image", "Video", "Voice", "Media"]
-                .iter()
-                .map(|name| data_root.join(name))
-                .filter(|path| path.is_dir())
-                .collect();
+            let media_roots = discover_media_roots(&data_root, root);
             let capability = if databases.len() >= 3 {
                 SourceCapability::ProbeRequired
             } else {
@@ -129,6 +125,44 @@ fn discover_under(root: &Path) -> Vec<SourceCandidate> {
             .then_with(|| left.source_id.cmp(&right.source_id))
     });
     candidates
+}
+
+fn discover_media_roots(data_root: &Path, discovery_root: &Path) -> Vec<PathBuf> {
+    const MEDIA_DIRECTORIES: &[&str] = &[
+        "FileStorage",
+        "MsgAttach",
+        "File",
+        "Files",
+        "Image",
+        "Images",
+        "Video",
+        "Voice",
+        "Media",
+    ];
+    let mut roots = BTreeSet::new();
+    for base in data_root
+        .ancestors()
+        .take(5)
+        .take_while(|path| path.starts_with(discovery_root))
+    {
+        for name in MEDIA_DIRECTORIES {
+            let candidate = base.join(name);
+            if candidate.is_dir() {
+                roots.insert(candidate);
+            }
+        }
+    }
+    if roots.is_empty() {
+        let account_root = data_root
+            .strip_prefix(discovery_root)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .map(|component| discovery_root.join(component.as_os_str()))
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| data_root.to_path_buf());
+        roots.insert(account_root);
+    }
+    roots.into_iter().collect()
 }
 
 fn message_database_size(candidate: &SourceCandidate) -> u64 {
@@ -232,5 +266,75 @@ mod tests {
                 .iter()
                 .any(|database| database.wal_path.is_some())
         );
+    }
+
+    #[test]
+    fn discovers_media_directories_next_to_the_database_directory() {
+        let directory = tempdir().unwrap();
+        let account = directory.path().join("account");
+        let data = account.join("Data");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(account.join("FileStorage").join("MsgAttach")).unwrap();
+        fs::create_dir_all(account.join("Image")).unwrap();
+        for name in ["message.db", "session.db", "user.db"] {
+            let mut bytes = vec![0_u8; 100];
+            bytes[..16].copy_from_slice(b"SQLite format 3\0");
+            bytes[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+            fs::write(data.join(name), bytes).unwrap();
+        }
+
+        let candidates = WindowsSourceAdapter
+            .discover(Some(directory.path().to_path_buf()))
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0]
+                .media_roots
+                .contains(&account.join("FileStorage"))
+        );
+        assert!(candidates[0].media_roots.contains(&account.join("Image")));
+    }
+
+    #[test]
+    fn falls_back_to_the_authorized_account_root_for_new_media_layouts() {
+        let directory = tempdir().unwrap();
+        let account = directory.path().join("account");
+        let data = account.join("Data").join("Databases");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(account.join("NewStorageLayout").join("Attachments")).unwrap();
+        for name in ["message.db", "session.db", "user.db"] {
+            let mut bytes = vec![0_u8; 100];
+            bytes[..16].copy_from_slice(b"SQLite format 3\0");
+            bytes[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+            fs::write(data.join(name), bytes).unwrap();
+        }
+
+        let candidates = WindowsSourceAdapter
+            .discover(Some(directory.path().to_path_buf()))
+            .unwrap();
+        assert_eq!(candidates[0].media_roots, vec![account]);
+    }
+
+    #[test]
+    #[ignore = "requires the user's explicit authorization to inspect local WXWork directory structure"]
+    fn authorized_real_source_discovers_nonempty_media_roots_without_reading_content() {
+        let candidate = WindowsSourceAdapter
+            .discover(None)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("authorized WXWork source was not discovered");
+        assert!(
+            !candidate.media_roots.is_empty(),
+            "authorized source exposed no recognized media directories"
+        );
+        let file_count = candidate
+            .media_roots
+            .iter()
+            .flat_map(|root| WalkDir::new(root).follow_links(false).into_iter())
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count();
+        assert!(file_count > 0, "recognized media directories were empty");
     }
 }

@@ -15,7 +15,9 @@ use archive_export::{
     export_package,
 };
 use archive_store::{ArchiveStore, IngestSummary, MessageQuery, StoreError};
-use archive_transfer::{append_enterprise_collector_config, read_json, write_importable_json};
+use archive_transfer::{
+    append_enterprise_collector_config, read_json, write_importable_json_formatted,
+};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
@@ -45,6 +47,7 @@ mod dpapi_protect {
     }
     const UI_FORBIDDEN: u32 = 0x1;
     #[link(name = "crypt32")]
+    #[link(name = "shell32")]
     unsafe extern "system" {
         fn CryptProtectData(
             input: *const Blob,
@@ -150,9 +153,42 @@ struct AppState {
     enterprise_config: Arc<Mutex<EnterpriseConfig>>,
     collector_template: Option<Arc<PathBuf>>,
     local_collector: Option<LocalCollector>,
+    local_collection_progress: Arc<Mutex<LocalCollectionProgress>>,
 }
 
-type LocalCollector = Arc<dyn Fn(bool, bool) -> Result<ClientExportV1, String> + Send + Sync>;
+pub type LocalCollectionProgressReporter = Arc<dyn Fn(u8, &str, &str) + Send + Sync>;
+pub type LocalCollectionMediaSink =
+    Arc<dyn Fn(&Path, &str, u64) -> Result<(), String> + Send + Sync>;
+type LocalCollector = Arc<
+    dyn Fn(
+            bool,
+            bool,
+            LocalCollectionProgressReporter,
+            LocalCollectionMediaSink,
+        ) -> Result<ClientExportV1, String>
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalCollectionProgress {
+    running: bool,
+    percent: u8,
+    stage: String,
+    detail: String,
+}
+
+impl Default for LocalCollectionProgress {
+    fn default() -> Self {
+        Self {
+            running: false,
+            percent: 0,
+            stage: "等待开始".into(),
+            detail: "选择采集范围后开始处理。".into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -277,6 +313,8 @@ struct ImportResponse {
     inserted: u64,
     unchanged: u64,
     revised: u64,
+    media_count: u64,
+    missing_media_count: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,7 +328,7 @@ struct ArchiveSummaryResponse {
 #[serde(rename_all = "camelCase")]
 struct ErrorResponse {
     code: &'static str,
-    message: &'static str,
+    message: String,
     recoverable: bool,
 }
 
@@ -298,6 +336,16 @@ struct ErrorResponse {
 struct PageQuery {
     limit: Option<u32>,
     offset: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LocalCollectionQuery {
+    include_media: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenMediaQuery {
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,6 +359,12 @@ struct MessagesQuery {
     offset: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GlobalSearchQuery {
+    q: String,
+    limit: Option<u32>,
+}
+
 #[derive(Debug, Serialize)]
 struct MessageResponse {
     #[serde(flatten)]
@@ -318,6 +372,14 @@ struct MessageResponse {
     sender_name: Option<String>,
     sender_kind: Option<String>,
     quoted_message: Option<QuotedMessageResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct GlobalSearchResponse {
+    #[serde(flatten)]
+    message: MessageResponse,
+    conversation_name: Option<String>,
+    offset_in_conversation: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -347,6 +409,10 @@ struct ExportRequest {
     media_only: Option<bool>,
     #[serde(default)]
     data_redaction: bool,
+    #[serde(default)]
+    simplify: bool,
+    #[serde(default)]
+    pretty: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -355,6 +421,10 @@ struct LocalExportRequest {
     format: ExportFormat,
     #[serde(default)]
     data_redaction: bool,
+    #[serde(default)]
+    simplify: bool,
+    #[serde(default)]
+    pretty: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -425,7 +495,15 @@ impl Drop for DesktopServer {
 
 pub fn start_desktop_server_with_local_collector<F>(collector: F) -> Result<DesktopServer, String>
 where
-    F: Fn(bool, bool) -> Result<ClientExportV1, String> + Send + Sync + 'static,
+    F: Fn(
+            bool,
+            bool,
+            LocalCollectionProgressReporter,
+            LocalCollectionMediaSink,
+        ) -> Result<ClientExportV1, String>
+        + Send
+        + Sync
+        + 'static,
 {
     start_desktop_server_inner(Some(Arc::new(collector)))
 }
@@ -499,6 +577,7 @@ fn prepare_server(
         enterprise_config: Arc::new(Mutex::new(load_enterprise_config(&data_root))),
         collector_template: collector_template.map(Arc::new),
         local_collector,
+        local_collection_progress: Arc::new(Mutex::new(LocalCollectionProgress::default())),
     };
     ArchiveStore::open(&state.archive_path)
         .map_err(|error| format!("归档数据库初始化失败：{error}"))?;
@@ -508,6 +587,10 @@ fn prepare_server(
         .route("/api/v1/imports/json", post(import_json))
         .route("/api/v1/imports/enterprise", post(import_enterprise))
         .route("/api/v1/collections/local", post(collect_local))
+        .route(
+            "/api/v1/collections/local/progress",
+            get(local_collection_progress),
+        )
         .route("/api/v1/server/access-token", post(update_access_token))
         .route(
             "/api/v1/server/access-token/regenerate",
@@ -530,8 +613,10 @@ fn prepare_server(
             get(list_conversation_participants),
         )
         .route("/api/v1/media/{content_hash}", get(get_media))
+        .route("/api/v1/media/{content_hash}/open", post(open_media))
         .route("/api/v1/messages/count", get(count_messages))
         .route("/api/v1/messages", get(list_messages))
+        .route("/api/v1/search/messages", get(search_messages))
         .route(
             "/api/v1/exports",
             post(create_export_job).layer(DefaultBodyLimit::max(64 * 1024)),
@@ -1182,6 +1267,8 @@ async fn ingest_export(
 ) -> Result<Json<ImportResponse>, ApiError> {
     let export_id = export.export_id.to_string();
     let batch_count = export.batches.len();
+    let media_count = export.media_count;
+    let missing_media_count = export.missing_media_count;
     let archive_path = Arc::clone(&state.archive_path);
     let data_root = Arc::clone(&state.data_root);
     let conversations = export.conversations;
@@ -1215,6 +1302,8 @@ async fn ingest_export(
         inserted: summary.inserted,
         unchanged: summary.unchanged,
         revised: summary.revised,
+        media_count,
+        missing_media_count,
     }))
 }
 
@@ -1228,12 +1317,7 @@ fn persist_media_blobs(
     let media_root = data_root.join("media");
     std::fs::create_dir_all(&media_root).map_err(|_| ApiError::store())?;
     for blob in media_blobs {
-        if blob.content_hash.len() != 64
-            || !blob
-                .content_hash
-                .chars()
-                .all(|value| value.is_ascii_hexdigit())
-        {
+        if !is_valid_content_hash(&blob.content_hash) {
             return Err(ApiError::invalid_export());
         }
         let bytes = decode_hex(&blob.content_hex).map_err(|_| ApiError::invalid_export())?;
@@ -1274,13 +1358,72 @@ fn persist_media_blobs(
     Ok(())
 }
 
+fn persist_local_media_file(
+    data_root: &Path,
+    source: &Path,
+    expected_hash: &str,
+    expected_size: u64,
+) -> Result<(), ApiError> {
+    if !is_valid_content_hash(expected_hash) || !source.is_file() {
+        return Err(ApiError::invalid_export());
+    }
+    let media_root = data_root.join("media");
+    std::fs::create_dir_all(&media_root).map_err(|_| ApiError::store())?;
+    let target = media_root.join(expected_hash);
+    if target.is_file() {
+        return (target.metadata().map_err(|_| ApiError::store())?.len() == expected_size)
+            .then_some(())
+            .ok_or_else(ApiError::invalid_export);
+    }
+    let partial = media_root.join(format!(
+        ".{}.{}.partial",
+        expected_hash,
+        Uuid::new_v4().simple()
+    ));
+    let copy_result = (|| -> Result<(), std::io::Error> {
+        let mut input = std::fs::File::open(source)?;
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&partial)?;
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = std::io::Read::read(&mut input, &mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            std::io::Write::write_all(&mut output, &buffer[..read])?;
+            hasher.update(&buffer[..read]);
+            size += read as u64;
+        }
+        output.sync_all()?;
+        if size != expected_size || encode_hex(&hasher.finalize()) != expected_hash {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "media changed while copying",
+            ));
+        }
+        match std::fs::hard_link(&partial, &target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && target.is_file() => {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    })();
+    let _ = std::fs::remove_file(&partial);
+    copy_result.map_err(|_| ApiError::store())
+}
+
 async fn get_media(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(content_hash): AxumPath<String>,
 ) -> Result<Response, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    if content_hash.len() != 64 || !content_hash.chars().all(|value| value.is_ascii_hexdigit()) {
+    if !is_valid_content_hash(&content_hash) {
         return Err(ApiError::invalid_query());
     }
     let media_path = state.data_root.join("media").join(&content_hash);
@@ -1302,6 +1445,95 @@ async fn get_media(
         .header(header::CACHE_CONTROL, "private, max-age=3600")
         .body(Body::from(bytes))
         .map_err(|_| ApiError::store())
+}
+
+async fn open_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(content_hash): AxumPath<String>,
+    Query(query): Query<OpenMediaQuery>,
+) -> Result<Json<OpenDirectoryResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    if !is_valid_content_hash(&content_hash) {
+        return Err(ApiError::invalid_query());
+    }
+    let source = state.data_root.join("media").join(&content_hash);
+    if !source.is_file() {
+        return Err(ApiError::not_found());
+    }
+    let extension = Path::new(&query.name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 10
+                && value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .map(str::to_ascii_lowercase);
+    let Some(extension) = extension else {
+        return Err(ApiError::invalid_query());
+    };
+    let opened_root = state.data_root.join("opened-media");
+    std::fs::create_dir_all(&opened_root).map_err(|_| ApiError::store())?;
+    let opened_name = format!(
+        "{}-{}.{}",
+        content_hash,
+        sanitize_file_component(
+            Path::new(&query.name)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("file")
+        ),
+        extension
+    );
+    let opened_path = opened_root.join(opened_name);
+    if !opened_path.is_file() {
+        std::fs::hard_link(&source, &opened_path).map_err(|_| ApiError::store())?;
+    }
+    open_file_with_default_application(&opened_path)?;
+    Ok(Json(OpenDirectoryResponse { opened: true }))
+}
+
+#[cfg(windows)]
+fn open_file_with_default_application(path: &Path) -> Result<(), ApiError> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show_command: i32,
+        ) -> isize;
+    }
+    let operation = "open\0".encode_utf16().collect::<Vec<_>>();
+    let file = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: the UTF-16 buffers are null terminated and stay alive for the call.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    (result > 32).then_some(()).ok_or_else(ApiError::store)
+}
+
+#[cfg(not(windows))]
+fn open_file_with_default_application(_: &Path) -> Result<(), ApiError> {
+    Err(ApiError::invalid_query())
 }
 
 async fn archive_summary(
@@ -1327,13 +1559,14 @@ async fn archive_summary(
 async fn collect_local(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<LocalCollectionQuery>,
 ) -> Result<Json<ImportResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
     let collector = state
         .local_collector
         .clone()
         .ok_or_else(ApiError::local_collection_unavailable)?;
-    let (include_media, data_redaction) = {
+    let (configured_include_media, data_redaction) = {
         let config = state
             .enterprise_config
             .lock()
@@ -1343,11 +1576,97 @@ async fn collect_local(
             config.data_redaction,
         )
     };
-    let export = tokio::task::spawn_blocking(move || collector(include_media, data_redaction))
-        .await
-        .map_err(|_| ApiError::local_collection_failed())?
-        .map_err(|_| ApiError::local_collection_failed())?;
-    ingest_export(&state, export).await
+    let include_media = query.include_media.unwrap_or(configured_include_media);
+    set_local_collection_progress(&state, true, 3, "准备采集", "正在初始化本机采集任务。");
+    let progress = Arc::clone(&state.local_collection_progress);
+    let reporter: LocalCollectionProgressReporter = Arc::new(move |percent, stage, detail| {
+        if let Ok(mut current) = progress.lock() {
+            *current = LocalCollectionProgress {
+                running: true,
+                percent: percent.min(95),
+                stage: stage.to_owned(),
+                detail: detail.to_owned(),
+            };
+        }
+    });
+    let media_root = Arc::clone(&state.data_root);
+    let media_sink: LocalCollectionMediaSink =
+        Arc::new(move |source, expected_hash, expected_size| {
+            persist_local_media_file(&media_root, source, expected_hash, expected_size)
+                .map_err(|_| "媒体文件写入归档失败。".to_owned())
+        });
+    let export = match tokio::task::spawn_blocking(move || {
+        collector(include_media, data_redaction, reporter, media_sink)
+    })
+    .await
+    {
+        Ok(Ok(export)) => export,
+        Ok(Err(message)) => {
+            set_local_collection_progress(&state, false, 0, "采集失败", &message);
+            return Err(ApiError::local_collection_failed(message));
+        }
+        Err(_) => {
+            let message = "本机采集进程异常结束，请重试。".to_owned();
+            set_local_collection_progress(&state, false, 0, "采集失败", &message);
+            return Err(ApiError::local_collection_failed(message));
+        }
+    };
+    set_local_collection_progress(
+        &state,
+        true,
+        92,
+        "写入归档",
+        "正在校验并写入消息、图片和文件。",
+    );
+    let result = ingest_export(&state, export).await;
+    if result.is_ok() {
+        set_local_collection_progress(
+            &state,
+            false,
+            100,
+            "采集完成",
+            "本机数据已经合并到当前归档。",
+        );
+    } else {
+        set_local_collection_progress(
+            &state,
+            false,
+            0,
+            "写入失败",
+            "采集结果未能写入归档，请重试。",
+        );
+    }
+    result
+}
+
+async fn local_collection_progress(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<LocalCollectionProgress>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let progress = state
+        .local_collection_progress
+        .lock()
+        .map_err(|_| ApiError::store())?
+        .clone();
+    Ok(Json(progress))
+}
+
+fn set_local_collection_progress(
+    state: &AppState,
+    running: bool,
+    percent: u8,
+    stage: &str,
+    detail: &str,
+) {
+    if let Ok(mut progress) = state.local_collection_progress.lock() {
+        *progress = LocalCollectionProgress {
+            running,
+            percent: percent.min(100),
+            stage: stage.to_owned(),
+            detail: detail.to_owned(),
+        };
+    }
 }
 
 async fn list_conversations(
@@ -1487,6 +1806,105 @@ async fn count_messages(
     Ok(Json(MessageCountResponse { total }))
 }
 
+async fn search_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GlobalSearchQuery>,
+) -> Result<Json<Vec<GlobalSearchResponse>>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let search_text = query.q.trim().to_owned();
+    if search_text.is_empty() || search_text.chars().count() > 200 {
+        return Err(ApiError::invalid_query());
+    }
+    let archive_path = Arc::clone(&state.archive_path);
+    let results = tokio::task::spawn_blocking(move || {
+        let store = ArchiveStore::open_read_only(&archive_path).map_err(|_| ApiError::store())?;
+        let messages = store
+            .query_messages(&MessageQuery {
+                conversation_id: None,
+                participant_id: None,
+                text: Some(search_text),
+                starts_at: None,
+                ends_at: None,
+                message_type: None,
+                media_only: false,
+                limit: query.limit.unwrap_or(50).clamp(1, 100),
+                offset: 0,
+            })
+            .map_err(|_| ApiError::store())?;
+        let mut participant_cache = std::collections::BTreeMap::new();
+        let mut results = Vec::with_capacity(messages.len());
+        for message in messages {
+            if !participant_cache.contains_key(&message.conversation_id) {
+                let participants = store
+                    .list_conversation_participants(&message.conversation_id)
+                    .map_err(|_| ApiError::store())?
+                    .into_iter()
+                    .map(|participant| (participant.participant_id.clone(), participant))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                participant_cache.insert(message.conversation_id.clone(), participants);
+            }
+            let participants = participant_cache
+                .get(&message.conversation_id)
+                .ok_or_else(ApiError::store)?;
+            let participant = message
+                .sender_id
+                .as_ref()
+                .and_then(|sender_id| participants.get(sender_id));
+            let quoted_message = message
+                .quoted_message_id
+                .as_deref()
+                .map(|quoted_id| store.get_message(quoted_id))
+                .transpose()
+                .map_err(|_| ApiError::store())?
+                .flatten()
+                .map(|quoted| QuotedMessageResponse {
+                    sender_name: quoted
+                        .sender_id
+                        .as_ref()
+                        .and_then(|sender_id| participants.get(sender_id))
+                        .and_then(|item| item.display_name.clone()),
+                    stable_message_id: quoted.stable_message_id,
+                    sender_id: quoted.sender_id,
+                    sent_at: quoted.sent_at,
+                    body_text: quoted.body_text,
+                    message_type: quoted.message_type,
+                });
+            let conversation_name = store
+                .conversation_display_name(&message.conversation_id)
+                .map_err(|_| ApiError::store())?
+                .or_else(|| {
+                    message.conversation_id.starts_with("S:").then(|| {
+                        participants
+                            .values()
+                            .filter_map(|item| item.display_name.clone())
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    })
+                })
+                .filter(|name| !name.is_empty());
+            let offset_in_conversation = store
+                .message_offset_in_conversation(&message.stable_message_id)
+                .map_err(|_| ApiError::store())?
+                .unwrap_or(0);
+            results.push(GlobalSearchResponse {
+                conversation_name,
+                offset_in_conversation,
+                message: MessageResponse {
+                    sender_name: participant.and_then(|item| item.display_name.clone()),
+                    sender_kind: participant.and_then(|item| item.participant_kind.clone()),
+                    message,
+                    quoted_message,
+                },
+            });
+        }
+        Ok::<_, ApiError>(results)
+    })
+    .await
+    .map_err(|_| ApiError::store())??;
+    Ok(Json(results))
+}
+
 async fn list_conversation_participants(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1562,14 +1980,50 @@ async fn create_export_job(
         if request.data_redaction {
             redact_sensitive_messages(&mut messages);
         }
+        let conversation_ids = messages
+            .iter()
+            .map(|message| message.conversation_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut participant_directory = std::collections::BTreeMap::new();
+        let mut conversation_names = std::collections::BTreeMap::new();
+        if request.simplify || request.pretty {
+            for id in &conversation_ids {
+                for participant in store
+                    .list_conversation_participants(id)
+                    .map_err(ApiError::from_store)?
+                {
+                    participant_directory.insert(participant.participant_id.clone(), participant);
+                }
+            }
+            let mut offset = 0;
+            let mut remaining_conversations = conversation_ids.clone();
+            while !remaining_conversations.is_empty() {
+                let page = store
+                    .list_conversations(200, offset)
+                    .map_err(ApiError::from_store)?;
+                if page.is_empty() {
+                    break;
+                }
+                offset += page.len() as u64;
+                for conversation in page {
+                    if remaining_conversations.remove(conversation.conversation_id.as_str())
+                        && let Some(name) = conversation.display_name
+                    {
+                        conversation_names.insert(conversation.conversation_id, name);
+                    }
+                }
+            }
+        }
         let participants = messages
             .iter()
             .filter_map(|message| message.sender_id.as_ref())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .map(|participant_id| ExportParticipant {
-                participant_id: participant_id.clone(),
-                display_name: None,
+            .map(|id| ExportParticipant {
+                participant_id: id.clone(),
+                display_name: participant_directory
+                    .get(id)
+                    .and_then(|participant| participant.display_name.clone()),
                 participant_kind: None,
             })
             .collect::<Vec<_>>();
@@ -1608,6 +2062,9 @@ async fn create_export_job(
             format,
             messages,
             participants,
+            conversation_names,
+            simplify: request.simplify,
+            pretty: request.pretty,
             media,
             generated_at: Utc::now(),
             edge_executable: find_edge_executable(),
@@ -1654,8 +2111,15 @@ async fn create_local_export(
     let format = request.format;
     let data_redaction = request.data_redaction;
     let result = tokio::task::spawn_blocking(move || {
-        let export = collector(include_media, data_redaction)
-            .map_err(|_| ApiError::local_collection_failed())?;
+        let reporter: LocalCollectionProgressReporter = Arc::new(|_, _, _| {});
+        let media_root = Arc::clone(&data_root);
+        let media_sink: LocalCollectionMediaSink =
+            Arc::new(move |source, expected_hash, expected_size| {
+                persist_local_media_file(&media_root, source, expected_hash, expected_size)
+                    .map_err(|_| "媒体文件写入归档失败。".to_owned())
+            });
+        let export = collector(include_media, data_redaction, reporter, media_sink)
+            .map_err(ApiError::local_collection_failed)?;
         let export_id = export.export_id;
         let export_root = data_root.join("exports");
         std::fs::create_dir_all(&export_root).map_err(|_| ApiError::store())?;
@@ -1672,8 +2136,9 @@ async fn create_local_export(
             extension
         );
         let target = export_root.join(&file_name);
-        if format == ExportFormat::Json {
-            write_importable_json(&export, &target).map_err(|_| ApiError::invalid_export())?;
+        if format == ExportFormat::Json && !request.simplify {
+            write_importable_json_formatted(&export, &target, request.pretty)
+                .map_err(|_| ApiError::invalid_export())?;
             let result = ExportResult {
                 export_id,
                 target: target.clone(),
@@ -1690,6 +2155,15 @@ async fn create_local_export(
             .flat_map(|batch| batch.messages.iter())
             .cloned()
             .collect::<Vec<_>>();
+        let conversation_names = export
+            .conversations
+            .into_iter()
+            .filter_map(|conversation| {
+                conversation
+                    .display_name
+                    .map(|name| (conversation.conversation_id, name))
+            })
+            .collect();
         let participants = export
             .participants
             .into_iter()
@@ -1718,6 +2192,9 @@ async fn create_local_export(
             format,
             messages,
             participants,
+            conversation_names,
+            simplify: request.simplify,
+            pretty: request.pretty,
             media,
             generated_at: Utc::now(),
             edge_executable: find_edge_executable(),
@@ -2014,6 +2491,10 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
         .collect()
 }
 
+fn is_valid_content_hash(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit())
+}
+
 fn sanitize_file_component(value: &str) -> String {
     let cleaned: String = value
         .chars()
@@ -2046,7 +2527,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             body: ErrorResponse {
                 code: "MEDIA_NOT_FOUND",
-                message: "媒体内容不存在。",
+                message: "媒体内容不存在。".into(),
                 recoverable: true,
             },
         }
@@ -2057,7 +2538,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             body: ErrorResponse {
                 code: "UNAUTHORIZED",
-                message: "需要有效的服务端访问令牌。",
+                message: "需要有效的服务端访问令牌。".into(),
                 recoverable: true,
             },
         }
@@ -2068,7 +2549,7 @@ impl ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             body: ErrorResponse {
                 code: "INVALID_CLIENT_EXPORT",
-                message: "客户端 JSON 格式、关系或校验值无效。",
+                message: "客户端 JSON 格式、关系或校验值无效。".into(),
                 recoverable: true,
             },
         }
@@ -2079,7 +2560,7 @@ impl ApiError {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             body: ErrorResponse {
                 code: "CLIENT_EXPORT_TOO_LARGE",
-                message: "客户端 JSON 超过服务端单次导入上限。",
+                message: "客户端 JSON 超过服务端单次导入上限。".into(),
                 recoverable: true,
             },
         }
@@ -2090,7 +2571,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             body: ErrorResponse {
                 code: "INVALID_QUERY",
-                message: "检索参数无效。",
+                message: "检索参数无效。".into(),
                 recoverable: true,
             },
         }
@@ -2101,18 +2582,18 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             body: ErrorResponse {
                 code: "LOCAL_COLLECTION_UNAVAILABLE",
-                message: "当前访问方式不支持采集本机数据，请在桌面工作台中使用。",
+                message: "当前访问方式不支持采集本机数据，请在桌面工作台中使用。".into(),
                 recoverable: true,
             },
         }
     }
 
-    fn local_collection_failed() -> Self {
+    fn local_collection_failed(message: String) -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             body: ErrorResponse {
                 code: "LOCAL_COLLECTION_FAILED",
-                message: "本机采集未完成，请保持企业微信登录后重试。",
+                message,
                 recoverable: true,
             },
         }
@@ -2123,7 +2604,7 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: ErrorResponse {
                 code: "ARCHIVE_STORE_FAILED",
-                message: "服务端归档写入失败，诊断信息已脱敏。",
+                message: "服务端归档写入失败，诊断信息已脱敏。".into(),
                 recoverable: true,
             },
         }
@@ -2135,7 +2616,7 @@ impl ApiError {
                 status: StatusCode::CONFLICT,
                 body: ErrorResponse {
                     code: "BATCH_CONFLICT",
-                    message: "同一采集批次标识已存在，但内容校验值不同。",
+                    message: "同一采集批次标识已存在，但内容校验值不同。".into(),
                     recoverable: false,
                 },
             }
@@ -2150,7 +2631,7 @@ impl ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 body: ErrorResponse {
                     code: "PDF_RENDERER_UNAVAILABLE",
-                    message: "未找到可用的本机 Edge PDF 渲染器。",
+                    message: "未找到可用的本机 Edge PDF 渲染器。".into(),
                     recoverable: true,
                 },
             }
@@ -2159,7 +2640,7 @@ impl ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 body: ErrorResponse {
                     code: "ARCHIVE_EXPORT_FAILED",
-                    message: "服务端导出失败；未完成文件已清理。",
+                    message: "服务端导出失败；未完成文件已清理。".into(),
                     recoverable: true,
                 },
             }
@@ -2212,6 +2693,7 @@ mod tests {
             enterprise_config: Arc::new(Mutex::new(new_enterprise_config())),
             collector_template: None,
             local_collector: None,
+            local_collection_progress: Arc::new(Mutex::new(LocalCollectionProgress::default())),
         }
     }
 
@@ -2222,6 +2704,31 @@ mod tests {
             format!("Bearer {TEST_TOKEN}").parse().unwrap(),
         );
         headers
+    }
+
+    #[test]
+    fn streams_local_media_to_the_content_addressed_store() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("source.bin");
+        let bytes = b"streamed local media";
+        std::fs::write(&source, bytes).unwrap();
+        let hash = encode_hex(&Sha256::digest(bytes));
+
+        persist_local_media_file(&directory.0, &source, &hash, bytes.len() as u64).unwrap();
+
+        assert_eq!(
+            std::fs::read(directory.0.join("media").join(hash)).unwrap(),
+            bytes
+        );
+        assert!(
+            std::fs::read_dir(directory.0.join("media"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".partial"))
+        );
     }
 
     fn export_bytes(body: &str, batch_id: Uuid, batch_hash: &str) -> Vec<u8> {
@@ -2314,6 +2821,43 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn local_collection_query_overrides_the_configured_media_mode() {
+        let directory = TestDirectory::new();
+        let mut app_state = state(&directory);
+        app_state.enterprise_config.lock().unwrap().include_files = false;
+        app_state.enterprise_config.lock().unwrap().include_images = false;
+        let selected_modes = Arc::new(Mutex::new(Vec::new()));
+        let captured_modes = Arc::clone(&selected_modes);
+        let export: ClientExportV1 = serde_json::from_slice(&export_bytes(
+            "本机消息",
+            Uuid::new_v4(),
+            "local-collection",
+        ))
+        .unwrap();
+        app_state.local_collector = Some(Arc::new(move |include_media, _, reporter, _| {
+            captured_modes.lock().unwrap().push(include_media);
+            reporter(55, "解析消息", "正在解析测试消息。");
+            Ok(export.clone())
+        }));
+
+        let _ = collect_local(
+            State(app_state.clone()),
+            authorized_headers(),
+            Query(LocalCollectionQuery {
+                include_media: Some(true),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*selected_modes.lock().unwrap(), vec![true]);
+        let progress = app_state.local_collection_progress.lock().unwrap().clone();
+        assert!(!progress.running);
+        assert_eq!(progress.percent, 100);
+        assert_eq!(progress.stage, "采集完成");
     }
 
     #[tokio::test]
@@ -2605,6 +3149,8 @@ mod tests {
                 message_type: None,
                 media_only: None,
                 data_redaction: false,
+                simplify: false,
+                pretty: false,
             }),
         )
         .await
@@ -2672,6 +3218,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn export_options_reach_both_writers_and_keep_full_local_json_importable() {
+        let directory = TestDirectory::new();
+        let mut app_state = state(&directory);
+        let bytes = export_bytes("普通消息\n第二行", Uuid::new_v4(), "fixture");
+        let export: ClientExportV1 = serde_json::from_slice(&bytes).unwrap();
+        app_state.local_collector = Some(Arc::new(move |_, _, _, _| {
+            let mut snapshot = export.clone();
+            snapshot.export_id = Uuid::new_v4();
+            Ok(snapshot)
+        }));
+        let _ = import_json(
+            State(app_state.clone()),
+            authorized_headers(),
+            Body::from(bytes),
+        )
+        .await
+        .unwrap();
+        for simplify in [false, true] {
+            for pretty in [false, true] {
+                for local in [false, true] {
+                    let payload = json!({"scope": "entire_archive", "format": "json", "simplify": simplify, "pretty": pretty});
+                    let response = if local {
+                        create_local_export(
+                            State(app_state.clone()),
+                            authorized_headers(),
+                            Json(serde_json::from_value(payload).unwrap()),
+                        )
+                        .await
+                        .unwrap()
+                    } else {
+                        create_export_job(
+                            State(app_state.clone()),
+                            authorized_headers(),
+                            Json(serde_json::from_value(payload).unwrap()),
+                        )
+                        .await
+                        .unwrap()
+                    };
+                    let path = directory.0.join("exports").join(&response.file_name);
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    assert_eq!(text.contains('\n'), pretty);
+                    assert_eq!(response.message_count, 1);
+                    let document: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if simplify {
+                        assert_eq!(document[0]["sender"], "测试成员");
+                        assert_eq!(document[0]["conversation"], "测试会话");
+                        assert_eq!(document[0]["content"], "普通消息\n第二行");
+                        assert!(!text.contains("participant-fixture"));
+                        assert!(!text.contains("raw_payload"));
+                        assert!(!text.contains("participants"));
+                    } else if local {
+                        assert_eq!(read_json(&path).unwrap().message_count, 1);
+                    } else {
+                        assert_eq!(document[0]["stable_message_id"], "stable-message-1");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_export_requests_default_to_full_compact_output() {
+        let local: LocalExportRequest = serde_json::from_value(json!({"format":"json"})).unwrap();
+        let server: ExportRequest =
+            serde_json::from_value(json!({"scope":"entire_archive", "format":"json"})).unwrap();
+        assert!(!local.simplify && !local.pretty && !server.simplify && !server.pretty);
+    }
+
     #[test]
     fn data_redaction_removes_plaintext_values() {
         let export: archive_domain::ClientExportV1 = serde_json::from_slice(&export_bytes(
@@ -2686,7 +3301,7 @@ mod tests {
 
         assert_eq!(
             messages[0].body_text.as_deref(),
-            Some("账号 [敏感数据已脱敏] 密码 [敏感数据已脱敏]")
+            Some("账号 admin 密码 [敏感数据已脱敏]")
         );
         assert!(!serde_json::to_string(&messages).unwrap().contains("secret"));
     }

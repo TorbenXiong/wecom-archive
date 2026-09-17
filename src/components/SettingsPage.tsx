@@ -21,7 +21,7 @@ export function SettingsPage() {
         <section className="settings-section compact-setting about-setting">
           <div className="compact-heading"><Building2 size={18} /><h2>关于</h2></div>
           <div className="setting-fact"><span>产品</span><strong>企业微信记录归档</strong></div>
-          <div className="setting-fact"><span>版本</span><strong>0.0.2</strong></div>
+          <div className="setting-fact"><span>版本</span><strong>0.0.3</strong></div>
         </section>
       </div>
     </main>
