@@ -17,5 +17,6 @@
 
 - 版本：`0.0.4`；工作台默认监听 `127.0.0.1:9812`。
 - 附件：`WeComArchive-0.0.4-windows-x64.exe`（最终构建后上传）。
-- SHA-256：`42A48C94A1503084A363A306C275B8351566446B928C52E204CCE67E0B0E523C`。
+- SHA-256：`EDA7C1CA3E59F87D1D0E41A358D6613B183E22E8B81164430907AA4E6FC3F4E8`。
 - 变更记录：[0.0.4 提交记录](https://github.com/TorbenXiong/wecom-archive/commits/0.0.4)。
+
