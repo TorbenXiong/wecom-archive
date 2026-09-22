@@ -8,6 +8,10 @@ export interface ServerArchiveSummary {
   local_collection_available: boolean;
 }
 
+export interface ArchiveUpdate {
+  revision: number;
+}
+
 export interface ServerConversation {
   conversation_id: string;
   display_name?: string;
@@ -64,6 +68,11 @@ export interface ServerParticipant {
   participant_kind?: string;
 }
 
+export interface CollectedUser {
+  source_instance_id: string;
+  display_name?: string;
+}
+
 export interface MessageQuery {
   conversationId: string;
   participantId?: string;
@@ -72,6 +81,7 @@ export interface MessageQuery {
   mediaOnly?: boolean;
   limit?: number;
   offset?: number;
+  sort?: "asc" | "desc";
 }
 
 export interface ServerImportResult {
@@ -101,6 +111,50 @@ export interface EnterpriseConfig {
   includeMedia: boolean;
   dataRedaction: boolean;
   offlineExportEnabled: boolean;
+  superAdminEnabled: boolean;
+  serverSchedule: CollectionSchedule;
+  collectorSchedule: CollectionSchedule;
+}
+
+export type CollectionScheduleMode = "disabled" | "interval" | "daily";
+
+export interface CollectionSchedule {
+  mode: CollectionScheduleMode;
+  intervalMinutes: number;
+  dailyTime: string;
+}
+
+export interface CollectionSchedules {
+  localPlans: LocalCollectionPlan[];
+  collectorPlans: CollectorPlan[];
+}
+
+export interface LocalCollectionPlan {
+  id: string;
+  name: string;
+  includeMedia: boolean;
+  schedule: CollectionSchedule;
+  createdAt: string;
+  updatedAt: string;
+  lastRunAt?: string;
+  lastStatus?: "success" | "error";
+  lastDetail?: string;
+  nextRunAt?: string;
+}
+
+export interface CollectorPlan {
+  collectorId: string;
+  fileName: string;
+  organizationName: string;
+  uploadUrl: string;
+  includeMedia: boolean;
+  dataRedaction: boolean;
+  offlineExportEnabled: boolean;
+  schedule: CollectionSchedule;
+  createdAt: string;
+  lastUploadAt?: string;
+  nextRunAt?: string;
+  executableAvailable: boolean;
 }
 
 export interface CollectorResult {
@@ -114,7 +168,7 @@ export interface CollectorResult {
 
 export interface ServerExportRequest {
   scope: "current_conversation" | "current_filter" | "entire_archive";
-  format: "json" | "csv" | "html" | "pdf";
+  format: "json" | "csv" | "html" | "md";
   conversationId?: string;
   participantId?: string;
   text?: string;
@@ -123,7 +177,11 @@ export interface ServerExportRequest {
   dataRedaction?: boolean;
   simplify?: boolean;
   pretty?: boolean;
+  conversationOrder?: ExportOrder;
+  messageOrder?: ExportOrder;
 }
+
+export type ExportOrder = "ascending" | "descending";
 
 export interface ServerExportResult {
   exportId: string;
@@ -136,15 +194,24 @@ export interface ServerExportResult {
 }
 
 export interface LocalExportRequest {
-  format: "json" | "csv" | "html" | "pdf";
+  format: "json" | "csv" | "html" | "md";
   dataRedaction: boolean;
   simplify?: boolean;
   pretty?: boolean;
+  conversationOrder?: ExportOrder;
+  messageOrder?: ExportOrder;
 }
 
 interface ServerError {
   code?: string;
   message?: string;
+}
+
+export class ServerApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ServerApiError";
+  }
 }
 
 async function request<T>(path: string, token: string, init?: RequestInit): Promise<T> {
@@ -157,13 +224,25 @@ async function request<T>(path: string, token: string, init?: RequestInit): Prom
   });
   if (!response.ok) {
     const detail = await response.json().catch(() => ({})) as ServerError;
-    throw new Error(detail.message || `服务端请求失败（${response.status}）`);
+    throw new ServerApiError(detail.message || `服务端请求失败（${response.status}）`, response.status);
   }
   return response.json() as Promise<T>;
 }
 
 export function getArchiveSummary(token: string): Promise<ServerArchiveSummary> {
   return request<ServerArchiveSummary>("/api/v1/archive/summary", token);
+}
+
+export function waitForArchiveUpdate(token: string, since: number, signal: AbortSignal): Promise<ArchiveUpdate> {
+  return request<ArchiveUpdate>(
+    `/api/v1/archive/updates?since=${encodeURIComponent(since)}`,
+    token,
+    { signal },
+  );
+}
+
+export function getCollectedUsers(token: string, signal?: AbortSignal): Promise<CollectedUser[]> {
+  return request<CollectedUser[]>("/api/v1/archive/collected-users", token, { signal });
 }
 
 export function collectLocalArchive(token: string, includeMedia: boolean): Promise<ServerImportResult> {
@@ -175,8 +254,22 @@ export function getLocalCollectionProgress(token: string, signal?: AbortSignal):
   return request<LocalCollectionProgress>("/api/v1/collections/local/progress", token, { signal });
 }
 
-export function listConversations(token: string, signal?: AbortSignal): Promise<ServerConversation[]> {
-  return request<ServerConversation[]>("/api/v1/conversations?limit=200", token, { signal });
+export async function listConversations(token: string, signal?: AbortSignal): Promise<ServerConversation[]> {
+  const pageSize = 200;
+  const conversations: ServerConversation[] = [];
+  const seen = new Set<string>();
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await request<ServerConversation[]>(`/api/v1/conversations?limit=${pageSize}&offset=${offset}`, token, { signal });
+    let added = 0;
+    for (const conversation of page) {
+      if (seen.has(conversation.conversation_id)) continue;
+      seen.add(conversation.conversation_id);
+      conversations.push(conversation);
+      added += 1;
+    }
+    if (page.length < pageSize || added === 0) break;
+  }
+  return conversations;
 }
 
 export function listConversationParticipants(token: string, conversationId: string, signal?: AbortSignal): Promise<ServerParticipant[]> {
@@ -193,6 +286,7 @@ export function listMessages(token: string, query: MessageQuery, signal?: AbortS
   if (query.text) parameters.set("text", query.text);
   if (query.messageType) parameters.set("message_type", query.messageType);
   if (query.mediaOnly) parameters.set("media_only", "true");
+  if (query.sort) parameters.set("sort", query.sort);
   return request<ServerMessage[]>(`/api/v1/messages?${parameters}`, token, { signal });
 }
 
@@ -205,8 +299,8 @@ export function countMessages(token: string, query: Omit<MessageQuery, "limit" |
   return request<{ total: number }>(`/api/v1/messages/count?${parameters}`, token, { signal });
 }
 
-export function searchMessages(token: string, text: string, signal?: AbortSignal): Promise<GlobalSearchResult[]> {
-  const parameters = new URLSearchParams({ q: text, limit: "50" });
+export function searchMessages(token: string, text: string, signal?: AbortSignal, sort: "asc" | "desc" = "desc"): Promise<GlobalSearchResult[]> {
+  const parameters = new URLSearchParams({ q: text, limit: "50", sort });
   return request<GlobalSearchResult[]>(`/api/v1/search/messages?${parameters}`, token, { signal });
 }
 
@@ -220,6 +314,42 @@ export async function importClientJson(file: File, token: string): Promise<Serve
 
 export function getEnterpriseConfig(token: string): Promise<EnterpriseConfig> {
   return request<EnterpriseConfig>("/api/v1/enterprise/config", token);
+}
+
+export function updateSuperAdmin(token: string, enabled: boolean): Promise<{ superAdminEnabled: boolean }> {
+  return request<{ superAdminEnabled: boolean }>("/api/v1/settings/super-admin", token, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+export function getCollectionSchedules(token: string): Promise<CollectionSchedules> {
+  return request<CollectionSchedules>("/api/v1/collection-schedules", token);
+}
+
+export function createLocalCollectionPlan(token: string, input: { name: string; includeMedia: boolean; schedule: CollectionSchedule }): Promise<CollectionSchedules> {
+  return request<CollectionSchedules>("/api/v1/collection-schedules", token, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function updateLocalCollectionPlan(token: string, planId: string, input: { name: string; includeMedia: boolean; schedule: CollectionSchedule }): Promise<CollectionSchedules> {
+  return request<CollectionSchedules>(`/api/v1/collection-schedules/${encodeURIComponent(planId)}`, token, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function deleteLocalCollectionPlan(token: string, planId: string): Promise<CollectionSchedules> {
+  return request<CollectionSchedules>(`/api/v1/collection-schedules/${encodeURIComponent(planId)}`, token, { method: "DELETE" });
+}
+
+export function listEnterpriseCollectors(token: string): Promise<{ collectors: CollectorPlan[] }> {
+  return request<{ collectors: CollectorPlan[] }>("/api/v1/enterprise/collectors", token);
 }
 
 export function updateServerAccessToken(currentToken: string, accessToken: string): Promise<{ updated: boolean }> {
@@ -244,6 +374,9 @@ export function updateEnterpriseConfig(token: string, config: {
   includeMedia?: boolean;
   dataRedaction?: boolean;
   offlineExportEnabled?: boolean;
+  superAdminEnabled?: boolean;
+  serverSchedule?: CollectionSchedule;
+  collectorSchedule?: CollectionSchedule;
 }): Promise<EnterpriseConfig> {
   return request<EnterpriseConfig>("/api/v1/enterprise/config", token, {
     method: "PUT",

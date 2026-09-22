@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
-use windows::Win32::Security::Cryptography::{
-    CERT_HASH_PROP_ID, CertGetCertificateContextProperty,
-};
+use windows::Win32::Security::Cryptography::{CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW};
 use windows::Win32::Security::WinTrust::{
     WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO,
     WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
@@ -31,7 +29,9 @@ use windows::Win32::System::Threading::{
 use windows::core::{PCWSTR, PWSTR};
 use zeroize::Zeroize;
 
-const TRUSTED_PUBLISHER_THUMBPRINTS: &[&str] = &["2bc94a2110f6f412ab416d53eb755664d320590c"];
+// The leaf certificate changes during normal WXWork updates. Trust the
+// stable publisher identity instead of pinning a short-lived certificate.
+const TRUSTED_PUBLISHER_COMMON_NAME: &str = "Tencent Technology (Shenzhen) Company Limited";
 const MAX_SCAN_BYTES: u64 = 1024 * 1024 * 1024;
 const READ_CHUNK_BYTES: usize = 256 * 1024;
 const MAX_DERIVED_CANDIDATES: usize = 512;
@@ -324,11 +324,9 @@ fn verify_publisher(path: &Path) -> bool {
             } else {
                 (*provider_cert).pCert
             };
-            certificate_thumbprint(cert).is_some_and(|thumbprint| {
-                TRUSTED_PUBLISHER_THUMBPRINTS
-                    .iter()
-                    .any(|expected| thumbprint.eq_ignore_ascii_case(expected))
-            })
+            certificate_common_name(cert)
+                .as_deref()
+                .is_some_and(is_trusted_publisher_common_name)
         }
     } else {
         false
@@ -344,28 +342,36 @@ fn verify_publisher(path: &Path) -> bool {
     trusted
 }
 
-fn certificate_thumbprint(
+fn is_trusted_publisher_common_name(common_name: &str) -> bool {
+    common_name.eq_ignore_ascii_case(TRUSTED_PUBLISHER_COMMON_NAME)
+}
+
+fn certificate_common_name(
     certificate: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
 ) -> Option<String> {
     if certificate.is_null() {
         return None;
     }
-    let mut size = 0_u32;
-    unsafe {
-        CertGetCertificateContextProperty(certificate, CERT_HASH_PROP_ID, None, &mut size).ok()?;
+    let size =
+        unsafe { CertGetNameStringW(certificate, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, None) };
+    if size <= 1 {
+        return None;
     }
-    let mut bytes = vec![0_u8; size as usize];
-    unsafe {
-        CertGetCertificateContextProperty(
+    let mut name = vec![0_u16; size as usize];
+    let written = unsafe {
+        CertGetNameStringW(
             certificate,
-            CERT_HASH_PROP_ID,
-            Some(bytes.as_mut_ptr().cast()),
-            &mut size,
+            CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            0,
+            None,
+            Some(&mut name),
         )
-        .ok()?;
+    };
+    if written <= 1 {
+        return None;
     }
-    bytes.truncate(size as usize);
-    Some(hex::encode(bytes))
+    name.truncate(written as usize - 1);
+    String::from_utf16(&name).ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -892,6 +898,17 @@ impl Drop for OwnedHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_tencent_publisher_identity_without_leaf_certificate_pinning() {
+        assert!(is_trusted_publisher_common_name(
+            "Tencent Technology (Shenzhen) Company Limited"
+        ));
+        assert!(is_trusted_publisher_common_name(
+            "tencent technology (shenzhen) company limited"
+        ));
+        assert!(!is_trusted_publisher_common_name("Other Publisher"));
+    }
 
     #[test]
     fn extracts_ascii_hex_and_utf16_candidates_without_surrounding_data() {

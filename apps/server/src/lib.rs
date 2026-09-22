@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -16,7 +17,8 @@ use archive_export::{
 };
 use archive_store::{ArchiveStore, IngestSummary, MessageQuery, StoreError};
 use archive_transfer::{
-    append_enterprise_collector_config, read_json, write_importable_json_formatted,
+    append_enterprise_collector_config, read_json, sort_export_for_output,
+    write_importable_json_formatted,
 };
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
@@ -24,11 +26,14 @@ use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::Utc;
+#[cfg(test)]
+use chrono::TimeZone;
+use chrono::{Local, NaiveTime, TimeDelta, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -134,6 +139,8 @@ mod dpapi_protect {
 
 const DATA_ROOT_ENV: &str = "WECOM_ARCHIVE_SERVER_DATA";
 const LISTEN_ENV: &str = "WECOM_ARCHIVE_SERVER_LISTEN";
+const DEFAULT_SERVER_PORT: u16 = 9812;
+const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:9812";
 const MAX_CLIENT_EXPORT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const ENTERPRISE_CONFIG_FILE: &str = "enterprise-config.json";
 const ACCESS_TOKEN_FILE: &str = "access-token.dpapi";
@@ -154,6 +161,8 @@ struct AppState {
     collector_template: Option<Arc<PathBuf>>,
     local_collector: Option<LocalCollector>,
     local_collection_progress: Arc<Mutex<LocalCollectionProgress>>,
+    local_collection_running: Arc<AtomicBool>,
+    archive_update: watch::Sender<u64>,
 }
 
 pub type LocalCollectionProgressReporter = Arc<dyn Fn(u8, &str, &str) + Send + Sync>;
@@ -163,6 +172,7 @@ type LocalCollector = Arc<
     dyn Fn(
             bool,
             bool,
+            Option<i64>,
             LocalCollectionProgressReporter,
             LocalCollectionMediaSink,
         ) -> Result<ClientExportV1, String>
@@ -201,10 +211,21 @@ struct EnterpriseConfig {
     include_files: bool,
     #[serde(default)]
     include_images: bool,
-    #[serde(default)]
+    #[serde(default = "default_data_redaction")]
     data_redaction: bool,
     #[serde(default)]
     offline_export_enabled: bool,
+    #[serde(default = "default_super_admin_enabled")]
+    super_admin_enabled: bool,
+    #[serde(default)]
+    local_collection_plans: Vec<LocalCollectionPlan>,
+    #[serde(default, skip_serializing)]
+    server_include_media: bool,
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    server_schedule: CollectionSchedule,
+    #[serde(default)]
+    collector_schedule: CollectionSchedule,
     key_id: String,
     public_key_hex: String,
     private_key_protected_hex: String,
@@ -214,6 +235,94 @@ struct EnterpriseConfig {
     key_history: Vec<EnterpriseKeyRecord>,
     #[serde(default)]
     collectors: Vec<EnterpriseCollectorRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionSchedule {
+    #[serde(default)]
+    mode: CollectionScheduleMode,
+    #[serde(default = "default_schedule_interval_minutes")]
+    interval_minutes: u32,
+    #[serde(default = "default_schedule_daily_time")]
+    daily_time: String,
+}
+
+impl Default for CollectionSchedule {
+    fn default() -> Self {
+        Self {
+            mode: CollectionScheduleMode::Disabled,
+            interval_minutes: default_schedule_interval_minutes(),
+            daily_time: default_schedule_daily_time(),
+        }
+    }
+}
+
+impl CollectionSchedule {
+    fn validate(&self) -> Result<(), ApiError> {
+        if !(1..=10_080).contains(&self.interval_minutes)
+            || NaiveTime::parse_from_str(&self.daily_time, "%H:%M").is_err()
+        {
+            return Err(ApiError::invalid_query());
+        }
+        Ok(())
+    }
+
+    fn next_after(&self, now: chrono::DateTime<Local>) -> Option<chrono::DateTime<Local>> {
+        match self.mode {
+            CollectionScheduleMode::Disabled => None,
+            CollectionScheduleMode::Interval => {
+                Some(now + TimeDelta::minutes(i64::from(self.interval_minutes)))
+            }
+            CollectionScheduleMode::Daily => {
+                let time = NaiveTime::parse_from_str(&self.daily_time, "%H:%M").ok()?;
+                let today = now.date_naive().and_time(time);
+                let candidate = today.and_local_timezone(Local).earliest()?;
+                if candidate > now {
+                    Some(candidate)
+                } else {
+                    (today + TimeDelta::days(1))
+                        .and_local_timezone(Local)
+                        .earliest()
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CollectionScheduleMode {
+    #[default]
+    Disabled,
+    Interval,
+    Daily,
+}
+
+impl CollectionScheduleMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Interval => "interval",
+            Self::Daily => "daily",
+        }
+    }
+}
+
+fn default_schedule_interval_minutes() -> u32 {
+    60
+}
+
+fn default_super_admin_enabled() -> bool {
+    true
+}
+
+fn default_data_redaction() -> bool {
+    true
+}
+
+fn default_schedule_daily_time() -> String {
+    "02:00".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +337,22 @@ struct EnterpriseCollectorRecord {
     collector_id: String,
     key_id: String,
     created_at: String,
+    #[serde(default)]
+    file_name: String,
+    #[serde(default)]
+    organization_name: String,
+    #[serde(default)]
+    upload_url: String,
+    #[serde(default)]
+    include_media: bool,
+    #[serde(default = "default_data_redaction")]
+    data_redaction: bool,
+    #[serde(default)]
+    offline_export_enabled: bool,
+    #[serde(default)]
+    schedule: CollectionSchedule,
+    #[serde(default)]
+    last_upload_at: Option<String>,
     public_key_hex: String,
     private_key_protected_hex: String,
     upload_token_sha256: String,
@@ -253,6 +378,18 @@ struct RegeneratedAccessTokenResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SuperAdminRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SuperAdminResponse {
+    super_admin_enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EnterpriseConfigRequest {
     organization_name: String,
     collection_notice: String,
@@ -264,6 +401,12 @@ struct EnterpriseConfigRequest {
     data_redaction: bool,
     #[serde(default)]
     offline_export_enabled: bool,
+    #[serde(default)]
+    super_admin_enabled: Option<bool>,
+    #[serde(default)]
+    server_schedule: Option<CollectionSchedule>,
+    #[serde(default)]
+    collector_schedule: Option<CollectionSchedule>,
 }
 
 #[derive(Debug, Serialize)]
@@ -278,6 +421,72 @@ struct EnterpriseConfigResponse {
     include_media: bool,
     data_redaction: bool,
     offline_export_enabled: bool,
+    super_admin_enabled: bool,
+    server_schedule: CollectionSchedule,
+    collector_schedule: CollectionSchedule,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalCollectionPlanRequest {
+    name: String,
+    schedule: CollectionSchedule,
+    include_media: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalCollectionPlan {
+    id: String,
+    name: String,
+    include_media: bool,
+    schedule: CollectionSchedule,
+    created_at: String,
+    updated_at: String,
+    #[serde(default)]
+    last_run_at: Option<String>,
+    #[serde(default)]
+    last_status: Option<String>,
+    #[serde(default)]
+    last_detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalCollectionPlanResponse {
+    #[serde(flatten)]
+    plan: LocalCollectionPlan,
+    next_run_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionSchedulesResponse {
+    local_plans: Vec<LocalCollectionPlanResponse>,
+    collector_plans: Vec<CollectorPlanResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorPlanResponse {
+    collector_id: String,
+    file_name: String,
+    organization_name: String,
+    upload_url: String,
+    include_media: bool,
+    data_redaction: bool,
+    offline_export_enabled: bool,
+    schedule: CollectionSchedule,
+    created_at: String,
+    last_upload_at: Option<String>,
+    next_run_at: Option<String>,
+    executable_available: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorListResponse {
+    collectors: Vec<CollectorPlanResponse>,
 }
 
 #[derive(Debug, Serialize)]
@@ -315,6 +524,7 @@ struct ImportResponse {
     revised: u64,
     media_count: u64,
     missing_media_count: u64,
+    completed_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -322,6 +532,17 @@ struct ArchiveSummaryResponse {
     #[serde(flatten)]
     summary: archive_store::ArchiveSummary,
     local_collection_available: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchiveUpdateQuery {
+    since: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveUpdateResponse {
+    revision: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -357,12 +578,14 @@ struct MessagesQuery {
     media_only: Option<bool>,
     limit: Option<u32>,
     offset: Option<u64>,
+    sort: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GlobalSearchQuery {
     q: String,
     limit: Option<u32>,
+    sort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -413,6 +636,10 @@ struct ExportRequest {
     simplify: bool,
     #[serde(default)]
     pretty: bool,
+    #[serde(default)]
+    conversation_order: ExportOrder,
+    #[serde(default)]
+    message_order: ExportOrder,
 }
 
 #[derive(Debug, Deserialize)]
@@ -425,6 +652,24 @@ struct LocalExportRequest {
     simplify: bool,
     #[serde(default)]
     pretty: bool,
+    #[serde(default)]
+    conversation_order: ExportOrder,
+    #[serde(default)]
+    message_order: ExportOrder,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum ExportOrder {
+    Ascending,
+    #[default]
+    Descending,
+}
+
+impl ExportOrder {
+    fn is_ascending(self) -> bool {
+        matches!(self, Self::Ascending)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -443,6 +688,7 @@ struct PreparedServer {
     address: SocketAddr,
     token: Zeroizing<String>,
     router: Router,
+    state: AppState,
 }
 
 pub struct DesktopServer {
@@ -498,6 +744,7 @@ where
     F: Fn(
             bool,
             bool,
+            Option<i64>,
             LocalCollectionProgressReporter,
             LocalCollectionMediaSink,
         ) -> Result<ClientExportV1, String>
@@ -512,7 +759,7 @@ fn start_desktop_server_inner(
     local_collector: Option<LocalCollector>,
 ) -> Result<DesktopServer, String> {
     let (shutdown_sender, shutdown_receiver) = std::sync::mpsc::channel();
-    let collector_template = std::env::current_exe().ok();
+    let collector_template = find_collector_template();
     let prepared = prepare_server(collector_template, local_collector)?;
     let page_url = format!(
         "http://{}/#token={}",
@@ -564,23 +811,29 @@ fn prepare_server(
     let address = std::env::var(LISTEN_ENV)
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787));
+        .unwrap_or(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            DEFAULT_SERVER_PORT,
+        ));
     if !address.ip().is_loopback() {
         return Err("服务端只允许监听本机回环地址。".into());
     }
 
+    let archive_path = Arc::new(data_root.join("archive.db"));
+    let initial_revision = open_archive_for_startup(&archive_path)?;
+    let (archive_update, _) = watch::channel(initial_revision);
     let state = AppState {
         data_root: Arc::new(data_root.clone()),
-        archive_path: Arc::new(data_root.join("archive.db")),
+        archive_path,
         token_sha256: Arc::new(Mutex::new(Sha256::digest(token.as_bytes()).into())),
         access_token_path: Arc::new(access_token_path),
         enterprise_config: Arc::new(Mutex::new(load_enterprise_config(&data_root))),
         collector_template: collector_template.map(Arc::new),
         local_collector,
         local_collection_progress: Arc::new(Mutex::new(LocalCollectionProgress::default())),
+        local_collection_running: Arc::new(AtomicBool::new(false)),
+        archive_update,
     };
-    ArchiveStore::open(&state.archive_path)
-        .map_err(|error| format!("归档数据库初始化失败：{error}"))?;
 
     let app = Router::new()
         .route("/api/v1/health", get(health))
@@ -591,6 +844,14 @@ fn prepare_server(
             "/api/v1/collections/local/progress",
             get(local_collection_progress),
         )
+        .route(
+            "/api/v1/collection-schedules",
+            get(get_collection_schedules).post(create_local_collection_plan),
+        )
+        .route(
+            "/api/v1/collection-schedules/{plan_id}",
+            axum::routing::put(update_local_collection_plan).delete(delete_local_collection_plan),
+        )
         .route("/api/v1/server/access-token", post(update_access_token))
         .route(
             "/api/v1/server/access-token/regenerate",
@@ -600,13 +861,22 @@ fn prepare_server(
             "/api/v1/enterprise/config",
             get(get_enterprise_config).put(update_enterprise_config),
         )
+        .route(
+            "/api/v1/settings/super-admin",
+            axum::routing::put(update_super_admin),
+        )
         .route("/api/v1/enterprise/key/rotate", post(rotate_enterprise_key))
-        .route("/api/v1/enterprise/collectors", post(generate_collector))
+        .route(
+            "/api/v1/enterprise/collectors",
+            get(list_collectors).post(generate_collector),
+        )
         .route(
             "/api/v1/enterprise/collectors/open-directory",
             post(open_collector_directory),
         )
         .route("/api/v1/archive/summary", get(archive_summary))
+        .route("/api/v1/archive/updates", get(archive_updates))
+        .route("/api/v1/archive/collected-users", get(collected_users))
         .route("/api/v1/conversations", get(list_conversations))
         .route(
             "/api/v1/conversations/{conversation_id}/participants",
@@ -630,14 +900,42 @@ fn prepare_server(
             post(open_export_directory),
         )
         .layer(DefaultBodyLimit::disable())
-        .with_state(state)
+        .with_state(state.clone())
         .fallback(embedded_web);
 
     Ok(PreparedServer {
         address,
         token,
         router: app,
+        state,
     })
+}
+
+fn open_archive_for_startup(path: &Path) -> Result<u64, String> {
+    let mut last_error = None;
+    for attempt in 0..45 {
+        match ArchiveStore::open_with_busy_timeout(path, Duration::from_secs(1))
+            .and_then(|store| store.summary())
+        {
+            Ok(summary) => {
+                return Ok(summary.revision);
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                let locked = detail.contains("database is locked")
+                    || detail.contains("database table is locked");
+                last_error = Some(detail);
+                if !locked || attempt == 44 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    Err(format!(
+        "归档数据库初始化失败：{}。如果刚刚中断了采集，请等待上一次采集完全退出后重试。",
+        last_error.unwrap_or_else(|| "未知数据库错误".into())
+    ))
 }
 
 async fn serve(
@@ -649,8 +947,9 @@ async fn serve(
         Ok(listener) => listener,
         Err(error) => {
             let message = format!(
-                "服务端启动失败（{}）。请确认 8787 端口未被占用。",
-                error.kind()
+                "服务端启动失败（{}）。请确认 {} 端口未被占用。",
+                error.kind(),
+                prepared.address.port()
             );
             if let Some(sender) = ready_sender {
                 let _ = sender.send(Err(message.clone()));
@@ -661,12 +960,15 @@ async fn serve(
     if let Some(sender) = ready_sender {
         let _ = sender.send(Ok(()));
     }
+    let scheduler = tokio::spawn(run_local_collection_scheduler(prepared.state.clone()));
     axum::serve(listener, prepared.router)
         .with_graceful_shutdown(async move {
             let _ = tokio::task::spawn_blocking(move || shutdown_receiver.recv()).await;
         })
         .await
-        .map_err(|_| "本机归档服务异常退出。".to_owned())
+        .map_err(|_| "本机归档服务异常退出。".to_owned())?;
+    scheduler.abort();
+    Ok(())
 }
 
 fn load_or_generate_access_token(path: &Path) -> Result<Zeroizing<String>, String> {
@@ -798,6 +1100,25 @@ fn load_enterprise_config(root: &Path) -> EnterpriseConfig {
         config.collection_notice = DEFAULT_COLLECTION_NOTICE.into();
         migrated = true;
     }
+    if config.local_collection_plans.is_empty()
+        && config.server_schedule.mode != CollectionScheduleMode::Disabled
+    {
+        let now = Utc::now().to_rfc3339();
+        config.local_collection_plans.push(LocalCollectionPlan {
+            id: Uuid::new_v4().to_string(),
+            name: "本机采集计划".into(),
+            include_media: config.server_include_media,
+            schedule: config.server_schedule.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+            last_run_at: None,
+            last_status: None,
+            last_detail: None,
+        });
+        config.server_schedule = CollectionSchedule::default();
+        config.server_include_media = false;
+        migrated = true;
+    }
     if migrated {
         let _ = persist_enterprise_config(root, &config);
     }
@@ -835,8 +1156,13 @@ fn new_enterprise_config() -> EnterpriseConfig {
         upload_url: default_upload_url(),
         include_files: false,
         include_images: false,
-        data_redaction: false,
+        data_redaction: true,
         offline_export_enabled: false,
+        super_admin_enabled: default_super_admin_enabled(),
+        local_collection_plans: Vec::new(),
+        server_include_media: false,
+        server_schedule: CollectionSchedule::default(),
+        collector_schedule: CollectionSchedule::default(),
         key_id: format!("key-{}", Uuid::new_v4().simple()),
         public_key_hex,
         private_key_protected_hex,
@@ -847,8 +1173,114 @@ fn new_enterprise_config() -> EnterpriseConfig {
     }
 }
 
+fn enterprise_config_response(config: &EnterpriseConfig) -> EnterpriseConfigResponse {
+    EnterpriseConfigResponse {
+        configured: !config.organization_name.trim().is_empty(),
+        organization_id: config.organization_id.clone(),
+        organization_name: config.organization_name.clone(),
+        collection_notice: config.collection_notice.clone(),
+        upload_url: config.upload_url.clone(),
+        key_id: config.key_id.clone(),
+        include_media: config.include_files || config.include_images,
+        data_redaction: config.data_redaction,
+        offline_export_enabled: config.offline_export_enabled,
+        super_admin_enabled: config.super_admin_enabled,
+        server_schedule: config.server_schedule.clone(),
+        collector_schedule: config.collector_schedule.clone(),
+    }
+}
+
+fn collection_schedules_response(
+    config: &EnterpriseConfig,
+    data_root: &Path,
+) -> CollectionSchedulesResponse {
+    let now = Local::now();
+    let local_plans = config
+        .local_collection_plans
+        .iter()
+        .cloned()
+        .map(|plan| LocalCollectionPlanResponse {
+            next_run_at: estimated_next_run(
+                &plan.schedule,
+                plan.last_run_at
+                    .as_deref()
+                    .or(Some(plan.created_at.as_str())),
+                now,
+            ),
+            plan,
+        })
+        .collect();
+    CollectionSchedulesResponse {
+        local_plans,
+        collector_plans: collector_plan_responses(config, Some(&data_root.join("collectors")), now),
+    }
+}
+
+fn estimated_next_run(
+    schedule: &CollectionSchedule,
+    reference: Option<&str>,
+    now: chrono::DateTime<Local>,
+) -> Option<String> {
+    let next = match schedule.mode {
+        CollectionScheduleMode::Disabled => None,
+        CollectionScheduleMode::Daily => schedule.next_after(now),
+        CollectionScheduleMode::Interval => {
+            let from_reference = reference
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| {
+                    value.with_timezone(&Local)
+                        + TimeDelta::minutes(i64::from(schedule.interval_minutes))
+                });
+            Some(
+                from_reference
+                    .filter(|value| *value > now)
+                    .unwrap_or_else(|| {
+                        now + TimeDelta::minutes(i64::from(schedule.interval_minutes))
+                    }),
+            )
+        }
+    }?;
+    Some(next.to_rfc3339())
+}
+
+fn collector_plan_responses(
+    config: &EnterpriseConfig,
+    collector_root: Option<&Path>,
+    now: chrono::DateTime<Local>,
+) -> Vec<CollectorPlanResponse> {
+    let mut plans = config
+        .collectors
+        .iter()
+        .map(|collector| CollectorPlanResponse {
+            collector_id: collector.collector_id.clone(),
+            file_name: collector.file_name.clone(),
+            organization_name: collector.organization_name.clone(),
+            upload_url: collector.upload_url.clone(),
+            include_media: collector.include_media,
+            data_redaction: collector.data_redaction,
+            offline_export_enabled: collector.offline_export_enabled,
+            schedule: collector.schedule.clone(),
+            created_at: collector.created_at.clone(),
+            last_upload_at: collector.last_upload_at.clone(),
+            next_run_at: estimated_next_run(
+                &collector.schedule,
+                collector
+                    .last_upload_at
+                    .as_deref()
+                    .or(Some(collector.created_at.as_str())),
+                now,
+            ),
+            executable_available: collector_root
+                .filter(|_| !collector.file_name.is_empty())
+                .is_some_and(|root| root.join(&collector.file_name).is_file()),
+        })
+        .collect::<Vec<_>>();
+    plans.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    plans
+}
+
 fn default_upload_url() -> String {
-    "http://127.0.0.1:8787".into()
+    DEFAULT_SERVER_URL.into()
 }
 
 fn normalize_upload_url(value: &str) -> Result<String, ApiError> {
@@ -924,17 +1356,131 @@ async fn get_enterprise_config(
         .lock()
         .map_err(|_| ApiError::store())?
         .clone();
-    Ok(Json(EnterpriseConfigResponse {
-        configured: !config.organization_name.trim().is_empty(),
-        organization_id: config.organization_id,
-        organization_name: config.organization_name,
-        collection_notice: config.collection_notice,
-        upload_url: config.upload_url,
-        key_id: config.key_id,
-        include_media: config.include_files || config.include_images,
-        data_redaction: config.data_redaction,
-        offline_export_enabled: config.offline_export_enabled,
+    Ok(Json(enterprise_config_response(&config)))
+}
+
+async fn get_collection_schedules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectionSchedulesResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    Ok(Json(collection_schedules_response(
+        &config,
+        &state.data_root,
+    )))
+}
+
+async fn update_super_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SuperAdminRequest>,
+) -> Result<Json<SuperAdminResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let mut config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    config.super_admin_enabled = request.enabled;
+    persist_enterprise_config(&state.data_root, &config)?;
+    Ok(Json(SuperAdminResponse {
+        super_admin_enabled: config.super_admin_enabled,
     }))
+}
+
+async fn create_local_collection_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<LocalCollectionPlanRequest>,
+) -> Result<Json<CollectionSchedulesResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    request.schedule.validate()?;
+    let name = validate_plan_name(&request.name)?;
+    let mut config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    let now = Utc::now().to_rfc3339();
+    config.local_collection_plans.push(LocalCollectionPlan {
+        id: Uuid::new_v4().to_string(),
+        name,
+        include_media: request.include_media,
+        schedule: request.schedule,
+        created_at: now.clone(),
+        updated_at: now,
+        last_run_at: None,
+        last_status: None,
+        last_detail: None,
+    });
+    persist_enterprise_config(&state.data_root, &config)?;
+    Ok(Json(collection_schedules_response(
+        &config,
+        &state.data_root,
+    )))
+}
+
+async fn update_local_collection_plan(
+    State(state): State<AppState>,
+    AxumPath(plan_id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<LocalCollectionPlanRequest>,
+) -> Result<Json<CollectionSchedulesResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    request.schedule.validate()?;
+    let name = validate_plan_name(&request.name)?;
+    let mut config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    let plan = config
+        .local_collection_plans
+        .iter_mut()
+        .find(|plan| plan.id == plan_id)
+        .ok_or_else(ApiError::invalid_query)?;
+    plan.name = name;
+    plan.include_media = request.include_media;
+    plan.schedule = request.schedule;
+    plan.updated_at = Utc::now().to_rfc3339();
+    persist_enterprise_config(&state.data_root, &config)?;
+    Ok(Json(collection_schedules_response(
+        &config,
+        &state.data_root,
+    )))
+}
+
+async fn delete_local_collection_plan(
+    State(state): State<AppState>,
+    AxumPath(plan_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<CollectionSchedulesResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let mut config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    let previous_len = config.local_collection_plans.len();
+    config
+        .local_collection_plans
+        .retain(|plan| plan.id != plan_id);
+    if config.local_collection_plans.len() == previous_len {
+        return Err(ApiError::invalid_query());
+    }
+    persist_enterprise_config(&state.data_root, &config)?;
+    Ok(Json(collection_schedules_response(
+        &config,
+        &state.data_root,
+    )))
+}
+
+fn validate_plan_name(value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 80 {
+        return Err(ApiError::invalid_query());
+    }
+    Ok(value.to_owned())
 }
 
 async fn update_enterprise_config(
@@ -947,6 +1493,12 @@ async fn update_enterprise_config(
         return Err(ApiError::invalid_query());
     }
     let upload_url = normalize_upload_url(&request.upload_url)?;
+    if let Some(schedule) = &request.server_schedule {
+        schedule.validate()?;
+    }
+    if let Some(schedule) = &request.collector_schedule {
+        schedule.validate()?;
+    }
     let mut config = state
         .enterprise_config
         .lock()
@@ -976,18 +1528,17 @@ async fn update_enterprise_config(
     config.include_images = request.include_media;
     config.data_redaction = request.data_redaction;
     config.offline_export_enabled = request.offline_export_enabled;
+    if let Some(enabled) = request.super_admin_enabled {
+        config.super_admin_enabled = enabled;
+    }
+    if let Some(schedule) = request.server_schedule {
+        config.server_schedule = schedule;
+    }
+    if let Some(schedule) = request.collector_schedule {
+        config.collector_schedule = schedule;
+    }
     persist_enterprise_config(&state.data_root, &config)?;
-    Ok(Json(EnterpriseConfigResponse {
-        configured: true,
-        organization_id: config.organization_id.clone(),
-        organization_name: config.organization_name.clone(),
-        collection_notice: config.collection_notice.clone(),
-        upload_url: config.upload_url.clone(),
-        key_id: config.key_id.clone(),
-        include_media: config.include_files || config.include_images,
-        data_redaction: config.data_redaction,
-        offline_export_enabled: config.offline_export_enabled,
-    }))
+    Ok(Json(enterprise_config_response(&config)))
 }
 
 async fn rotate_enterprise_key(
@@ -1007,17 +1558,7 @@ async fn rotate_enterprise_key(
     config.private_key_protected_hex =
         encode_hex(&dpapi_protect::protect(&private_key).map_err(|_| ApiError::store())?);
     persist_enterprise_config(&state.data_root, &config)?;
-    Ok(Json(EnterpriseConfigResponse {
-        configured: !config.organization_name.trim().is_empty(),
-        organization_id: config.organization_id.clone(),
-        organization_name: config.organization_name.clone(),
-        collection_notice: config.collection_notice.clone(),
-        upload_url: config.upload_url.clone(),
-        key_id: config.key_id.clone(),
-        include_media: config.include_files || config.include_images,
-        data_redaction: config.data_redaction,
-        offline_export_enabled: config.offline_export_enabled,
-    }))
+    Ok(Json(enterprise_config_response(&config)))
 }
 
 async fn generate_collector(
@@ -1067,10 +1608,15 @@ async fn generate_collector(
         "includeMedia": config.include_files || config.include_images,
         "dataRedaction": config.data_redaction,
         "offlineExportEnabled": config.offline_export_enabled,
+        "collectorSchedule": &config.collector_schedule,
         "formats": ["enterprise-package.v1"],
     });
     let artifact_text = serde_json::to_string_pretty(&artifact).map_err(|_| ApiError::store())?;
-    let file_name = format!("{}.exe", sanitize_file_component(&key_id));
+    let file_name = format!(
+        "{}-{}.exe",
+        sanitize_file_component(&key_id),
+        &collector_id[..8]
+    );
     let collector_root = state.data_root.join("collectors");
     std::fs::create_dir_all(&collector_root).map_err(|_| ApiError::store())?;
     let executable_path = collector_root.join(&file_name);
@@ -1103,10 +1649,23 @@ async fn generate_collector(
         if legacy_config_path.is_file() {
             let _ = std::fs::remove_file(legacy_config_path);
         }
+        let collector_organization_name = config.organization_name.clone();
+        let collector_include_media = config.include_files || config.include_images;
+        let collector_data_redaction = config.data_redaction;
+        let collector_offline_export_enabled = config.offline_export_enabled;
+        let collector_schedule = config.collector_schedule.clone();
         config.collectors.push(EnterpriseCollectorRecord {
             collector_id: collector_id.clone(),
             key_id: key_id.clone(),
             created_at: Utc::now().to_rfc3339(),
+            file_name: file_name.clone(),
+            organization_name: collector_organization_name,
+            upload_url: upload_url.clone(),
+            include_media: collector_include_media,
+            data_redaction: collector_data_redaction,
+            offline_export_enabled: collector_offline_export_enabled,
+            schedule: collector_schedule,
+            last_upload_at: None,
             public_key_hex: String::new(),
             private_key_protected_hex: String::new(),
             upload_token_sha256,
@@ -1130,6 +1689,24 @@ async fn generate_collector(
     }))
 }
 
+async fn list_collectors(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectorListResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    Ok(Json(CollectorListResponse {
+        collectors: collector_plan_responses(
+            &config,
+            Some(&state.data_root.join("collectors")),
+            Local::now(),
+        ),
+    }))
+}
+
 async fn open_collector_directory(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1137,7 +1714,7 @@ async fn open_collector_directory(
     authorize(&headers, &state.token_sha256)?;
     let directory = state.data_root.join("collectors");
     if !directory.is_dir() {
-        return Err(ApiError::store());
+        return Err(ApiError::collector_directory_missing());
     }
     #[cfg(windows)]
     {
@@ -1161,7 +1738,7 @@ fn collector_signing_payload(
     upload_token: &str,
 ) -> String {
     format!(
-        "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         config.organization_id,
         config.organization_name,
         config.collection_notice,
@@ -1173,16 +1750,15 @@ fn collector_signing_payload(
         config.include_files,
         config.include_images,
         config.data_redaction,
-        config.offline_export_enabled
+        config.offline_export_enabled,
+        config.collector_schedule.mode.as_str(),
+        config.collector_schedule.interval_minutes,
+        config.collector_schedule.daily_time
     )
 }
 
 fn find_collector_template() -> Option<PathBuf> {
-    let executable = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .join("WeComArchive.exe");
-    executable.is_file().then_some(executable)
+    std::env::current_exe().ok().filter(|path| path.is_file())
 }
 
 async fn import_enterprise(
@@ -1190,7 +1766,8 @@ async fn import_enterprise(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<ImportResponse>, ApiError> {
-    authorize_enterprise_upload(&headers, &state.token_sha256, &state.enterprise_config)?;
+    let collector_id =
+        authorize_enterprise_upload(&headers, &state.token_sha256, &state.enterprise_config)?;
     let import_path = receive_package(&state.data_root, body).await?;
     let bytes = tokio::fs::read(&import_path)
         .await
@@ -1242,7 +1819,19 @@ async fn import_enterprise(
     );
     let export = archive_transfer::validate_enterprise_plaintext(&package, &plaintext)
         .map_err(|_| ApiError::invalid_export())?;
-    ingest_export(&state, export).await
+    let result = ingest_export(&state, export).await;
+    if let Ok(response) = &result
+        && let Some(collector_id) = collector_id
+        && let Ok(mut config) = state.enterprise_config.lock()
+        && let Some(collector) = config
+            .collectors
+            .iter_mut()
+            .find(|collector| collector.collector_id == collector_id)
+    {
+        collector.last_upload_at = Some(response.0.completed_at.clone());
+        let _ = persist_enterprise_config(&state.data_root, &config);
+    }
+    result
 }
 
 async fn import_json(
@@ -1275,7 +1864,7 @@ async fn ingest_export(
     let participants = export.participants;
     let batches = export.batches;
     let media_blobs = export.media_blobs;
-    let summary = tokio::task::spawn_blocking(move || {
+    let (summary, revision) = tokio::task::spawn_blocking(move || {
         persist_media_blobs(&data_root, &media_blobs)?;
         let mut store = ArchiveStore::open(&archive_path).map_err(ApiError::from_store)?;
         let mut total = IngestSummary {
@@ -1292,10 +1881,16 @@ async fn ingest_export(
         store
             .upsert_directory(&conversations, &participants)
             .map_err(ApiError::from_store)?;
-        Ok::<_, ApiError>(total)
+        let revision = store.summary().map_err(ApiError::from_store)?.revision;
+        Ok::<_, ApiError>((total, revision))
     })
     .await
     .map_err(|_| ApiError::store())??;
+    // Keep the latest revision even when the workspace page is not currently
+    // listening. `send` drops the value when there are no receivers, which
+    // made the first collector upload invisible until a later upload.
+    state.archive_update.send_replace(revision);
+    let completed_at = Utc::now().to_rfc3339();
     Ok(Json(ImportResponse {
         export_id,
         batch_count,
@@ -1304,6 +1899,7 @@ async fn ingest_export(
         revised: summary.revised,
         media_count,
         missing_media_count,
+        completed_at,
     }))
 }
 
@@ -1423,6 +2019,7 @@ async fn get_media(
     AxumPath(content_hash): AxumPath<String>,
 ) -> Result<Response, ApiError> {
     authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
     if !is_valid_content_hash(&content_hash) {
         return Err(ApiError::invalid_query());
     }
@@ -1454,6 +2051,7 @@ async fn open_media(
     Query(query): Query<OpenMediaQuery>,
 ) -> Result<Json<OpenDirectoryResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
     if !is_valid_content_hash(&content_hash) {
         return Err(ApiError::invalid_query());
     }
@@ -1556,6 +2154,37 @@ async fn archive_summary(
     }))
 }
 
+async fn archive_updates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ArchiveUpdateQuery>,
+) -> Result<Json<ArchiveUpdateResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let mut receiver = state.archive_update.subscribe();
+    if *receiver.borrow() <= query.since {
+        receiver.changed().await.map_err(|_| ApiError::store())?;
+    }
+    Ok(Json(ArchiveUpdateResponse {
+        revision: *receiver.borrow(),
+    }))
+}
+
+async fn collected_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<archive_store::CollectedUser>>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let archive_path = Arc::clone(&state.archive_path);
+    let users = tokio::task::spawn_blocking(move || {
+        ArchiveStore::open_read_only(&archive_path)
+            .and_then(|store| store.list_collected_users())
+            .map_err(|_| ApiError::store())
+    })
+    .await
+    .map_err(|_| ApiError::store())??;
+    Ok(Json(users))
+}
+
 async fn collect_local(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1566,15 +2195,20 @@ async fn collect_local(
         .local_collector
         .clone()
         .ok_or_else(ApiError::local_collection_unavailable)?;
+    if state
+        .local_collection_running
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(ApiError::local_collection_running());
+    }
+    let _run_guard = LocalCollectionRunGuard(Arc::clone(&state.local_collection_running));
     let (configured_include_media, data_redaction) = {
         let config = state
             .enterprise_config
             .lock()
             .map_err(|_| ApiError::store())?;
-        (
-            config.include_files || config.include_images,
-            config.data_redaction,
-        )
+        (config.server_include_media, config.data_redaction)
     };
     let include_media = query.include_media.unwrap_or(configured_include_media);
     set_local_collection_progress(&state, true, 3, "准备采集", "正在初始化本机采集任务。");
@@ -1596,7 +2230,7 @@ async fn collect_local(
                 .map_err(|_| "媒体文件写入归档失败。".to_owned())
         });
     let export = match tokio::task::spawn_blocking(move || {
-        collector(include_media, data_redaction, reporter, media_sink)
+        collector(include_media, data_redaction, None, reporter, media_sink)
     })
     .await
     {
@@ -1630,6 +2264,183 @@ async fn collect_local(
     } else {
         set_local_collection_progress(
             &state,
+            false,
+            0,
+            "写入失败",
+            "采集结果未能写入归档，请重试。",
+        );
+    }
+    result
+}
+
+struct LocalCollectionRunGuard(Arc<AtomicBool>);
+
+impl Drop for LocalCollectionRunGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+async fn run_local_collection_scheduler(state: AppState) {
+    let mut next_runs: BTreeMap<String, (CollectionSchedule, chrono::DateTime<Local>)> =
+        BTreeMap::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let plans = match state.enterprise_config.lock() {
+            Ok(config) => config.local_collection_plans.clone(),
+            Err(_) => continue,
+        };
+        let active_ids = plans
+            .iter()
+            .map(|plan| plan.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        next_runs.retain(|id, _| active_ids.contains(id.as_str()));
+        let now = Local::now();
+        for plan in &plans {
+            if plan.schedule.mode == CollectionScheduleMode::Disabled {
+                next_runs.remove(&plan.id);
+                continue;
+            }
+            let should_reset = next_runs
+                .get(&plan.id)
+                .is_none_or(|(schedule, _)| schedule != &plan.schedule);
+            if should_reset {
+                if let Some(next) = plan.schedule.next_after(now) {
+                    next_runs.insert(plan.id.clone(), (plan.schedule.clone(), next));
+                }
+            }
+        }
+        for plan in plans {
+            let Some((_, due_at)) = next_runs.get(&plan.id).cloned() else {
+                continue;
+            };
+            if now < due_at {
+                continue;
+            }
+            if state
+                .local_collection_running
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                if let Some(next) = plan.schedule.next_after(now) {
+                    next_runs.insert(plan.id.clone(), (plan.schedule.clone(), next));
+                }
+                continue;
+            }
+            let guard = LocalCollectionRunGuard(Arc::clone(&state.local_collection_running));
+            let since = plan
+                .last_run_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.timestamp_millis().saturating_sub(5 * 60 * 1000));
+            let result = run_local_collection_once(&state, plan.include_media, since).await;
+            drop(guard);
+            update_local_plan_result(&state, &plan.id, &result);
+            if let Err(error) = result {
+                set_local_collection_progress(
+                    &state,
+                    false,
+                    0,
+                    "定时采集失败",
+                    &error.body.message,
+                );
+            }
+            if let Some(next) = plan.schedule.next_after(Local::now()) {
+                next_runs.insert(plan.id.clone(), (plan.schedule.clone(), next));
+            }
+        }
+    }
+}
+
+fn update_local_plan_result(
+    state: &AppState,
+    plan_id: &str,
+    result: &Result<Json<ImportResponse>, ApiError>,
+) {
+    if let Ok(mut config) = state.enterprise_config.lock()
+        && let Some(plan) = config
+            .local_collection_plans
+            .iter_mut()
+            .find(|plan| plan.id == plan_id)
+    {
+        if result.is_ok() {
+            plan.last_run_at = Some(Utc::now().to_rfc3339());
+        }
+        plan.last_status = Some(if result.is_ok() { "success" } else { "error" }.into());
+        plan.last_detail = result
+            .as_ref()
+            .err()
+            .map(|error| error.body.message.clone());
+        plan.updated_at = Utc::now().to_rfc3339();
+        let _ = persist_enterprise_config(&state.data_root, &config);
+    }
+}
+
+async fn run_local_collection_once(
+    state: &AppState,
+    include_media: bool,
+    since_unix_ms: Option<i64>,
+) -> Result<Json<ImportResponse>, ApiError> {
+    let collector = state
+        .local_collector
+        .clone()
+        .ok_or_else(ApiError::local_collection_unavailable)?;
+    let data_redaction = {
+        let config = state
+            .enterprise_config
+            .lock()
+            .map_err(|_| ApiError::store())?;
+        config.data_redaction
+    };
+    set_local_collection_progress(state, true, 3, "准备采集", "正在初始化定时采集任务。");
+    let progress = Arc::clone(&state.local_collection_progress);
+    let reporter: LocalCollectionProgressReporter = Arc::new(move |percent, stage, detail| {
+        if let Ok(mut current) = progress.lock() {
+            *current = LocalCollectionProgress {
+                running: true,
+                percent: percent.min(95),
+                stage: stage.to_owned(),
+                detail: detail.to_owned(),
+            };
+        }
+    });
+    let media_root = Arc::clone(&state.data_root);
+    let media_sink: LocalCollectionMediaSink =
+        Arc::new(move |source, expected_hash, expected_size| {
+            persist_local_media_file(&media_root, source, expected_hash, expected_size)
+                .map_err(|_| "媒体文件写入归档失败。".to_owned())
+        });
+    let export = tokio::task::spawn_blocking(move || {
+        collector(
+            include_media,
+            data_redaction,
+            since_unix_ms,
+            reporter,
+            media_sink,
+        )
+    })
+    .await
+    .map_err(|_| ApiError::local_collection_failed("本机采集进程异常结束，请重试。".into()))?
+    .map_err(ApiError::local_collection_failed)?;
+    set_local_collection_progress(
+        state,
+        true,
+        92,
+        "写入归档",
+        "正在校验并写入消息、图片和文件。",
+    );
+    let result = ingest_export(state, export).await;
+    if result.is_ok() {
+        set_local_collection_progress(
+            state,
+            false,
+            100,
+            "采集完成",
+            "本机数据已经合并到当前归档。",
+        );
+    } else {
+        set_local_collection_progress(
+            state,
             false,
             0,
             "写入失败",
@@ -1694,6 +2505,7 @@ async fn list_messages(
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<Vec<MessageResponse>>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
     if query.conversation_id.trim().is_empty() {
         return Err(ApiError::invalid_query());
     }
@@ -1702,6 +2514,7 @@ async fn list_messages(
         .as_deref()
         .map(parse_message_type)
         .transpose()?;
+    let sort_ascending = parse_sort_ascending(query.sort.as_deref())?;
     let message_query = MessageQuery {
         conversation_id: Some(query.conversation_id),
         participant_id: query.participant_id,
@@ -1712,6 +2525,7 @@ async fn list_messages(
         media_only: query.media_only.unwrap_or(false),
         limit: query.limit.unwrap_or(100),
         offset: query.offset.unwrap_or(0),
+        sort_ascending,
     };
     let archive_path = Arc::clone(&state.archive_path);
     let messages = tokio::task::spawn_blocking(move || {
@@ -1776,6 +2590,7 @@ async fn count_messages(
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<MessageCountResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
     if query.conversation_id.trim().is_empty() {
         return Err(ApiError::invalid_query());
     }
@@ -1794,6 +2609,7 @@ async fn count_messages(
         media_only: query.media_only.unwrap_or(false),
         limit: 1,
         offset: 0,
+        sort_ascending: false,
     };
     let archive_path = Arc::clone(&state.archive_path);
     let total = tokio::task::spawn_blocking(move || {
@@ -1812,10 +2628,12 @@ async fn search_messages(
     Query(query): Query<GlobalSearchQuery>,
 ) -> Result<Json<Vec<GlobalSearchResponse>>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
     let search_text = query.q.trim().to_owned();
     if search_text.is_empty() || search_text.chars().count() > 200 {
         return Err(ApiError::invalid_query());
     }
+    let sort_ascending = parse_sort_ascending(query.sort.as_deref())?;
     let archive_path = Arc::clone(&state.archive_path);
     let results = tokio::task::spawn_blocking(move || {
         let store = ArchiveStore::open_read_only(&archive_path).map_err(|_| ApiError::store())?;
@@ -1830,6 +2648,7 @@ async fn search_messages(
                 media_only: false,
                 limit: query.limit.unwrap_or(50).clamp(1, 100),
                 offset: 0,
+                sort_ascending,
             })
             .map_err(|_| ApiError::store())?;
         let mut participant_cache = std::collections::BTreeMap::new();
@@ -1884,7 +2703,7 @@ async fn search_messages(
                 })
                 .filter(|name| !name.is_empty());
             let offset_in_conversation = store
-                .message_offset_in_conversation(&message.stable_message_id)
+                .message_offset_in_conversation(&message.stable_message_id, sort_ascending)
                 .map_err(|_| ApiError::store())?
                 .unwrap_or(0);
             results.push(GlobalSearchResponse {
@@ -1911,6 +2730,7 @@ async fn list_conversation_participants(
     AxumPath(conversation_id): AxumPath<String>,
 ) -> Result<Json<Vec<archive_store::ParticipantListItem>>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
     if conversation_id.trim().is_empty() {
         return Err(ApiError::invalid_query());
     }
@@ -1931,6 +2751,7 @@ async fn create_export_job(
     Json(request): Json<ExportRequest>,
 ) -> Result<Json<ExportResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
     let message_type = request
         .message_type
         .as_deref()
@@ -1968,6 +2789,7 @@ async fn create_export_job(
             && request.media_only.unwrap_or(false),
         limit: 50_000,
         offset: 0,
+        sort_ascending: request.message_order.is_ascending(),
     };
     let archive_path = Arc::clone(&state.archive_path);
     let data_root = Arc::clone(&state.data_root);
@@ -1995,22 +2817,22 @@ async fn create_export_job(
                     participant_directory.insert(participant.participant_id.clone(), participant);
                 }
             }
-            let mut offset = 0;
-            let mut remaining_conversations = conversation_ids.clone();
-            while !remaining_conversations.is_empty() {
-                let page = store
-                    .list_conversations(200, offset)
-                    .map_err(ApiError::from_store)?;
-                if page.is_empty() {
-                    break;
-                }
-                offset += page.len() as u64;
-                for conversation in page {
-                    if remaining_conversations.remove(conversation.conversation_id.as_str())
-                        && let Some(name) = conversation.display_name
-                    {
-                        conversation_names.insert(conversation.conversation_id, name);
-                    }
+        }
+        let mut offset = 0;
+        let mut remaining_conversations = conversation_ids.clone();
+        while !remaining_conversations.is_empty() {
+            let page = store
+                .list_conversations(200, offset)
+                .map_err(ApiError::from_store)?;
+            if page.is_empty() {
+                break;
+            }
+            offset += page.len() as u64;
+            for conversation in page {
+                if remaining_conversations.remove(conversation.conversation_id.as_str())
+                    && let Some(name) = conversation.display_name
+                {
+                    conversation_names.insert(conversation.conversation_id, name);
                 }
             }
         }
@@ -2047,7 +2869,7 @@ async fn create_export_job(
             ExportFormat::Json => "json",
             ExportFormat::Csv => "csv",
             ExportFormat::Html => "html",
-            ExportFormat::Pdf => "pdf",
+            ExportFormat::Md => "md",
         };
         let file_name = format!(
             "archive-export-{}-{}.{}",
@@ -2067,7 +2889,8 @@ async fn create_export_job(
             pretty: request.pretty,
             media,
             generated_at: Utc::now(),
-            edge_executable: find_edge_executable(),
+            conversation_order_ascending: request.conversation_order.is_ascending(),
+            message_order_ascending: request.message_order.is_ascending(),
         };
         let result = export_package(&package, &target, &AtomicBool::new(false))
             .map_err(ApiError::from_export)?;
@@ -2110,6 +2933,8 @@ async fn create_local_export(
     let export_directory = data_root.join("exports").display().to_string();
     let format = request.format;
     let data_redaction = request.data_redaction;
+    let conversation_order_ascending = request.conversation_order.is_ascending();
+    let message_order_ascending = request.message_order.is_ascending();
     let result = tokio::task::spawn_blocking(move || {
         let reporter: LocalCollectionProgressReporter = Arc::new(|_, _, _| {});
         let media_root = Arc::clone(&data_root);
@@ -2118,7 +2943,7 @@ async fn create_local_export(
                 persist_local_media_file(&media_root, source, expected_hash, expected_size)
                     .map_err(|_| "媒体文件写入归档失败。".to_owned())
             });
-        let export = collector(include_media, data_redaction, reporter, media_sink)
+        let mut export = collector(include_media, data_redaction, None, reporter, media_sink)
             .map_err(ApiError::local_collection_failed)?;
         let export_id = export.export_id;
         let export_root = data_root.join("exports");
@@ -2127,7 +2952,7 @@ async fn create_local_export(
             ExportFormat::Json => "json",
             ExportFormat::Csv => "csv",
             ExportFormat::Html => "html",
-            ExportFormat::Pdf => "pdf",
+            ExportFormat::Md => "md",
         };
         let file_name = format!(
             "local-export-{}-{}.{}",
@@ -2137,6 +2962,12 @@ async fn create_local_export(
         );
         let target = export_root.join(&file_name);
         if format == ExportFormat::Json && !request.simplify {
+            sort_export_for_output(
+                &mut export,
+                conversation_order_ascending,
+                message_order_ascending,
+            )
+            .map_err(|_| ApiError::invalid_export())?;
             write_importable_json_formatted(&export, &target, request.pretty)
                 .map_err(|_| ApiError::invalid_export())?;
             let result = ExportResult {
@@ -2197,7 +3028,8 @@ async fn create_local_export(
             pretty: request.pretty,
             media,
             generated_at: Utc::now(),
-            edge_executable: find_edge_executable(),
+            conversation_order_ascending,
+            message_order_ascending,
         };
         let result = export_package(&package, &target, &AtomicBool::new(false))
             .map_err(ApiError::from_export)?;
@@ -2264,19 +3096,6 @@ fn query_all_messages(
     }
 }
 
-fn find_edge_executable() -> Option<PathBuf> {
-    let suffix = PathBuf::from("Microsoft")
-        .join("Edge")
-        .join("Application")
-        .join("msedge.exe");
-    ["PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA"]
-        .into_iter()
-        .filter_map(std::env::var_os)
-        .map(PathBuf::from)
-        .map(|root| root.join(&suffix))
-        .find(|path| path.is_file())
-}
-
 fn parse_message_type(value: &str) -> Result<MessageType, ApiError> {
     match value {
         "text" => Ok(MessageType::Text),
@@ -2288,6 +3107,14 @@ fn parse_message_type(value: &str) -> Result<MessageType, ApiError> {
         "reply" => Ok(MessageType::Reply),
         "system" => Ok(MessageType::System),
         "unsupported" => Ok(MessageType::Unsupported),
+        _ => Err(ApiError::invalid_query()),
+    }
+}
+
+fn parse_sort_ascending(value: Option<&str>) -> Result<bool, ApiError> {
+    match value.unwrap_or("desc") {
+        "asc" => Ok(true),
+        "desc" => Ok(false),
         _ => Err(ApiError::invalid_query()),
     }
 }
@@ -2409,7 +3236,7 @@ fn authorize_enterprise_upload(
     headers: &HeaderMap,
     server_token_sha256: &Arc<Mutex<[u8; 32]>>,
     enterprise_config: &Arc<Mutex<EnterpriseConfig>>,
-) -> Result<(), ApiError> {
+) -> Result<Option<String>, ApiError> {
     let Some(value) = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -2423,20 +3250,21 @@ fn authorize_enterprise_upload(
         constant_time_equal(&actual, expected.as_slice())
     };
     if server_matches {
-        return Ok(());
+        return Ok(None);
     }
     let actual_hex = encode_hex(&actual);
     let config = enterprise_config.lock().map_err(|_| ApiError::store())?;
-    if config.collectors.iter().any(|collector| {
-        constant_time_equal(
-            actual_hex.as_bytes(),
-            collector.upload_token_sha256.as_bytes(),
-        )
-    }) {
-        Ok(())
-    } else {
-        Err(ApiError::unauthorized())
-    }
+    config
+        .collectors
+        .iter()
+        .find(|collector| {
+            constant_time_equal(
+                actual_hex.as_bytes(),
+                collector.upload_token_sha256.as_bytes(),
+            )
+        })
+        .map(|collector| Some(collector.collector_id.clone()))
+        .ok_or_else(ApiError::unauthorized)
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
@@ -2522,6 +3350,17 @@ struct ApiError {
 }
 
 impl ApiError {
+    fn forbidden() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            body: ErrorResponse {
+                code: "SUPER_ADMIN_REQUIRED",
+                message: "当前未启用超管模式，请在设置中开启后再访问会话内容。".into(),
+                recoverable: true,
+            },
+        }
+    }
+
     fn not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -2588,6 +3427,17 @@ impl ApiError {
         }
     }
 
+    fn local_collection_running() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            body: ErrorResponse {
+                code: "LOCAL_COLLECTION_RUNNING",
+                message: "已有本机采集任务正在运行，请稍后重试。".into(),
+                recoverable: true,
+            },
+        }
+    }
+
     fn local_collection_failed(message: String) -> Self {
         Self {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -2610,6 +3460,17 @@ impl ApiError {
         }
     }
 
+    fn collector_directory_missing() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: ErrorResponse {
+                code: "COLLECTOR_DIRECTORY_MISSING",
+                message: "暂未生成过采集端，请先生成采集端。".into(),
+                recoverable: true,
+            },
+        }
+    }
+
     fn from_store(error: StoreError) -> Self {
         if matches!(error, StoreError::BatchConflict) {
             Self {
@@ -2626,26 +3487,25 @@ impl ApiError {
     }
 
     fn from_export(error: archive_export::ExportError) -> Self {
-        if matches!(error, archive_export::ExportError::PdfRendererUnavailable) {
-            Self {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                body: ErrorResponse {
-                    code: "PDF_RENDERER_UNAVAILABLE",
-                    message: "未找到可用的本机 Edge PDF 渲染器。".into(),
-                    recoverable: true,
-                },
-            }
-        } else {
-            Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                body: ErrorResponse {
-                    code: "ARCHIVE_EXPORT_FAILED",
-                    message: "服务端导出失败；未完成文件已清理。".into(),
-                    recoverable: true,
-                },
-            }
+        let _ = error;
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: ErrorResponse {
+                code: "ARCHIVE_EXPORT_FAILED",
+                message: "服务端导出失败；未完成文件已清理。".into(),
+                recoverable: true,
+            },
         }
     }
+}
+
+fn require_super_admin(state: &AppState) -> Result<(), ApiError> {
+    let enabled = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?
+        .super_admin_enabled;
+    enabled.then_some(()).ok_or_else(ApiError::forbidden)
 }
 
 impl IntoResponse for ApiError {
@@ -2694,6 +3554,8 @@ mod tests {
             collector_template: None,
             local_collector: None,
             local_collection_progress: Arc::new(Mutex::new(LocalCollectionProgress::default())),
+            local_collection_running: Arc::new(AtomicBool::new(false)),
+            archive_update: watch::channel(0).0,
         }
     }
 
@@ -2704,6 +3566,250 @@ mod tests {
             format!("Bearer {TEST_TOKEN}").parse().unwrap(),
         );
         headers
+    }
+
+    fn enable_super_admin(state: &AppState) {
+        state.enterprise_config.lock().unwrap().super_admin_enabled = true;
+    }
+
+    #[tokio::test]
+    async fn super_admin_defaults_to_enabled_and_can_be_disabled_for_server_export() {
+        let directory = TestDirectory::new();
+        let app_state = state(&directory);
+        assert!(
+            app_state
+                .enterprise_config
+                .lock()
+                .unwrap()
+                .super_admin_enabled
+        );
+        app_state
+            .enterprise_config
+            .lock()
+            .unwrap()
+            .super_admin_enabled = false;
+
+        let message_error = list_messages(
+            State(app_state.clone()),
+            authorized_headers(),
+            Query(MessagesQuery {
+                conversation_id: "conversation".into(),
+                participant_id: None,
+                text: None,
+                message_type: None,
+                media_only: None,
+                limit: None,
+                offset: None,
+                sort: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(message_error.status, StatusCode::FORBIDDEN);
+
+        let error = create_export_job(
+            State(app_state),
+            authorized_headers(),
+            Json(ExportRequest {
+                scope: ExportScope::EntireArchive,
+                format: ExportFormat::Json,
+                conversation_id: None,
+                participant_id: None,
+                text: None,
+                message_type: None,
+                media_only: None,
+                data_redaction: false,
+                simplify: false,
+                pretty: false,
+                conversation_order: ExportOrder::Descending,
+                message_order: ExportOrder::Descending,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.body.code, "SUPER_ADMIN_REQUIRED");
+    }
+
+    #[tokio::test]
+    async fn super_admin_setting_is_persisted() {
+        let directory = TestDirectory::new();
+        let app_state = state(&directory);
+        let Json(response) = update_super_admin(
+            State(app_state),
+            authorized_headers(),
+            Json(SuperAdminRequest { enabled: true }),
+        )
+        .await
+        .unwrap();
+        assert!(response.super_admin_enabled);
+        assert!(load_enterprise_config(&directory.0).super_admin_enabled);
+    }
+
+    #[test]
+    fn collection_schedule_calculates_interval_and_daily_runs() {
+        let now = Local
+            .with_ymd_and_hms(2026, 1, 15, 1, 30, 0)
+            .single()
+            .unwrap();
+        let interval = CollectionSchedule {
+            mode: CollectionScheduleMode::Interval,
+            interval_minutes: 45,
+            daily_time: "02:00".into(),
+        };
+        assert_eq!(
+            interval.next_after(now).unwrap() - now,
+            TimeDelta::minutes(45)
+        );
+
+        let daily = CollectionSchedule {
+            mode: CollectionScheduleMode::Daily,
+            interval_minutes: 60,
+            daily_time: "02:00".into(),
+        };
+        let next = daily.next_after(now).unwrap();
+        assert_eq!(next.date_naive(), now.date_naive());
+        assert_eq!(next.time(), NaiveTime::from_hms_opt(2, 0, 0).unwrap());
+        assert!(
+            CollectionSchedule {
+                mode: CollectionScheduleMode::Interval,
+                interval_minutes: 1,
+                daily_time: "02:00".into(),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            CollectionSchedule {
+                mode: CollectionScheduleMode::Interval,
+                interval_minutes: 0,
+                daily_time: "02:00".into(),
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_collection_plans_are_independent_and_persisted() {
+        let directory = TestDirectory::new();
+        let app_state = state(&directory);
+        let first_schedule = CollectionSchedule {
+            mode: CollectionScheduleMode::Daily,
+            interval_minutes: 60,
+            daily_time: "03:15".into(),
+        };
+        let second_schedule = CollectionSchedule {
+            mode: CollectionScheduleMode::Interval,
+            interval_minutes: 30,
+            daily_time: "02:00".into(),
+        };
+
+        let Json(first_response) = create_local_collection_plan(
+            State(app_state.clone()),
+            authorized_headers(),
+            Json(LocalCollectionPlanRequest {
+                name: "早班采集".into(),
+                schedule: first_schedule.clone(),
+                include_media: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_response.local_plans.len(), 1);
+        assert_eq!(first_response.local_plans[0].plan.schedule, first_schedule);
+
+        let Json(second_response) = create_local_collection_plan(
+            State(app_state.clone()),
+            authorized_headers(),
+            Json(LocalCollectionPlanRequest {
+                name: "晚班采集".into(),
+                schedule: second_schedule.clone(),
+                include_media: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_response.local_plans.len(), 2);
+
+        let persisted = load_enterprise_config(&directory.0);
+        assert_eq!(persisted.local_collection_plans.len(), 2);
+        assert_eq!(
+            persisted.local_collection_plans[1].schedule,
+            second_schedule
+        );
+    }
+
+    #[tokio::test]
+    async fn enterprise_config_update_without_schedules_preserves_existing_plans() {
+        let directory = TestDirectory::new();
+        let app_state = state(&directory);
+        {
+            let mut config = app_state.enterprise_config.lock().unwrap();
+            config.local_collection_plans.push(LocalCollectionPlan {
+                id: "local-plan".into(),
+                name: "已有计划".into(),
+                include_media: true,
+                schedule: CollectionSchedule::default(),
+                created_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
+                last_run_at: None,
+                last_status: None,
+                last_detail: None,
+            });
+            config.collector_schedule = CollectionSchedule {
+                mode: CollectionScheduleMode::Interval,
+                interval_minutes: 90,
+                daily_time: "02:00".into(),
+            };
+        }
+
+        let _ = update_enterprise_config(
+            State(app_state.clone()),
+            authorized_headers(),
+            Json(EnterpriseConfigRequest {
+                organization_name: "测试企业".into(),
+                collection_notice: DEFAULT_COLLECTION_NOTICE.into(),
+                upload_url: default_upload_url(),
+                key_id: None,
+                include_media: true,
+                data_redaction: false,
+                offline_export_enabled: false,
+                super_admin_enabled: None,
+                server_schedule: None,
+                collector_schedule: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let config = app_state.enterprise_config.lock().unwrap();
+        assert_eq!(config.local_collection_plans.len(), 1);
+        assert_eq!(config.collector_schedule.interval_minutes, 90);
+    }
+
+    #[tokio::test]
+    async fn local_collection_plan_rejects_an_invalid_interval() {
+        let directory = TestDirectory::new();
+        let app_state = state(&directory);
+
+        let error = create_local_collection_plan(
+            State(app_state),
+            authorized_headers(),
+            Json(LocalCollectionPlanRequest {
+                name: "无效计划".into(),
+                include_media: false,
+                schedule: CollectionSchedule {
+                    mode: CollectionScheduleMode::Interval,
+                    interval_minutes: 0,
+                    daily_time: "02:00".into(),
+                },
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -2837,7 +3943,7 @@ mod tests {
             "local-collection",
         ))
         .unwrap();
-        app_state.local_collector = Some(Arc::new(move |include_media, _, reporter, _| {
+        app_state.local_collector = Some(Arc::new(move |include_media, _, _, reporter, _| {
             captured_modes.lock().unwrap().push(include_media);
             reporter(55, "解析消息", "正在解析测试消息。");
             Ok(export.clone())
@@ -2872,6 +3978,15 @@ mod tests {
             .lock()
             .unwrap()
             .organization_name = "测试企业".into();
+        app_state
+            .enterprise_config
+            .lock()
+            .unwrap()
+            .collector_schedule = CollectionSchedule {
+            mode: CollectionScheduleMode::Interval,
+            interval_minutes: 45,
+            daily_time: "02:00".into(),
+        };
 
         let before = app_state.enterprise_config.lock().unwrap().clone();
         let Json(response) = generate_collector(State(app_state.clone()), authorized_headers())
@@ -2880,7 +3995,12 @@ mod tests {
 
         assert!(response.executable_generated);
         assert_eq!(response.key_id, before.key_id);
-        assert_eq!(response.file_name, format!("{}.exe", before.key_id));
+        assert!(
+            response
+                .file_name
+                .starts_with(&format!("{}-", before.key_id))
+        );
+        assert!(response.file_name.ends_with(".exe"));
         assert_eq!(
             response.directory,
             directory.0.join("collectors").display().to_string()
@@ -2888,10 +4008,14 @@ mod tests {
         let artifact: serde_json::Value = serde_json::from_str(&response.artifact).unwrap();
         assert_eq!(artifact["keyId"], before.key_id);
         assert_eq!(artifact["publicKeyHex"], before.public_key_hex);
+        assert_eq!(artifact["collectorSchedule"]["mode"], "interval");
+        assert_eq!(artifact["collectorSchedule"]["intervalMinutes"], 45);
         let after = app_state.enterprise_config.lock().unwrap().clone();
         assert!(after.collectors.iter().any(|collector| {
             collector.collector_id == response.collector_id
                 && collector.key_id == before.key_id
+                && collector.file_name == response.file_name
+                && collector.schedule.mode == CollectionScheduleMode::Interval
                 && collector.private_key_protected_hex.is_empty()
         }));
         let executable = directory.0.join("collectors").join(&response.file_name);
@@ -2907,6 +4031,19 @@ mod tests {
                 .join(format!("{}.wca-collector", response.file_name))
                 .exists()
         );
+
+        let Json(second) = generate_collector(State(app_state.clone()), authorized_headers())
+            .await
+            .unwrap();
+        assert_ne!(second.file_name, response.file_name);
+        let Json(list) = list_collectors(State(app_state), authorized_headers())
+            .await
+            .unwrap();
+        assert_eq!(list.collectors.len(), 2);
+        assert!(list.collectors.iter().all(|collector| {
+            collector.schedule.mode == CollectionScheduleMode::Interval
+                && collector.executable_available
+        }));
     }
 
     #[tokio::test]
@@ -2972,6 +4109,9 @@ mod tests {
                 include_media: false,
                 data_redaction: false,
                 offline_export_enabled: false,
+                super_admin_enabled: None,
+                server_schedule: None,
+                collector_schedule: None,
             }),
         )
         .await
@@ -3129,6 +4269,7 @@ mod tests {
     async fn creates_authenticated_server_export_file() {
         let directory = TestDirectory::new();
         let app_state = state(&directory);
+        enable_super_admin(&app_state);
         let bytes = export_bytes("服务端导出内容", Uuid::new_v4(), "batch-a");
         let _ = import_json(
             State(app_state.clone()),
@@ -3151,6 +4292,8 @@ mod tests {
                 data_redaction: false,
                 simplify: false,
                 pretty: false,
+                conversation_order: ExportOrder::Descending,
+                message_order: ExportOrder::Descending,
             }),
         )
         .await
@@ -3222,9 +4365,10 @@ mod tests {
     async fn export_options_reach_both_writers_and_keep_full_local_json_importable() {
         let directory = TestDirectory::new();
         let mut app_state = state(&directory);
+        enable_super_admin(&app_state);
         let bytes = export_bytes("普通消息\n第二行", Uuid::new_v4(), "fixture");
         let export: ClientExportV1 = serde_json::from_slice(&bytes).unwrap();
-        app_state.local_collector = Some(Arc::new(move |_, _, _, _| {
+        app_state.local_collector = Some(Arc::new(move |_, _, _, _, _| {
             let mut snapshot = export.clone();
             snapshot.export_id = Uuid::new_v4();
             Ok(snapshot)
@@ -3263,16 +4407,24 @@ mod tests {
                     assert_eq!(response.message_count, 1);
                     let document: serde_json::Value = serde_json::from_str(&text).unwrap();
                     if simplify {
-                        assert_eq!(document[0]["sender"], "测试成员");
-                        assert_eq!(document[0]["conversation"], "测试会话");
-                        assert_eq!(document[0]["content"], "普通消息\n第二行");
+                        let conversation = &document["conversations"][0];
+                        assert_eq!(conversation["conversation"], "测试会话");
+                        assert_eq!(conversation["messages"][0]["sender"], "测试成员");
+                        assert_eq!(conversation["messages"][0]["content"], "普通消息\n第二行");
                         assert!(!text.contains("participant-fixture"));
                         assert!(!text.contains("raw_payload"));
                         assert!(!text.contains("participants"));
                     } else if local {
                         assert_eq!(read_json(&path).unwrap().message_count, 1);
                     } else {
-                        assert_eq!(document[0]["stable_message_id"], "stable-message-1");
+                        assert_eq!(
+                            document["conversations"][0]["conversation_id"],
+                            "conversation-fixture"
+                        );
+                        assert_eq!(
+                            document["conversations"][0]["messages"][0]["stable_message_id"],
+                            "stable-message-1"
+                        );
                     }
                 }
             }

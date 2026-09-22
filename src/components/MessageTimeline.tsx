@@ -3,14 +3,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ConversationSummary, MessageItem, ParticipantItem } from "../domain/types";
 import { getMediaObjectUrl, openMediaFile } from "../lib/server-api";
 import { ParticipantCard } from "./ParticipantCard";
-import { ExportDirectoryButton } from "./ExportDirectoryButton";
 
 interface MessageTimelineProps {
   token: string;
   conversation: ConversationSummary;
   messages: MessageItem[];
   participants: ParticipantItem[];
-  onOpenDirectoryFailed?: (error: unknown) => void;
   status?: string;
   pageIndex?: number;
   pageSize?: number;
@@ -22,6 +20,8 @@ interface MessageTimelineProps {
   onNextPage?: () => void;
   targetMessageId?: string;
   onTargetLocated?: () => void;
+  sortAscending?: boolean;
+  onSortChange?: (ascending: boolean) => void;
 }
 
 export function MessageTimeline({
@@ -30,7 +30,6 @@ export function MessageTimeline({
   messages,
   participants,
   status,
-  onOpenDirectoryFailed,
   pageIndex = 0,
   pageSize = 200,
   totalMessages = conversation.messageCount,
@@ -41,8 +40,9 @@ export function MessageTimeline({
   onNextPage,
   targetMessageId,
   onTargetLocated,
+  sortAscending = false,
+  onSortChange,
 }: MessageTimelineProps) {
-  const [sortAscending, setSortAscending] = useState(true);
   const [messageSearch, setMessageSearch] = useState("");
   const [selectedParticipant, setSelectedParticipant] = useState<ParticipantItem>();
   const [highlightedMessageId, setHighlightedMessageId] = useState<string>();
@@ -59,8 +59,8 @@ export function MessageTimeline({
       if (message.direction === "system" && isOpaqueSystemIdentifier(message.body)) return false;
       return !normalizedSearch || `${message.senderName} ${message.body || ""} ${message.attachment?.name || ""}`.toLocaleLowerCase("zh-CN").includes(normalizedSearch);
     });
-    return sortAscending ? [...filtered].reverse() : filtered;
-  }, [messages, messageSearch, sortAscending]);
+    return !onSortChange && sortAscending ? [...filtered].reverse() : filtered;
+  }, [messages, messageSearch, onSortChange, sortAscending]);
   const participantsById = useMemo(() => new Map(participants.map((participant) => [participant.id, participant])), [participants]);
   const boundaryDate = ordered[0]?.sentAt ? new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ordered[0].sentAt)) : "";
 
@@ -122,8 +122,7 @@ export function MessageTimeline({
       <header className="timeline-header">
         <div className="timeline-heading"><h1>{conversation.title}</h1><em className="conversation-kind-badge">{conversation.isGroup ? "群会话" : "私人会话"}</em><label className="message-search"><Search size={16} /><input value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="搜索当前会话消息…" /></label></div>
         <div className="timeline-actions">
-          <button type="button" onClick={() => setSortAscending((value) => !value)}><SlidersHorizontal size={15} />按时间{sortAscending ? "升序" : "降序"}</button>
-          {onOpenDirectoryFailed && <ExportDirectoryButton token={token} onFailed={onOpenDirectoryFailed} />}
+          <button type="button" onClick={() => onSortChange?.(!sortAscending)}><SlidersHorizontal size={15} />按时间{sortAscending ? "升序" : "降序"}</button>
           <button className="icon-button" type="button" aria-label="更多操作"><MoreVertical size={18} /></button>
         </div>
       </header>

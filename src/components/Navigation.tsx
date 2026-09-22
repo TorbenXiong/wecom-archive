@@ -1,6 +1,6 @@
-import { Download, MessagesSquare, ServerCog, Settings } from "lucide-react";
+import { CalendarClock, Download, MessagesSquare, ServerCog, Settings } from "lucide-react";
 
-type Section = "conversations" | "local-export" | "server-config" | "settings";
+type Section = "conversations" | "local-export" | "server-config" | "collection-schedules" | "settings";
 
 interface NavigationProps {
   active: Section;
@@ -11,7 +11,7 @@ const items: Array<{ id: Section; label: string; icon: typeof MessagesSquare }> 
   { id: "local-export", label: "本机", icon: Download },
   { id: "server-config", label: "采集端", icon: ServerCog },
   { id: "conversations", label: "会话", icon: MessagesSquare },
-  { id: "settings", label: "设置", icon: Settings },
+  { id: "collection-schedules", label: "采集计划", icon: CalendarClock },
 ];
 
 export function Navigation({ active, onSelect }: NavigationProps) {
@@ -29,7 +29,14 @@ export function Navigation({ active, onSelect }: NavigationProps) {
         </button>
       ))}
       <div className="nav-spacer" />
-      <div className="nav-security"><span />离线运行</div>
+      <button
+        className={active === "settings" ? "nav-item nav-settings active" : "nav-item nav-settings"}
+        onClick={() => onSelect("settings")}
+        type="button"
+      >
+        <Settings size={19} strokeWidth={1.9} />
+        <span>设置</span>
+      </button>
     </nav>
   );
 }

@@ -7,7 +7,7 @@ use archive_domain::{
     ArchiveBatchV1, CLIENT_EXPORT_SCHEMA_VERSION, ClientExportV1, ConversationV1, DomainError,
     MediaBlobV1, ParticipantV1,
 };
-use chrono::Utc;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -1107,6 +1107,22 @@ pub fn write_importable_json_formatted(
 ) -> Result<(), TransferError> {
     export.validate()?;
     verify_checksum(export)?;
+    let mut export_for_output = export.clone();
+    truncate_export_timestamps(&mut export_for_output);
+    export_for_output.content_sha256 = if export_for_output.media_transport == "embedded_hex_v1" {
+        hash_content_with_media(
+            &export_for_output.conversations,
+            &export_for_output.participants,
+            &export_for_output.batches,
+            &export_for_output.media_blobs,
+        )?
+    } else {
+        hash_content(
+            &export_for_output.conversations,
+            &export_for_output.participants,
+            &export_for_output.batches,
+        )?
+    };
     let participant_names = export
         .participants
         .iter()
@@ -1131,8 +1147,10 @@ pub fn write_importable_json_formatted(
                 .map(|name| (conversation.conversation_id.clone(), name.to_owned()))
         })
         .collect::<BTreeMap<_, _>>();
-    let mut document = serde_json::to_value(export)?;
+    let mut document = serde_json::to_value(&export_for_output)?;
+    normalize_export_timestamps(&mut document, true);
     if let Some(root) = document.as_object_mut() {
+        let mut messages_by_conversation = BTreeMap::<String, Vec<serde_json::Value>>::new();
         root.insert(
             "readable_names".into(),
             serde_json::json!({
@@ -1170,7 +1188,40 @@ pub fn write_importable_json_formatted(
                         message
                             .insert("conversation_name".into(), conversation_name.clone().into());
                     }
+                    if let Some(conversation_id) = message
+                        .get("conversation_id")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        messages_by_conversation
+                            .entry(conversation_id.to_owned())
+                            .or_default()
+                            .push(serde_json::Value::Object(message.clone()));
+                    }
                 }
+            }
+        }
+        if let Some(conversations) = root
+            .get_mut("conversations")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for conversation in conversations {
+                let Some(object) = conversation.as_object_mut() else {
+                    continue;
+                };
+                let Some(conversation_id) = object
+                    .get("conversation_id")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                object.insert(
+                    "messages".into(),
+                    serde_json::Value::Array(
+                        messages_by_conversation
+                            .remove(conversation_id)
+                            .unwrap_or_default(),
+                    ),
+                );
             }
         }
     }
@@ -1182,6 +1233,77 @@ pub fn write_importable_json_formatted(
         }
         Ok(())
     })
+}
+
+/// Reorders an export without breaking its versioned checksum. This is used
+/// when a user asks for a different reading order while retaining an
+/// importable JSON contract.
+pub fn sort_export_for_output(
+    export: &mut ClientExportV1,
+    conversation_order_ascending: bool,
+    message_order_ascending: bool,
+) -> Result<(), TransferError> {
+    for batch in &mut export.batches {
+        batch.messages.sort_by(|left, right| {
+            let order = left
+                .sent_at
+                .cmp(&right.sent_at)
+                .then_with(|| left.stable_message_id.cmp(&right.stable_message_id));
+            if message_order_ascending {
+                order
+            } else {
+                order.reverse()
+            }
+        });
+    }
+    export.batches.sort_by(|left, right| {
+        let left_latest = left.messages.iter().map(|message| message.sent_at).max();
+        let right_latest = right.messages.iter().map(|message| message.sent_at).max();
+        let order = left_latest
+            .cmp(&right_latest)
+            .then_with(|| left.batch_id.cmp(&right.batch_id));
+        if conversation_order_ascending {
+            order
+        } else {
+            order.reverse()
+        }
+    });
+    let latest_by_conversation = export
+        .batches
+        .iter()
+        .flat_map(|batch| &batch.messages)
+        .fold(
+            BTreeMap::<String, DateTime<Utc>>::new(),
+            |mut latest, message| {
+                latest
+                    .entry(message.conversation_id.clone())
+                    .and_modify(|value| *value = (*value).max(message.sent_at))
+                    .or_insert(message.sent_at);
+                latest
+            },
+        );
+    export.conversations.sort_by(|left, right| {
+        let order = latest_by_conversation
+            .get(&left.conversation_id)
+            .cmp(&latest_by_conversation.get(&right.conversation_id))
+            .then_with(|| left.conversation_id.cmp(&right.conversation_id));
+        if conversation_order_ascending {
+            order
+        } else {
+            order.reverse()
+        }
+    });
+    export.content_sha256 = if export.media_transport == "embedded_hex_v1" {
+        hash_content_with_media(
+            &export.conversations,
+            &export.participants,
+            &export.batches,
+            &export.media_blobs,
+        )?
+    } else {
+        hash_content(&export.conversations, &export.participants, &export.batches)?
+    };
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -1326,7 +1448,7 @@ fn readable_view(export: &ClientExportV1) -> Result<ReadableExport, serde_json::
             .push(ReadableMessage {
                 sender: sender_name,
                 direction,
-                sent_at: message.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                sent_at: format_export_time(&message.sent_at),
                 message_type: readable_message_type(&message.message_type, &message.raw_type),
                 content: readable_message_content(message),
                 media,
@@ -1396,7 +1518,7 @@ fn readable_view(export: &ClientExportV1) -> Result<ReadableExport, serde_json::
     });
     Ok(ReadableExport {
         schema_version: "readable-export.v1",
-        exported_at: export.generated_at.to_rfc3339(),
+        exported_at: format_export_time(&export.generated_at),
         message_count: export.message_count,
         conversation_count: conversations.len(),
         conversations,
@@ -1409,6 +1531,10 @@ fn latest_message_time(conversation: &ReadableConversation) -> &str {
         .last()
         .map(|message| message.sent_at.as_str())
         .unwrap_or("")
+}
+
+fn format_export_time(value: &DateTime<Utc>) -> String {
+    value.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn readable_message_type(value: &archive_domain::MessageType, raw_type: &str) -> &'static str {
@@ -1520,7 +1646,9 @@ pub fn write_csv(export: &ClientExportV1, target: &Path) -> Result<(), TransferE
 
 pub fn read_json(path: &Path) -> Result<ClientExportV1, TransferError> {
     let reader = BufReader::new(File::open(path)?);
-    let export: ClientExportV1 = serde_json::from_reader(reader)?;
+    let mut document: serde_json::Value = serde_json::from_reader(reader)?;
+    normalize_export_timestamps(&mut document, false);
+    let export: ClientExportV1 = serde_json::from_value(document)?;
     export.validate()?;
     verify_checksum(&export)?;
     Ok(export)
@@ -1665,10 +1793,76 @@ fn is_emoji(code: u32) -> bool {
 }
 
 pub fn read_json_slice(bytes: &[u8]) -> Result<ClientExportV1, TransferError> {
-    let export: ClientExportV1 = serde_json::from_slice(bytes)?;
+    let mut document: serde_json::Value = serde_json::from_slice(bytes)?;
+    normalize_export_timestamps(&mut document, false);
+    let export: ClientExportV1 = serde_json::from_value(document)?;
     export.validate()?;
     verify_checksum(&export)?;
     Ok(export)
+}
+
+const EXPORT_TIMESTAMP_FIELDS: &[&str] = &[
+    "generated_at",
+    "collected_at",
+    "displayed_at",
+    "acknowledged_at",
+    "starts_at",
+    "ends_at",
+    "expires_at",
+    "sent_at",
+];
+
+fn normalize_export_timestamps(value: &mut serde_json::Value, for_output: bool) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                if EXPORT_TIMESTAMP_FIELDS.contains(&key.as_str()) {
+                    if let serde_json::Value::String(text) = child {
+                        if for_output {
+                            if let Ok(parsed) = DateTime::parse_from_rfc3339(text) {
+                                *text = parsed
+                                    .with_timezone(&Utc)
+                                    .format("%Y-%m-%d %H:%M:%S")
+                                    .to_string();
+                            }
+                        } else if let Ok(parsed) =
+                            NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+                        {
+                            *text = DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc)
+                                .to_rfc3339();
+                        }
+                    }
+                }
+                normalize_export_timestamps(child, for_output);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                normalize_export_timestamps(item, for_output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn truncate_export_timestamps(export: &mut ClientExportV1) {
+    export.generated_at = truncate_datetime(export.generated_at);
+    for batch in &mut export.batches {
+        batch.collected_at = truncate_datetime(batch.collected_at);
+        batch.employee_notice.displayed_at = truncate_datetime(batch.employee_notice.displayed_at);
+        batch.employee_notice.acknowledged_at =
+            batch.employee_notice.acknowledged_at.map(truncate_datetime);
+        batch.collection_scope.starts_at = batch.collection_scope.starts_at.map(truncate_datetime);
+        batch.collection_scope.ends_at = batch.collection_scope.ends_at.map(truncate_datetime);
+        batch.retention.expires_at = batch.retention.expires_at.map(truncate_datetime);
+        for message in &mut batch.messages {
+            message.sent_at = truncate_datetime(message.sent_at);
+        }
+    }
+}
+
+fn truncate_datetime(value: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(value.timestamp(), 0).unwrap_or(value)
 }
 
 fn verify_checksum(export: &ClientExportV1) -> Result<(), TransferError> {
@@ -1833,10 +2027,35 @@ mod tests {
             document["batches"][0]["messages"][0]["conversation_name"],
             "合成会话 <test>"
         );
+        assert_eq!(
+            document["conversations"][0]["messages"][0]["stable_message_id"],
+            "message-1"
+        );
+        assert!(
+            document["generated_at"]
+                .as_str()
+                .is_some_and(|value| value.len() == 19 && value.chars().nth(10) == Some(' '))
+        );
+        assert!(
+            document["batches"][0]["collected_at"]
+                .as_str()
+                .is_some_and(|value| value.len() == 19 && value.chars().nth(10) == Some(' '))
+        );
+        assert!(
+            document["batches"][0]["messages"][0]["sent_at"]
+                .as_str()
+                .is_some_and(|value| value.len() == 19 && value.chars().nth(10) == Some(' '))
+        );
         let imported = read_json(&path).unwrap();
-        assert_eq!(imported.conversations, export.conversations);
-        assert_eq!(imported.participants, export.participants);
-        assert_eq!(imported.batches, export.batches);
+        let mut expected = export.clone();
+        truncate_export_timestamps(&mut expected);
+        expected.content_sha256 = hash_content(
+            &expected.conversations,
+            &expected.participants,
+            &expected.batches,
+        )
+        .unwrap();
+        assert_eq!(imported, expected);
 
         let compact_path = directory.path().join("compact.json");
         write_importable_json_formatted(&export, &compact_path, false).unwrap();
@@ -1846,7 +2065,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&compact).unwrap(),
             document
         );
-        assert_eq!(read_json(&compact_path).unwrap(), imported);
+        assert_eq!(read_json(&compact_path).unwrap(), expected);
     }
 
     #[test]

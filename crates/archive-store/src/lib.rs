@@ -33,6 +33,8 @@ pub struct MessageQuery {
     pub media_only: bool,
     pub limit: u32,
     pub offset: u64,
+    #[serde(default)]
+    pub sort_ascending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,12 +73,22 @@ pub struct ParticipantListItem {
     pub participant_kind: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectedUser {
+    pub source_instance_id: String,
+    pub display_name: Option<String>,
+}
+
 pub struct ArchiveStore {
     connection: Connection,
 }
 
 impl ArchiveStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with_busy_timeout(path, Duration::from_secs(30))
+    }
+
+    pub fn open_with_busy_timeout(path: &Path, busy_timeout: Duration) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| StoreError::Invalid(error.to_string()))?;
@@ -87,7 +99,7 @@ impl ArchiveStore {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        connection.busy_timeout(Duration::from_secs(30))?;
+        connection.busy_timeout(busy_timeout)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
@@ -97,11 +109,18 @@ impl ArchiveStore {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        Self::open_read_only_with_busy_timeout(path, Duration::from_secs(30))
+    }
+
+    pub fn open_read_only_with_busy_timeout(
+        path: &Path,
+        busy_timeout: Duration,
+    ) -> Result<Self, StoreError> {
         let connection = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        connection.busy_timeout(Duration::from_secs(30))?;
+        connection.busy_timeout(busy_timeout)?;
         connection.pragma_update(None, "query_only", true)?;
         Ok(Self { connection })
     }
@@ -252,7 +271,12 @@ impl ArchiveStore {
         let media_search =
             search_text.map(|value| format!("%{}%", value.replace('%', "\\%").replace('_', "\\_")));
 
-        let mut statement = self.connection.prepare(
+        let order_by = if query.sort_ascending {
+            "m.sent_at ASC, m.stable_message_id ASC"
+        } else {
+            "m.sent_at DESC, m.stable_message_id DESC"
+        };
+        let sql = format!(
             "SELECT m.payload_json
              FROM messages m
              WHERE (?1 IS NULL OR m.conversation_id = ?1)
@@ -273,9 +297,10 @@ impl ArchiveStore {
                     WHERE mm.stable_message_id = m.stable_message_id
                       AND media_search.original_name LIKE ?8 ESCAPE '\\'
                ))
-             ORDER BY m.sent_at DESC, m.stable_message_id DESC
+             ORDER BY {order_by}
              LIMIT ?9 OFFSET ?10",
-        )?;
+        );
+        let mut statement = self.connection.prepare(&sql)?;
 
         let rows = statement.query_map(
             params![
@@ -349,6 +374,7 @@ impl ArchiveStore {
     pub fn message_offset_in_conversation(
         &self,
         stable_message_id: &str,
+        sort_ascending: bool,
     ) -> Result<Option<u64>, StoreError> {
         let target = self
             .connection
@@ -361,10 +387,18 @@ impl ArchiveStore {
         let Some((conversation_id, sent_at)) = target else {
             return Ok(None);
         };
-        let offset = self.connection.query_row(
+        let comparison = if sort_ascending {
+            "sent_at < ?2 OR (sent_at = ?2 AND stable_message_id < ?3)"
+        } else {
+            "sent_at > ?2 OR (sent_at = ?2 AND stable_message_id > ?3)"
+        };
+        let sql = format!(
             "SELECT count(*) FROM messages
              WHERE conversation_id = ?1
-               AND (sent_at > ?2 OR (sent_at = ?2 AND stable_message_id > ?3))",
+               AND ({comparison})"
+        );
+        let offset = self.connection.query_row(
+            &sql,
             params![conversation_id, sent_at, stable_message_id],
             |row| row.get::<_, i64>(0),
         )?;
@@ -402,6 +436,36 @@ impl ArchiveStore {
                 participant_id: row.get(0)?,
                 display_name: row.get(1)?,
                 participant_kind: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_collected_users(&self) -> Result<Vec<CollectedUser>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT sources.source_instance_id,
+                    (SELECT coalesce(nullif(trim(p.display_name), ''), m.sender_id)
+                     FROM messages m
+                     LEFT JOIN participants p ON p.participant_id = m.sender_id
+                     WHERE m.source_instance_id = sources.source_instance_id
+                       AND m.direction = 'outgoing'
+                       AND m.sender_id IS NOT NULL
+                     GROUP BY m.sender_id, p.display_name
+                     ORDER BY count(*) DESC, m.sender_id ASC
+                     LIMIT 1) AS display_name
+             FROM (
+                SELECT DISTINCT source_instance_id
+                FROM collection_batches
+                WHERE status = 'completed' AND trim(source_instance_id) <> ''
+             ) sources
+             ORDER BY coalesce(display_name, sources.source_instance_id) COLLATE NOCASE ASC,
+                      sources.source_instance_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(CollectedUser {
+                source_instance_id: row.get(0)?,
+                display_name: row.get(1)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -1075,21 +1139,85 @@ mod tests {
         store.ingest_batch(&input).unwrap();
 
         assert_eq!(
-            store.message_offset_in_conversation("stable-3").unwrap(),
+            store
+                .message_offset_in_conversation("stable-3", false)
+                .unwrap(),
             Some(0)
         );
         assert_eq!(
-            store.message_offset_in_conversation("stable-2").unwrap(),
+            store
+                .message_offset_in_conversation("stable-2", false)
+                .unwrap(),
             Some(1)
         );
         assert_eq!(
-            store.message_offset_in_conversation("stable-one").unwrap(),
+            store
+                .message_offset_in_conversation("stable-one", false)
+                .unwrap(),
             Some(2)
         );
         assert_eq!(
-            store.message_offset_in_conversation("missing").unwrap(),
+            store
+                .message_offset_in_conversation("missing", false)
+                .unwrap(),
             None
         );
+        let ascending = store
+            .query_messages(&MessageQuery {
+                conversation_id: Some("conversation".into()),
+                limit: 10,
+                sort_ascending: true,
+                ..MessageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            ascending
+                .iter()
+                .map(|message| message.stable_message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stable-one", "stable-2", "stable-3"]
+        );
+    }
+
+    #[test]
+    fn lists_collected_source_accounts_instead_of_chat_participants() {
+        let directory = tempdir().unwrap();
+        let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+        let mut input = batch("第一条");
+        input.messages[0].direction = MessageDirection::Outgoing;
+        let mut second = input.messages[0].clone();
+        second.source_message_id = "two".into();
+        second.stable_message_id = "stable-two".into();
+        second.sender_id = Some("participant-2".into());
+        second.direction = MessageDirection::Incoming;
+        input.messages.push(second);
+        let mut third = input.messages[0].clone();
+        third.source_message_id = "three".into();
+        third.stable_message_id = "stable-three".into();
+        input.messages.push(third);
+        store
+            .upsert_directory(
+                &[],
+                &[
+                    ParticipantV1 {
+                        participant_id: "participant".into(),
+                        display_name: Some("甲用户".into()),
+                        participant_kind: None,
+                    },
+                    ParticipantV1 {
+                        participant_id: "participant-2".into(),
+                        display_name: Some("乙用户".into()),
+                        participant_kind: None,
+                    },
+                ],
+            )
+            .unwrap();
+        store.ingest_batch(&input).unwrap();
+
+        let users = store.list_collected_users().unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].source_instance_id, "source");
+        assert_eq!(users[0].display_name.as_deref(), Some("甲用户"));
     }
 
     #[test]

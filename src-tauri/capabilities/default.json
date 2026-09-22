@@ -3,7 +3,7 @@
   "identifier": "main-window",
   "description": "Minimal capabilities for the local archive workspace.",
   "remote": {
-    "urls": ["http://127.0.0.1:8787/*"]
+    "urls": ["http://127.0.0.1:9812/*"]
   },
   "windows": ["main"],
   "permissions": [

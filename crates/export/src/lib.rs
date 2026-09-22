@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use archive_domain::{MediaIntegrity, MessageDirection, MessageV1};
@@ -18,7 +17,7 @@ pub enum ExportFormat {
     Json,
     Csv,
     Html,
-    Pdf,
+    Md,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,7 +58,8 @@ pub struct ExportPackage {
     pub pretty: bool,
     pub media: Vec<ExportMedia>,
     pub generated_at: DateTime<Utc>,
-    pub edge_executable: Option<PathBuf>,
+    pub conversation_order_ascending: bool,
+    pub message_order_ascending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,10 +80,6 @@ pub enum ExportError {
     Cancelled,
     #[error("unsafe export path")]
     UnsafePath,
-    #[error("PDF renderer is unavailable")]
-    PdfRendererUnavailable,
-    #[error("PDF rendering failed")]
-    PdfRenderFailed,
     #[error("export I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("JSON serialization failed: {0}")]
@@ -109,8 +105,9 @@ pub fn export_package(
 
     let result = (|| {
         let export_id = Uuid::new_v4();
-        let (message_count, media_count, missing_media_count) =
-            selected_messages(package).fold((0, 0, 0), |(messages, media, missing), message| {
+        let (message_count, media_count, missing_media_count) = selected_messages(package)
+            .into_iter()
+            .fold((0, 0, 0), |(messages, media, missing), message| {
                 (
                     messages + 1,
                     media + message.media.len() as u64,
@@ -151,7 +148,7 @@ fn render_payload(
         ExportFormat::Json => write_json(target, package, cancelled),
         ExportFormat::Csv => write_csv(target, package, cancelled),
         ExportFormat::Html => write_html(target, package, cancelled, false),
-        ExportFormat::Pdf => write_pdf(target, package, cancelled),
+        ExportFormat::Md => write_markdown(target, package, cancelled),
     }
 }
 
@@ -162,73 +159,177 @@ fn write_json(
 ) -> Result<(), ExportError> {
     let mut output = BufWriter::new(File::create(target)?);
     let names = ExportNames::new(package);
-    output.write_all(if package.pretty { b"[\n" } else { b"[" })?;
-    for (index, message) in selected_messages(package).enumerate() {
+    let conversations = selected_conversations(package);
+    for _ in &conversations {
         check_cancelled(cancelled)?;
-        if index > 0 {
-            output.write_all(if package.pretty { b",\n" } else { b"," })?;
-        }
-        if package.simplify {
-            let view = SimplifiedMessage {
-                conversation: names.conversation(message),
-                sender: names.sender(message),
-                content: message.body_text.as_deref(),
-                media: message
-                    .media
-                    .iter()
-                    .map(|media| media.original_name.as_deref().unwrap_or("未命名附件"))
-                    .collect(),
-                message_type: &message.message_type,
-                sent_at: &message.sent_at,
-            };
-            write_json_record(&mut output, &view, package.pretty)?;
-        } else {
-            write_json_record(&mut output, message, package.pretty)?;
-        }
     }
-    output.write_all(if package.pretty { b"\n]\n" } else { b"]" })?;
+    if package.simplify {
+        let document = GroupedJson {
+            conversations: conversations
+                .iter()
+                .map(|conversation| SimplifiedConversation {
+                    conversation: names.conversation_id(conversation.conversation_id),
+                    messages: conversation
+                        .messages
+                        .iter()
+                        .map(|message| SimplifiedMessage {
+                            sender: names.sender(message),
+                            content: message.body_text.as_deref(),
+                            media: message
+                                .media
+                                .iter()
+                                .map(|media| media.original_name.as_deref().unwrap_or("未命名附件"))
+                                .collect(),
+                            message_type: &message.message_type,
+                            sent_at: format_export_time(&message.sent_at),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        write_json_document(&mut output, &document, package.pretty)?;
+    } else {
+        let document = GroupedJson {
+            conversations: conversations
+                .iter()
+                .map(|conversation| {
+                    Ok::<_, ExportError>(CompleteConversation {
+                        conversation_id: conversation.conversation_id,
+                        conversation_name: names
+                            .conversation_name(conversation.conversation_id)
+                            .unwrap_or("未命名会话"),
+                        messages: conversation
+                            .messages
+                            .iter()
+                            .map(|message| complete_message_value(message))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        write_json_document(&mut output, &document, package.pretty)?;
+    }
     output.flush()?;
     Ok(())
 }
 
-// Serialize the reading projection directly: JSON Value maps sort keys alphabetically.
+#[derive(Serialize)]
+struct GroupedJson<T> {
+    conversations: Vec<T>,
+}
+
+#[derive(Serialize)]
+struct SimplifiedConversation<'a> {
+    conversation: &'a str,
+    messages: Vec<SimplifiedMessage<'a>>,
+}
+
+#[derive(Serialize)]
+struct CompleteConversation<'a> {
+    conversation_id: &'a str,
+    conversation_name: &'a str,
+    messages: Vec<serde_json::Value>,
+}
+
 #[derive(Serialize)]
 struct SimplifiedMessage<'a> {
-    conversation: &'a str,
     sender: &'a str,
     content: Option<&'a str>,
     media: Vec<&'a str>,
     message_type: &'a archive_domain::MessageType,
-    sent_at: &'a DateTime<Utc>,
+    sent_at: String,
 }
 
-fn write_json_record<T: Serialize>(
+fn complete_message_value(message: &MessageV1) -> Result<serde_json::Value, ExportError> {
+    let mut value = serde_json::to_value(message)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "sent_at".into(),
+            serde_json::Value::String(format_export_time(&message.sent_at)),
+        );
+    }
+    Ok(value)
+}
+
+fn write_json_document<T: Serialize>(
     output: &mut impl Write,
     value: &T,
     pretty: bool,
 ) -> Result<(), ExportError> {
     if pretty {
-        let formatted = serde_json::to_string_pretty(value)?;
-        for (index, line) in formatted.lines().enumerate() {
-            if index > 0 {
-                output.write_all(b"\n")?;
-            }
-            write!(output, "  {line}")?;
-        }
+        serde_json::to_writer_pretty(&mut *output, value)?;
+        output.write_all(b"\n")?;
     } else {
         serde_json::to_writer(output, value)?;
     }
     Ok(())
 }
 
-fn selected_messages(package: &ExportPackage) -> impl Iterator<Item = &MessageV1> {
-    package.messages.iter().filter(|message| {
+struct SelectedConversation<'a> {
+    conversation_id: &'a str,
+    messages: Vec<&'a MessageV1>,
+}
+
+fn selected_messages(package: &ExportPackage) -> Vec<&MessageV1> {
+    selected_conversations(package)
+        .into_iter()
+        .flat_map(|conversation| conversation.messages)
+        .collect()
+}
+
+fn selected_conversations(package: &ExportPackage) -> Vec<SelectedConversation<'_>> {
+    let mut grouped = BTreeMap::<&str, Vec<&MessageV1>>::new();
+    for message in package.messages.iter().filter(|message| {
         !package.simplify
             || !matches!(
                 message.raw_type.as_str(),
                 "group_announcement" | "group_board"
             )
-    })
+    }) {
+        grouped
+            .entry(message.conversation_id.as_str())
+            .or_default()
+            .push(message);
+    }
+    for messages in grouped.values_mut() {
+        messages.sort_by(|left, right| {
+            let order = left
+                .sent_at
+                .cmp(&right.sent_at)
+                .then_with(|| left.stable_message_id.cmp(&right.stable_message_id));
+            if package.message_order_ascending {
+                order
+            } else {
+                order.reverse()
+            }
+        });
+    }
+    let mut conversations = grouped
+        .into_iter()
+        .map(|(conversation_id, messages)| {
+            let latest = messages
+                .iter()
+                .map(|message| message.sent_at)
+                .max()
+                .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            (conversation_id, latest, messages)
+        })
+        .collect::<Vec<_>>();
+    conversations.sort_by(|left, right| {
+        let order = left.1.cmp(&right.1).then_with(|| left.0.cmp(right.0));
+        if package.conversation_order_ascending {
+            order
+        } else {
+            order.reverse()
+        }
+    });
+    conversations
+        .into_iter()
+        .map(|(conversation_id, _, messages)| SelectedConversation {
+            conversation_id,
+            messages,
+        })
+        .collect()
 }
 
 struct ExportNames<'a> {
@@ -271,12 +372,24 @@ impl<'a> ExportNames<'a> {
     }
 
     fn conversation(&self, message: &MessageV1) -> &str {
+        self.conversation_id(&message.conversation_id)
+    }
+
+    fn conversation_id(&self, conversation_id: &str) -> &str {
         self.conversations
-            .get(&message.conversation_id)
+            .get(conversation_id)
             .map(String::as_str)
             .map(str::trim)
-            .filter(|name| !name.is_empty() && *name != message.conversation_id)
+            .filter(|name| !name.is_empty() && *name != conversation_id)
             .unwrap_or("未命名会话")
+    }
+
+    fn conversation_name(&self, conversation_id: &str) -> Option<&str> {
+        self.conversations
+            .get(conversation_id)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && *name != conversation_id)
     }
 }
 
@@ -330,45 +443,48 @@ fn write_csv(
         (false, true) => &pretty_headers[..],
         (false, false) => &headers[..],
     })?;
-    for message in selected_messages(package) {
+    for conversation in selected_conversations(package) {
         check_cancelled(cancelled)?;
-        let media_names = message
-            .media
-            .iter()
-            .filter_map(|media| media.original_name.as_deref())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        if package.simplify {
+        for message in conversation.messages {
+            check_cancelled(cancelled)?;
+            let media_names = message
+                .media
+                .iter()
+                .filter_map(|media| media.original_name.as_deref())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if package.simplify {
+                messages.write_record([
+                    safe_csv(names.conversation(message)),
+                    safe_csv(names.sender(message)),
+                    safe_csv(message.body_text.as_deref().unwrap_or_default()),
+                    safe_csv(&media_names),
+                    display_message_type(message, package.pretty)?,
+                    display_time(message, package.pretty),
+                ])?;
+                continue;
+            }
+            let media_hashes = message
+                .media
+                .iter()
+                .filter_map(|media| media.content_hash.as_deref())
+                .collect::<Vec<_>>()
+                .join(" | ");
             messages.write_record([
-                safe_csv(names.conversation(message)),
-                safe_csv(names.sender(message)),
-                safe_csv(message.body_text.as_deref().unwrap_or_default()),
-                safe_csv(&media_names),
-                display_message_type(message, package.pretty)?,
+                safe_csv(&message.stable_message_id),
+                safe_csv(&message.conversation_id),
+                safe_csv(message.sender_id.as_deref().unwrap_or_default()),
                 display_time(message, package.pretty),
+                enum_text(&message.direction)?,
+                display_message_type(message, package.pretty)?,
+                safe_csv(message.body_text.as_deref().unwrap_or_default()),
+                enum_text(&message.lifecycle)?,
+                safe_csv(message.quoted_message_id.as_deref().unwrap_or_default()),
+                safe_csv(&message.raw_type),
+                safe_csv(&media_names),
+                safe_csv(&media_hashes),
             ])?;
-            continue;
         }
-        let media_hashes = message
-            .media
-            .iter()
-            .filter_map(|media| media.content_hash.as_deref())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        messages.write_record([
-            safe_csv(&message.stable_message_id),
-            safe_csv(&message.conversation_id),
-            safe_csv(message.sender_id.as_deref().unwrap_or_default()),
-            display_time(message, package.pretty),
-            enum_text(&message.direction)?,
-            display_message_type(message, package.pretty)?,
-            safe_csv(message.body_text.as_deref().unwrap_or_default()),
-            enum_text(&message.lifecycle)?,
-            safe_csv(message.quoted_message_id.as_deref().unwrap_or_default()),
-            safe_csv(&message.raw_type),
-            safe_csv(&media_names),
-            safe_csv(&media_hashes),
-        ])?;
     }
     messages.flush()?;
     Ok(())
@@ -399,6 +515,7 @@ fn write_html(
 ) -> Result<(), ExportError> {
     let mut output = BufWriter::new(File::create(target)?);
     let names = ExportNames::new(package);
+    let conversations = selected_conversations(package);
     output.write_all(html_document_start("归档导出", for_print, package.pretty).as_bytes())?;
     let summary_details = if package.simplify {
         String::new()
@@ -412,51 +529,64 @@ fn write_html(
     write!(
         output,
         "<section class=\"summary\"><p>{} 条消息{summary_details}</p></section>",
-        selected_messages(package).count(),
-    )?;
-    for message in selected_messages(package) {
-        check_cancelled(cancelled)?;
-        let sender = if package.simplify {
-            html_escape(names.sender(message))
-        } else if package.pretty {
-            html_escape(&format!(
-                "{} ({})",
-                names.sender(message),
-                message.sender_id.as_deref().unwrap_or("系统")
-            ))
-        } else {
-            html_escape(message.sender_id.as_deref().unwrap_or("系统"))
-        };
-        let conversation = if package.simplify {
-            html_escape(names.conversation(message))
-        } else if package.pretty {
-            html_escape(&format!(
-                "{} ({})",
-                names.conversation(message),
-                message.conversation_id
-            ))
-        } else {
-            html_escape(&message.conversation_id)
-        };
-        let body = html_escape(message.body_text.as_deref().unwrap_or("[不支持的消息类型]"));
-        let media = message
-            .media
+        conversations
             .iter()
-            .filter_map(|item| item.original_name.as_deref())
-            .map(html_escape)
-            .collect::<Vec<_>>()
-            .join(" · ");
-        write!(
+            .map(|conversation| conversation.messages.len())
+            .sum::<usize>(),
+    )?;
+    for conversation_group in conversations {
+        check_cancelled(cancelled)?;
+        let conversation_title = if package.simplify {
+            names
+                .conversation_id(conversation_group.conversation_id)
+                .to_owned()
+        } else if package.pretty {
+            names
+                .conversation_name(conversation_group.conversation_id)
+                .map(|name| format!("{name} ({})", conversation_group.conversation_id))
+                .unwrap_or_else(|| conversation_group.conversation_id.to_owned())
+        } else {
+            conversation_group.conversation_id.to_owned()
+        };
+        writeln!(
             output,
-            "<article class=\"message\"><header><time>{}</time><strong>{sender}</strong><span>{}</span><span>会话 {conversation}</span></header><p>{body}</p>{}</article>",
-            html_escape(&display_time(message, package.pretty)),
-            html_escape(&display_message_type(message, package.pretty)?),
-            if media.is_empty() {
-                String::new()
-            } else {
-                format!("<small class=\"media\">附件：{media}</small>")
-            },
+            "<section class=\"conversation\"><h2>{}</h2>",
+            html_escape(&conversation_title)
         )?;
+        for message in conversation_group.messages {
+            check_cancelled(cancelled)?;
+            let sender = if package.simplify {
+                html_escape(names.sender(message))
+            } else if package.pretty {
+                html_escape(&format!(
+                    "{} ({})",
+                    names.sender(message),
+                    message.sender_id.as_deref().unwrap_or("系统")
+                ))
+            } else {
+                html_escape(message.sender_id.as_deref().unwrap_or("系统"))
+            };
+            let body = html_escape(message.body_text.as_deref().unwrap_or("[不支持的消息类型]"));
+            let media = message
+                .media
+                .iter()
+                .filter_map(|item| item.original_name.as_deref())
+                .map(html_escape)
+                .collect::<Vec<_>>()
+                .join(" · ");
+            write!(
+                output,
+                "<article class=\"message\"><header><time>{}</time><strong>{sender}</strong><span>{}</span></header><p>{body}</p>{}</article>",
+                html_escape(&display_time(message, package.pretty)),
+                html_escape(&display_message_type(message, package.pretty)?),
+                if media.is_empty() {
+                    String::new()
+                } else {
+                    format!("<small class=\"media\">附件：{media}</small>")
+                },
+            )?;
+        }
+        output.write_all(b"</section>")?;
     }
     output.write_all(b"</main></body></html>")?;
     output.flush()?;
@@ -475,40 +605,97 @@ fn html_document_start(title: &str, for_print: bool, pretty: bool) -> String {
     )
 }
 
-fn write_pdf(
+fn write_markdown(
     target: &Path,
     package: &ExportPackage,
     cancelled: &AtomicBool,
 ) -> Result<(), ExportError> {
-    let edge = package
-        .edge_executable
-        .as_deref()
-        .filter(|path| path.is_file())
-        .ok_or(ExportError::PdfRendererUnavailable)?;
-    let directory = tempfile::tempdir_in(target.parent().ok_or(ExportError::UnsafePath)?)?;
-    let html = directory.path().join("export.html");
-    write_html(&html, package, cancelled, true)?;
-    check_cancelled(cancelled)?;
-    render_one_pdf(edge, &html, target)
+    let mut output = BufWriter::new(File::create(target)?);
+    let names = ExportNames::new(package);
+    let conversations = selected_conversations(package);
+    writeln!(output, "# {}\n", markdown_escape("归档导出"))?;
+    writeln!(
+        output,
+        "导出时间：{} · 消息：{}\n",
+        markdown_escape(&format_export_time(&package.generated_at)),
+        conversations
+            .iter()
+            .map(|conversation| conversation.messages.len())
+            .sum::<usize>(),
+    )?;
+    for conversation_group in conversations {
+        check_cancelled(cancelled)?;
+        let conversation_title = if package.simplify {
+            names
+                .conversation_id(conversation_group.conversation_id)
+                .to_owned()
+        } else if package.pretty {
+            names
+                .conversation_name(conversation_group.conversation_id)
+                .map(|name| format!("{name} ({})", conversation_group.conversation_id))
+                .unwrap_or_else(|| conversation_group.conversation_id.to_owned())
+        } else {
+            conversation_group.conversation_id.to_owned()
+        };
+        writeln!(output, "## {}\n", markdown_escape(&conversation_title))?;
+        for message in conversation_group.messages {
+            check_cancelled(cancelled)?;
+            let sender = if package.simplify {
+                names.sender(message).to_owned()
+            } else if package.pretty {
+                format!(
+                    "{} ({})",
+                    names.sender(message),
+                    message.sender_id.as_deref().unwrap_or("系统")
+                )
+            } else {
+                message.sender_id.as_deref().unwrap_or("系统").to_owned()
+            };
+            let body = message.body_text.as_deref().unwrap_or("[不支持的消息类型]");
+            writeln!(
+                output,
+                "### {} · {} · {}\n",
+                markdown_escape(&display_time(message, package.pretty)),
+                markdown_escape(&sender),
+                markdown_escape(&display_message_type(message, package.pretty)?),
+            )?;
+            for line in body.split('\n') {
+                writeln!(output, "    {}", markdown_escape(line))?;
+            }
+            let media = message
+                .media
+                .iter()
+                .filter_map(|item| item.original_name.as_deref())
+                .collect::<Vec<_>>();
+            if !media.is_empty() {
+                writeln!(output, "\n**附件**")?;
+                for name in media {
+                    writeln!(output, "- {}", markdown_escape(name))?;
+                }
+            }
+            writeln!(output)?;
+        }
+    }
+    output.flush()?;
+    Ok(())
 }
 
-fn render_one_pdf(edge: &Path, html: &Path, output: &Path) -> Result<(), ExportError> {
-    let html = html.canonicalize()?;
-    let output = output.to_path_buf();
-    let status = Command::new(edge)
-        .arg("--headless=new")
-        .arg("--disable-gpu")
-        .arg("--no-pdf-header-footer")
-        .arg(format!("--print-to-pdf={}", output.display()))
-        .arg(format!(
-            "file:///{}",
-            html.to_string_lossy().replace('\\', "/")
-        ))
-        .status()?;
-    if !status.success() || !output.is_file() {
-        return Err(ExportError::PdfRenderFailed);
+fn markdown_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')' | '#' | '+' | '-' | '!'
+            | '|' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            _ => escaped.push(character),
+        }
     }
-    Ok(())
+    escaped
 }
 
 fn partial_path(target: &Path) -> Result<PathBuf, ExportError> {
@@ -574,12 +761,12 @@ fn enum_text<T: Serialize>(value: &T) -> Result<String, ExportError> {
     }
 }
 
-fn display_time(message: &MessageV1, pretty: bool) -> String {
-    if pretty {
-        message.sent_at.format("%Y-%m-%d %H:%M:%S UTC").to_string()
-    } else {
-        message.sent_at.to_rfc3339()
-    }
+fn display_time(message: &MessageV1, _pretty: bool) -> String {
+    format_export_time(&message.sent_at)
+}
+
+fn format_export_time(value: &DateTime<Utc>) -> String {
+    value.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn display_message_type(message: &MessageV1, pretty: bool) -> Result<String, ExportError> {
@@ -601,13 +788,14 @@ fn display_message_type(message: &MessageV1, pretty: bool) -> Result<String, Exp
     .into())
 }
 
-const COMPACT_CSS: &str = "body{font:12px/1.3 sans-serif;margin:8px}h1{font-size:16px;margin:0}.summary p,.message p{margin:0}.message{border-bottom:1px solid #ddd;padding:2px 0;overflow-wrap:anywhere}.message header{display:flex;flex-wrap:wrap;gap:8px}.message p{white-space:pre-wrap}";
+const COMPACT_CSS: &str = "body{font:12px/1.3 sans-serif;margin:8px}h1{font-size:16px;margin:0}.summary p,.message p{margin:0}.conversation{margin-top:12px}.conversation h2{font-size:14px;margin:8px 0;border-bottom:1px solid #bbb;padding-bottom:3px}.message{border-bottom:1px solid #ddd;padding:2px 0;overflow-wrap:anywhere}.message header{display:flex;flex-wrap:wrap;gap:8px}.message p{white-space:pre-wrap}";
 
 const BASE_CSS: &str = r#"
 :root{font-family:"Microsoft YaHei UI","Segoe UI",sans-serif;color:#10213c;background:#f5f7fb}
 *{box-sizing:border-box}body{margin:0}main{max-width:980px;margin:0 auto;padding:36px;background:#fff;min-height:100vh}
 h1{font-size:24px;margin:0 0 24px}.summary{padding:16px 20px;background:#eef4ff;border:1px solid #d7e4ff;border-radius:10px}
 .session-list{padding:0;list-style:none}.session-list li{display:flex;justify-content:space-between;padding:14px 0;border-bottom:1px solid #e5eaf2}
+.conversation{margin:28px 0 0}.conversation h2{font-size:18px;margin:0;padding:12px 16px;border:1px solid #d7e4ff;border-radius:8px;background:#f5f8ff}.conversation .message{padding:14px 16px}
 a{color:#1959d1}.message{padding:14px 0;border-bottom:1px solid #e5eaf2}.message header{display:flex;gap:12px;color:#5c6b80;font-size:12px}
 .message header{flex-wrap:wrap}.message strong{color:#10213c}.message p{white-space:pre-wrap;word-break:break-word;line-height:1.7;margin:8px 0}
 .media{display:block;color:#5c6b80;word-break:break-all}
@@ -671,7 +859,8 @@ mod tests {
             pretty,
             media: vec![],
             generated_at: sent_at,
-            edge_executable: None,
+            conversation_order_ascending: true,
+            message_order_ascending: true,
         }
     }
 
@@ -690,30 +879,36 @@ mod tests {
                 assert_eq!(result.message_count, if simplify { 1 } else { 3 });
                 assert_eq!(result.media_count, result.message_count);
                 assert_eq!(result.missing_media_count, result.message_count);
+                let conversation = &document["conversations"][0];
+                assert_eq!(document["conversations"].as_array().unwrap().len(), 1);
                 if simplify {
                     assert!(!text.contains("internal-"));
                     assert!(!text.contains("仅群"));
-                    assert_eq!(document[0]["sender"], "+测试成员");
-                    assert_eq!(document[0]["conversation"], "=测试会话");
+                    assert_eq!(conversation["conversation"], "=测试会话");
+                    assert_eq!(conversation["messages"].as_array().unwrap().len(), 1);
+                    let message = &conversation["messages"][0];
+                    assert_eq!(message["sender"], "+测试成员");
                     assert_eq!(
-                        document[0]["content"],
+                        message["content"],
                         package.messages[0].body_text.as_deref().unwrap()
                     );
-                    assert_eq!(document[0]["media"][0], "@附件.txt");
-                    assert_eq!(document[0].as_object().unwrap().len(), 6);
-                    let positions = [
-                        "conversation",
-                        "sender",
-                        "content",
-                        "media",
-                        "message_type",
-                        "sent_at",
-                    ]
-                    .map(|key| text.find(&format!("\"{key}\":")).unwrap());
+                    assert_eq!(message["media"][0], "@附件.txt");
+                    assert_eq!(message["sent_at"], "2026-09-16 08:30:00");
+                    assert_eq!(message.as_object().unwrap().len(), 5);
+                    let positions = ["conversation", "messages"]
+                        .map(|key| text.find(&format!("\"{key}\":")).unwrap());
                     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
                 } else {
-                    let restored: Vec<MessageV1> = serde_json::from_str(&text).unwrap();
-                    assert_eq!(restored, package.messages);
+                    assert_eq!(conversation["conversation_id"], "internal-conversation");
+                    assert_eq!(conversation["messages"].as_array().unwrap().len(), 3);
+                    assert_eq!(
+                        conversation["messages"][0]["stable_message_id"],
+                        "internal-message"
+                    );
+                    assert_eq!(
+                        conversation["messages"][0]["sent_at"],
+                        "2026-09-16 08:30:00"
+                    );
                 }
                 assert!(!partial_path(&path).unwrap().exists());
                 assert!(matches!(
@@ -749,6 +944,7 @@ mod tests {
                     assert_eq!(&rows[0][3], "'@附件.txt");
                     assert_eq!(&headers[0], if pretty { "会话" } else { "conversation" });
                     assert_eq!(&rows[0][4], if pretty { "文本" } else { "text" });
+                    assert_eq!(&rows[0][5], "2026-09-16 08:30:00");
                 } else {
                     assert_eq!(&rows[0][0], "internal-message");
                     assert_eq!(
@@ -759,13 +955,14 @@ mod tests {
                             "stable_message_id"
                         }
                     );
+                    assert_eq!(&rows[0][3], "2026-09-16 08:30:00");
                 }
             }
         }
     }
 
     #[test]
-    fn html_and_pdf_source_use_selected_layout_and_escape_content() {
+    fn html_uses_selected_layout_and_escapes_content() {
         let directory = tempfile::tempdir().unwrap();
         for simplify in [false, true] {
             for pretty in [false, true] {
@@ -782,12 +979,42 @@ mod tests {
                     assert_eq!(html.contains("internal-sender"), !simplify);
                     assert_eq!(html.contains("仅群公告内容"), !simplify);
                     assert!(html.contains("普通消息提及群公告"));
+                    assert!(html.contains("2026-09-16 08:30:00"));
                     if simplify {
                         assert!(html.contains("+测试成员"));
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn markdown_groups_conversations_and_escapes_markdown_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut package = fixture(ExportFormat::Md, true, true);
+        let mut other = package.messages[0].clone();
+        other.conversation_id = "other-conversation".into();
+        other.stable_message_id = "other-message".into();
+        other.sent_at = "2026-09-16T09:30:00Z".parse().unwrap();
+        other.body_text = Some("# 标题\n- 列表 <script>".into());
+        package.messages.push(other);
+        package
+            .conversation_names
+            .insert("other-conversation".into(), "另一个 # 会话".into());
+        package.conversation_order_ascending = false;
+        let path = directory.path().join("grouped.md");
+
+        export_package(&package, &path, &AtomicBool::new(false)).unwrap();
+
+        let markdown = fs::read_to_string(path).unwrap();
+        assert_eq!(markdown.matches("\n## ").count(), 2);
+        assert!(markdown.contains("## 另一个 \\# 会话"));
+        assert!(markdown.contains("    \\# 标题"));
+        assert!(markdown.contains("    \\- 列表 &lt;script&gt;"));
+        assert!(!markdown.contains("<script>"));
+        assert!(markdown.contains("**附件**"));
+        assert!(markdown.contains(r"导出时间：2026\-09\-16 08:30:00"));
+        assert!(markdown.contains(r"2026\-09\-16 09:30:00"));
     }
 
     #[test]
@@ -808,6 +1035,79 @@ mod tests {
     }
 
     #[test]
+    fn applies_conversation_and_message_orders_independently() {
+        let mut package = fixture(ExportFormat::Json, true, false);
+        package.messages.truncate(1);
+        let mut earlier = package.messages[0].clone();
+        earlier.stable_message_id = "conversation-a-new".into();
+        earlier.conversation_id = "conversation-a".into();
+        earlier.sent_at = "2026-09-16T08:00:00Z".parse().unwrap();
+        let mut latest = earlier.clone();
+        latest.stable_message_id = "conversation-a-latest".into();
+        latest.sent_at = "2026-09-16T09:00:00Z".parse().unwrap();
+        let mut other = earlier.clone();
+        other.stable_message_id = "conversation-b-only".into();
+        other.conversation_id = "conversation-b".into();
+        other.sent_at = "2026-09-16T08:30:00Z".parse().unwrap();
+        package.messages = vec![latest, other, earlier];
+        package.conversation_order_ascending = false;
+        package.message_order_ascending = true;
+
+        let ordered = selected_messages(&package)
+            .into_iter()
+            .map(|message| message.stable_message_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            vec![
+                "conversation-a-new",
+                "conversation-a-latest",
+                "conversation-b-only"
+            ]
+        );
+    }
+
+    #[test]
+    fn reading_exports_keep_messages_grouped_by_conversation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut package = fixture(ExportFormat::Json, true, true);
+        let mut other = package.messages[0].clone();
+        other.conversation_id = "other-conversation".into();
+        other.stable_message_id = "other-message".into();
+        other.sent_at = "2026-09-16T09:30:00Z".parse().unwrap();
+        package.messages.push(other);
+        package.conversation_order_ascending = false;
+        package
+            .conversation_names
+            .insert("other-conversation".into(), "另一个会话".into());
+
+        let json_path = directory.path().join("grouped.json");
+        export_package(&package, &json_path, &AtomicBool::new(false)).unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(json_path).unwrap()).unwrap();
+        let conversations = document["conversations"].as_array().unwrap();
+        assert_eq!(conversations.len(), 2);
+        assert_eq!(conversations[0]["conversation"], "另一个会话");
+        assert_eq!(conversations[0]["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(conversations[1]["conversation"], "=测试会话");
+        assert_eq!(conversations[1]["messages"].as_array().unwrap().len(), 1);
+
+        package.format = ExportFormat::Html;
+        let html_path = directory.path().join("grouped.html");
+        export_package(&package, &html_path, &AtomicBool::new(false)).unwrap();
+        let html = fs::read_to_string(html_path).unwrap();
+        assert_eq!(html.matches("class=\"conversation\"").count(), 2);
+        assert!(html.contains("另一个会话"));
+
+        package.format = ExportFormat::Md;
+        let markdown_path = directory.path().join("grouped.md");
+        export_package(&package, &markdown_path, &AtomicBool::new(false)).unwrap();
+        let markdown = fs::read_to_string(markdown_path).unwrap();
+        assert_eq!(markdown.matches("\n## ").count(), 2);
+        assert!(markdown.contains("另一个会话"));
+    }
+
+    #[test]
     fn empty_and_cancelled_exports_leave_no_partial_files() {
         let directory = tempfile::tempdir().unwrap();
         let mut package = fixture(ExportFormat::Json, true, false);
@@ -819,7 +1119,7 @@ mod tests {
                 .message_count,
             0
         );
-        assert_eq!(fs::read_to_string(empty).unwrap(), "[]");
+        assert_eq!(fs::read_to_string(empty).unwrap(), "{\"conversations\":[]}");
         let cancelled = directory.path().join("cancelled.json");
         assert!(matches!(
             export_package(&package, &cancelled, &AtomicBool::new(true)),

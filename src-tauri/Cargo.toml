@@ -31,7 +31,7 @@ libsqlite3-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tauri = { workspace = true, features = ["protocol-asset"] }
+tauri = { workspace = true, features = ["protocol-asset", "tray-icon"] }
 thiserror.workspace = true
 uuid.workspace = true
 zeroize.workspace = true

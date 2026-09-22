@@ -15,7 +15,7 @@ export default defineConfig(({ mode }) => {
       port: target === "client" ? 1420 : 1430,
       strictPort: true,
       host: host || false,
-      proxy: target === "server" ? { "/api": "http://127.0.0.1:8787" } : undefined,
+      proxy: target === "server" ? { "/api": "http://127.0.0.1:9812" } : undefined,
       hmr: host
         ? {
             protocol: "ws",
