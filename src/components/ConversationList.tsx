@@ -1,18 +1,21 @@
-import { ArrowRight, Download, Files, FileText, HardDriveDownload, LoaderCircle, MessageSquareText, Search, Upload, X } from "lucide-react";
+import { ArrowRight, Download, HardDriveDownload, LoaderCircle, MessageSquareText, Search, Upload, Users, X } from "lucide-react";
 import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import type { ConversationSummary } from "../domain/types";
-import { searchMessages, type GlobalSearchResult } from "../lib/server-api";
+import { searchMessages, type CollectedUser, type GlobalSearchResult } from "../lib/server-api";
 
 interface ConversationListProps {
   token: string;
   conversations: ConversationSummary[];
   selectedId: string;
+  messageSortAscending?: boolean;
+  superAdminEnabled?: boolean;
+  collectedUsers?: CollectedUser[];
   onSelect: (id: string) => void;
   onOpenSearchResult: (result: GlobalSearchResult) => void;
   onExport: () => void;
   localCollectionAvailable: boolean;
   collectingLocal: boolean;
-  onCollectLocal: (includeMedia: boolean) => void;
+  onOpenLocalCollection: () => void;
   importing: boolean;
   onImport: (file: File) => void;
 }
@@ -21,28 +24,31 @@ export function ConversationList({
   token,
   conversations,
   selectedId,
+  messageSortAscending = false,
   onSelect,
   onOpenSearchResult,
   onExport,
   localCollectionAvailable,
   collectingLocal,
-  onCollectLocal,
+  onOpenLocalCollection,
   importing,
   onImport,
+  collectedUsers = [],
+  superAdminEnabled = true,
 }: ConversationListProps) {
   const [search, setSearch] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchTab, setSearchTab] = useState<"all" | "messages">("all");
   const [showSearchMenu, setShowSearchMenu] = useState(false);
-  const [showCollectionMenu, setShowCollectionMenu] = useState(false);
   const deferredSearch = useDeferredValue(search.trim());
   const [results, setResults] = useState<GlobalSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
+  const [showCollectedUsers, setShowCollectedUsers] = useState(false);
 
   useEffect(() => {
     const openFromShortcut = (event: KeyboardEvent) => {
-      if (event.ctrlKey && event.altKey && event.key.toLocaleLowerCase() === "f") {
+      if (superAdminEnabled && event.ctrlKey && event.altKey && event.key.toLocaleLowerCase() === "f") {
         event.preventDefault();
         setShowSearchMenu(false);
         setSearchOpen(true);
@@ -50,16 +56,15 @@ export function ConversationList({
       if (event.key === "Escape") {
         setSearchOpen(false);
         setShowSearchMenu(false);
-        setShowCollectionMenu(false);
         setSearch("");
       }
     };
     window.addEventListener("keydown", openFromShortcut);
     return () => window.removeEventListener("keydown", openFromShortcut);
-  }, []);
+  }, [superAdminEnabled]);
 
   useEffect(() => {
-    if (!searchOpen || !deferredSearch) {
+    if (!superAdminEnabled || !searchOpen || !deferredSearch) {
       setResults([]);
       setSearching(false);
       setSearchError("");
@@ -68,7 +73,7 @@ export function ConversationList({
     const controller = new AbortController();
     setSearching(true);
     setSearchError("");
-    searchMessages(token, deferredSearch, controller.signal)
+    searchMessages(token, deferredSearch, controller.signal, messageSortAscending ? "asc" : "desc")
       .then(setResults)
       .catch((error) => {
         if (error instanceof DOMException && error.name === "AbortError") return;
@@ -79,7 +84,7 @@ export function ConversationList({
         if (!controller.signal.aborted) setSearching(false);
       });
     return () => controller.abort();
-  }, [deferredSearch, searchOpen, token]);
+  }, [deferredSearch, messageSortAscending, searchOpen, superAdminEnabled, token]);
 
   const conversationNames = useMemo(
     () => new Map(conversations.map((conversation) => [conversation.id, conversation.title])),
@@ -101,7 +106,7 @@ export function ConversationList({
       <div className="conversation-toolbar" onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget)) setShowSearchMenu(false);
       }}>
-        <div className="search-box conversation-search-box">
+        {superAdminEnabled && <div className="search-box conversation-search-box">
           <Search size={17} />
           <input
             aria-label="打开全局搜索"
@@ -110,8 +115,8 @@ export function ConversationList({
             placeholder="搜索"
             value={searchOpen ? search : ""}
           />
-        </div>
-        {showSearchMenu && !searchOpen && <div className="search-mode-menu">
+        </div>}
+        {superAdminEnabled && showSearchMenu && !searchOpen && <div className="search-mode-menu">
           <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => { setShowSearchMenu(false); setSearchOpen(true); }}>
             <span className="search-mode-icon"><Search size={16} /></span>
             <span><strong>全局搜索</strong><small>搜索全部归档聊天记录</small></span>
@@ -122,6 +127,7 @@ export function ConversationList({
       </div>
 
       <div className="conversation-scroll">
+        <button className="collected-users-summary" type="button" onClick={() => setShowCollectedUsers(true)}><Users size={15} /><span>已收集 <strong>{collectedUsers.length.toLocaleString("zh-CN")}</strong> 位用户聊天记录</span></button>
         {conversations.length === 0 ? <div className="conversation-empty">尚无归档数据，可采集本机或使用专属采集端。</div> : conversations.map((conversation) => (
           <button
             aria-current={selectedId === conversation.id ? "true" : undefined}
@@ -143,57 +149,21 @@ export function ConversationList({
       <div className="conversation-footer">
         <span>共 {conversations.length} 个会话</span>
         <div className="conversation-footer-actions">
-          {localCollectionAvailable && <div
-            className="collection-action-wrap"
-            onBlur={(event) => {
-              if (!event.currentTarget.contains(event.relatedTarget)) setShowCollectionMenu(false);
-            }}
-          >
-            <button
-              aria-expanded={showCollectionMenu}
-              aria-haspopup="menu"
-              className="conversation-footer-action"
-              disabled={collectingLocal}
-              onClick={() => setShowCollectionMenu((visible) => !visible)}
-              type="button"
-            >
+          {localCollectionAvailable && <div className="collection-action-wrap">
+            <button className="conversation-footer-action" disabled={collectingLocal} onClick={onOpenLocalCollection} type="button">
               {collectingLocal ? <LoaderCircle className="spin" size={14} /> : <HardDriveDownload size={14} />}
               {collectingLocal ? "采集中…" : "采集本机"}
             </button>
-            {showCollectionMenu && <div className="collection-mode-menu" role="menu">
-              <button
-                onClick={() => {
-                  setShowCollectionMenu(false);
-                  onCollectLocal(false);
-                }}
-                role="menuitem"
-                type="button"
-              >
-                <FileText size={17} />
-                <span><strong>仅文本消息</strong><small>不采集图片和文件内容</small></span>
-              </button>
-              <button
-                onClick={() => {
-                  setShowCollectionMenu(false);
-                  onCollectLocal(true);
-                }}
-                role="menuitem"
-                type="button"
-              >
-                <Files size={17} />
-                <span><strong>包含图片和文件</strong><small>同时采集聊天中的图片和文件</small></span>
-              </button>
-            </div>}
           </div>}
           <label className={importing ? "conversation-footer-action disabled" : "conversation-footer-action"} title="支持采集端 .wca 加密包和本机导出的 JSON">
             <Upload size={14} /><span>{importing ? "导入中" : "导入"}</span>
             <input aria-label="导入会话" type="file" accept=".wca,.json" hidden disabled={importing} onChange={(event) => { const file = event.target.files?.[0]; if (file) onImport(file); event.currentTarget.value = ""; }} />
           </label>
-          <button className="conversation-footer-action" type="button" onClick={onExport}><Download size={14} />导出</button>
+          {superAdminEnabled && <button className="conversation-footer-action" type="button" onClick={onExport}><Download size={14} />导出</button>}
         </div>
       </div>
 
-      {searchOpen && <section className="global-search-overlay" role="dialog" aria-modal="true" aria-label="全局搜索">
+      {superAdminEnabled && searchOpen && <section className="global-search-overlay" role="dialog" aria-modal="true" aria-label="全局搜索">
         <header className="global-search-header">
           <label className="global-search-input">
             <Search size={19} />
@@ -237,6 +207,12 @@ export function ConversationList({
                   </div>}
         </div>
         <footer className="global-search-footer"><span>↑↓ 选择</span><span>Enter 打开</span><span>Esc 关闭</span></footer>
+      </section>}
+      {showCollectedUsers && <section className="collected-users-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowCollectedUsers(false); }}>
+        <div className="collected-users-dialog" role="dialog" aria-modal="true" aria-label="已收集用户">
+          <header><div><strong>已收集用户</strong><span>{collectedUsers.length} 位</span></div><button type="button" aria-label="关闭" onClick={() => setShowCollectedUsers(false)}><X size={18} /></button></header>
+          <div className="collected-users-list">{collectedUsers.length === 0 ? <p>暂未采集到用户记录。</p> : collectedUsers.map((user, index) => { const fallbackName = `采集用户 ${index + 1}`; const name = user.display_name?.trim() || fallbackName; return <div className="collected-user-row" key={user.source_instance_id}><span className="conversation-avatar slate">{name.slice(0, 2)}</span><span><strong>{name}</strong></span></div>; })}</div>
+        </div>
       </section>}
     </aside>
   );

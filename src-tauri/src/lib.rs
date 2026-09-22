@@ -5,19 +5,21 @@ use std::io::{Read, Write};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use archive_domain::{
     ArchiveBatchV1, ClientExportV1, CollectionScope, ConversationV1, EmployeeNoticeEvidence,
     ExternalContactConsent, MediaIntegrity, MessageType, ParticipantV1, RetentionDirective,
     SourceAdapter, SourceCandidate, SourceCapability,
 };
-use chrono::{Local, TimeZone, Utc};
+use chrono::{Local, NaiveTime, TimeDelta, TimeZone, Utc};
 use message_parser::{RawMessageRow, normalize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use source_windows::WindowsSourceAdapter;
-use tauri::State;
+use tauri::{Manager, State};
 use zeroize::{Zeroize, Zeroizing};
 
 mod sqlite3mc;
@@ -31,6 +33,7 @@ struct BootstrapResponse {
     organization_name: Option<String>,
     collection_notice: Option<String>,
     offline_export_enabled: bool,
+    collector_schedule: CollectionSchedule,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -54,6 +57,36 @@ struct EnterpriseCollectorConfig {
     data_redaction: bool,
     #[serde(default)]
     offline_export_enabled: bool,
+    #[serde(default)]
+    collector_schedule: CollectionSchedule,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CollectionScheduleMode {
+    #[default]
+    Disabled,
+    Interval,
+    Daily,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct CollectionSchedule {
+    #[serde(default)]
+    mode: CollectionScheduleMode,
+    #[serde(default = "default_schedule_interval_minutes")]
+    interval_minutes: u32,
+    #[serde(default = "default_schedule_daily_time")]
+    daily_time: String,
+}
+
+fn default_schedule_interval_minutes() -> u32 {
+    60
+}
+
+fn default_schedule_daily_time() -> String {
+    "02:00".into()
 }
 
 #[derive(Debug, Serialize)]
@@ -285,6 +318,19 @@ struct CollectionSummary {
     content_sha256_prefix: String,
 }
 
+impl From<&ClientExportV1> for CollectionSummary {
+    fn from(export: &ClientExportV1) -> Self {
+        Self {
+            export_id: export.export_id.to_string(),
+            generated_at: export.generated_at.to_rfc3339(),
+            message_count: export.message_count,
+            media_count: export.media_count,
+            missing_media_count: export.missing_media_count,
+            content_sha256_prefix: export.content_sha256.chars().take(12).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UploadResult {
@@ -299,10 +345,23 @@ struct OfflineExportResult {
     message_count: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct AppState {
-    discovered_sources: Mutex<BTreeMap<String, SourceCandidate>>,
-    latest_export: Mutex<Option<ClientExportV1>>,
+    discovered_sources: Arc<Mutex<BTreeMap<String, SourceCandidate>>>,
+    latest_export: Arc<Mutex<Option<ClientExportV1>>>,
+    collection_running: Arc<AtomicBool>,
+    schedule_status: Arc<Mutex<CollectorScheduleStatus>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorScheduleStatus {
+    running: bool,
+    last_attempt_at: Option<String>,
+    last_success_at: Option<String>,
+    last_error: Option<String>,
+    last_message_count: Option<u64>,
+    last_media_count: Option<u64>,
 }
 
 #[tauri::command]
@@ -312,6 +371,32 @@ fn bootstrap() -> Result<BootstrapResponse, CommandError> {
         organization_name: Some(config.organization_name),
         collection_notice: Some(config.collection_notice),
         offline_export_enabled: config.offline_export_enabled,
+        collector_schedule: config.collector_schedule,
+    })
+}
+
+#[tauri::command]
+fn get_collector_schedule_status(
+    state: State<'_, AppState>,
+) -> Result<CollectorScheduleStatus, CommandError> {
+    state
+        .schedule_status
+        .lock()
+        .map(|status| status.clone())
+        .map_err(|_| internal_error())
+}
+
+#[tauri::command]
+fn hide_collector_window(window: tauri::WebviewWindow) -> Result<(), CommandError> {
+    window.set_skip_taskbar(true).map_err(|_| CommandError {
+        code: "WINDOW_HIDE_FAILED",
+        message: "无法隐藏采集端窗口。".into(),
+        recoverable: true,
+    })?;
+    window.hide().map_err(|_| CommandError {
+        code: "WINDOW_HIDE_FAILED",
+        message: "无法隐藏采集端窗口。".into(),
+        recoverable: true,
     })
 }
 
@@ -332,6 +417,18 @@ async fn collect_source(
     state: State<'_, AppState>,
     source_id: String,
 ) -> Result<CollectionSummary, CommandError> {
+    if state
+        .collection_running
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(CommandError {
+            code: "COLLECTION_RUNNING",
+            message: "已有采集任务正在运行，请稍后重试。".into(),
+            recoverable: true,
+        });
+    }
+    let _run_guard = CollectionRunGuard(Arc::clone(&state.collection_running));
     let authorization = CollectionAuthorization {
         notice_version: LOCAL_NOTICE_VERSION.into(),
         notice_displayed_at: Utc::now(),
@@ -374,17 +471,18 @@ async fn collect_source(
     .await
     .map_err(|_| internal_error())?;
     let export = result?;
-    let summary = CollectionSummary {
-        export_id: export.export_id.to_string(),
-        generated_at: export.generated_at.to_rfc3339(),
-        message_count: export.message_count,
-        media_count: export.media_count,
-        missing_media_count: export.missing_media_count,
-        content_sha256_prefix: export.content_sha256.chars().take(12).collect(),
-    };
+    let summary = CollectionSummary::from(&export);
     *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
     let _ = fs::remove_dir_all(&root);
     Ok(summary)
+}
+
+struct CollectionRunGuard(Arc<AtomicBool>);
+
+impl Drop for CollectionRunGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Collects the currently signed-in local WeCom profile for the embedded
@@ -397,6 +495,7 @@ pub fn collect_local_export(
     collect_local_export_internal(
         include_media,
         data_redaction,
+        None,
         std::sync::Arc::new(|_, _, _| {}),
         None,
     )
@@ -405,15 +504,23 @@ pub fn collect_local_export(
 pub fn collect_local_export_with_progress(
     include_media: bool,
     data_redaction: bool,
+    since_unix_ms: Option<i64>,
     progress: wecom_archive_server::LocalCollectionProgressReporter,
     media_sink: wecom_archive_server::LocalCollectionMediaSink,
 ) -> Result<ClientExportV1, String> {
-    collect_local_export_internal(include_media, data_redaction, progress, Some(&media_sink))
+    collect_local_export_internal(
+        include_media,
+        data_redaction,
+        since_unix_ms,
+        progress,
+        Some(&media_sink),
+    )
 }
 
 fn collect_local_export_internal(
     include_media: bool,
     data_redaction: bool,
+    since_unix_ms: Option<i64>,
     progress: wecom_archive_server::LocalCollectionProgressReporter,
     media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
 ) -> Result<ClientExportV1, String> {
@@ -434,7 +541,7 @@ fn collect_local_export_internal(
             .any(|database| database.encrypted);
         let key = resolve_collection_key(&candidate, encrypted)?;
         progress(25, "创建快照", "正在只读复制数据库及一致性文件。");
-        let export = collect_candidate_with_options(
+        let export = collect_candidate_with_options_since(
             candidate,
             temporary_root.join("work"),
             key.as_ref(),
@@ -448,6 +555,7 @@ fn collect_local_export_internal(
             },
             media_sink,
             Some(&progress),
+            since_unix_ms,
         )?;
         progress(88, "整理采集结果", "正在校验消息及媒体内容完整性。");
         Ok::<_, CommandError>(if data_redaction {
@@ -665,48 +773,16 @@ fn load_enterprise_collector_config() -> Result<EnterpriseCollectorConfig, Comma
         message: "企业采集配置中的签名无效。".into(),
         recoverable: false,
     })?;
-    let signing_payload = format!(
-        "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-        config.organization_id,
-        config.organization_name,
-        config.collection_notice,
-        config.key_id,
-        config.public_key_hex,
-        "aes-256-gcm+rsa-oaep-sha256",
-        config.upload_url,
-        config.upload_token,
-        config.include_files,
-        config.include_images,
-        config.data_redaction,
-        config.offline_export_enabled
-    );
+    let signing_payload = collector_signing_payload(&config);
     let signature_valid = source_windows::enterprise_crypto::verify(
         &signing_public_key,
         signing_payload.as_bytes(),
         &signature,
     )
     .is_ok()
+        || verify_legacy_collector_signature(&config, &signing_public_key, &signature, true)
         || (!config.offline_export_enabled
-            && source_windows::enterprise_crypto::verify(
-                &signing_public_key,
-                format!(
-                    "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-                    config.organization_id,
-                    config.organization_name,
-                    config.collection_notice,
-                    config.key_id,
-                    config.public_key_hex,
-                    "aes-256-gcm+rsa-oaep-sha256",
-                    config.upload_url,
-                    config.upload_token,
-                    config.include_files,
-                    config.include_images,
-                    config.data_redaction
-                )
-                .as_bytes(),
-                &signature,
-            )
-            .is_ok());
+            && verify_legacy_collector_signature(&config, &signing_public_key, &signature, false));
     if !signature_valid {
         return Err(CommandError {
             code: "ENTERPRISE_CONFIG_SIGNATURE_INVALID",
@@ -730,6 +806,73 @@ fn load_enterprise_collector_config() -> Result<EnterpriseCollectorConfig, Comma
         });
     }
     Ok(config)
+}
+
+fn collector_signing_payload(config: &EnterpriseCollectorConfig) -> String {
+    format!(
+        "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        config.organization_id,
+        config.organization_name,
+        config.collection_notice,
+        config.key_id,
+        config.public_key_hex,
+        "aes-256-gcm+rsa-oaep-sha256",
+        config.upload_url,
+        config.upload_token,
+        config.include_files,
+        config.include_images,
+        config.data_redaction,
+        config.offline_export_enabled,
+        match config.collector_schedule.mode {
+            CollectionScheduleMode::Disabled => "disabled",
+            CollectionScheduleMode::Interval => "interval",
+            CollectionScheduleMode::Daily => "daily",
+        },
+        config.collector_schedule.interval_minutes,
+        config.collector_schedule.daily_time,
+    )
+}
+
+fn verify_legacy_collector_signature(
+    config: &EnterpriseCollectorConfig,
+    signing_public_key: &[u8],
+    signature: &[u8],
+    include_offline_export: bool,
+) -> bool {
+    let payload = if include_offline_export {
+        format!(
+            "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            config.organization_id,
+            config.organization_name,
+            config.collection_notice,
+            config.key_id,
+            config.public_key_hex,
+            "aes-256-gcm+rsa-oaep-sha256",
+            config.upload_url,
+            config.upload_token,
+            config.include_files,
+            config.include_images,
+            config.data_redaction,
+            config.offline_export_enabled,
+        )
+    } else {
+        format!(
+            "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            config.organization_id,
+            config.organization_name,
+            config.collection_notice,
+            config.key_id,
+            config.public_key_hex,
+            "aes-256-gcm+rsa-oaep-sha256",
+            config.upload_url,
+            config.upload_token,
+            config.include_files,
+            config.include_images,
+            config.data_redaction,
+        )
+    };
+    source_windows::enterprise_crypto::verify(signing_public_key, payload.as_bytes(), signature)
+        .is_ok()
 }
 
 fn create_enterprise_package(
@@ -1059,6 +1202,28 @@ fn collect_candidate_with_options(
     media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
     progress: Option<&wecom_archive_server::LocalCollectionProgressReporter>,
 ) -> Result<ClientExportV1, CommandError> {
+    collect_candidate_with_options_since(
+        candidate,
+        work_root,
+        key,
+        authorization,
+        media_options,
+        media_sink,
+        progress,
+        None,
+    )
+}
+
+fn collect_candidate_with_options_since(
+    candidate: SourceCandidate,
+    work_root: PathBuf,
+    key: Option<&SourceKey>,
+    authorization: CollectionAuthorization,
+    media_options: MediaCollectionOptions,
+    media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
+    progress: Option<&wecom_archive_server::LocalCollectionProgressReporter>,
+    since_unix_ms: Option<i64>,
+) -> Result<ClientExportV1, CommandError> {
     if candidate
         .databases
         .iter()
@@ -1098,6 +1263,7 @@ fn collect_candidate_with_options(
         media_options,
         media_sink,
         progress,
+        since_unix_ms,
     );
     cleanup_snapshot(&work_root, &receipt.snapshot_root);
     result
@@ -1111,6 +1277,7 @@ fn read_snapshot_export_with_options(
     media_options: MediaCollectionOptions,
     media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
     progress: Option<&wecom_archive_server::LocalCollectionProgressReporter>,
+    since_unix_ms: Option<i64>,
 ) -> Result<ClientExportV1, CommandError> {
     report_collection_progress(
         progress,
@@ -1179,15 +1346,21 @@ fn read_snapshot_export_with_options(
         .map_err(|_| unsupported_source_schema())?
         != 0;
     if has_normalized {
+        let query = if since_unix_ms.is_some() {
+            "SELECT source_message_id, conversation_id, sender_id, sent_at_unix_ms,
+                    outgoing, raw_type, payload_json, recalled
+             FROM messages WHERE sent_at_unix_ms >= ?1
+             ORDER BY sent_at_unix_ms, source_message_id"
+        } else {
+            "SELECT source_message_id, conversation_id, sender_id, sent_at_unix_ms,
+                    outgoing, raw_type, payload_json, recalled
+             FROM messages ORDER BY sent_at_unix_ms, source_message_id"
+        };
         let mut statement = connection
-            .prepare(
-                "SELECT source_message_id, conversation_id, sender_id, sent_at_unix_ms,
-                        outgoing, raw_type, payload_json, recalled
-                 FROM messages ORDER BY sent_at_unix_ms, source_message_id",
-            )
+            .prepare(query)
             .map_err(|_| unsupported_source_schema())?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(since_unix_ms), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1250,14 +1423,27 @@ fn read_snapshot_export_with_options(
         if !has_wecom {
             return Err(unsupported_source_schema());
         }
+        let source_cutoff = since_unix_ms.and_then(|cutoff| {
+            connection
+                .query_row("SELECT MAX(send_time) FROM message_table", [], |row| {
+                    Ok(sqlite_value_to_i64(row.get_ref(0)?))
+                })
+                .ok()
+                .flatten()
+                .map(|sample| source_timestamp_cutoff(cutoff, sample))
+        });
+        let query = if source_cutoff.is_some() {
+            "SELECT rowid, send_time, conversation_id, sender_id, content_type, content
+             FROM message_table WHERE send_time >= ?1 ORDER BY send_time, rowid"
+        } else {
+            "SELECT rowid, send_time, conversation_id, sender_id, content_type, content
+             FROM message_table ORDER BY send_time, rowid"
+        };
         let mut statement = connection
-            .prepare(
-                "SELECT rowid, send_time, conversation_id, sender_id, content_type, content
-                 FROM message_table ORDER BY send_time, rowid",
-            )
+            .prepare(query)
             .map_err(|_| unsupported_source_schema())?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(source_cutoff), |row| {
                 let row_id = sqlite_value_to_string(row.get_ref(0)?);
                 let send_time = sqlite_value_to_i64(row.get_ref(1)?).unwrap_or_default();
                 let sent_at_unix_ms = normalize_source_timestamp(send_time);
@@ -1281,6 +1467,9 @@ fn read_snapshot_export_with_options(
         for row in rows {
             let (source_message_id, conversation_id, sender_id, sent_at_unix_ms, raw_type, content) =
                 row.map_err(|_| unsupported_source_schema())?;
+            if since_unix_ms.is_some_and(|cutoff| sent_at_unix_ms < cutoff) {
+                continue;
+            }
             let payload = readable_message_payload(&raw_type, &content);
             let mut message = normalize(
                 RawMessageRow {
@@ -2450,6 +2639,15 @@ fn normalize_source_timestamp(value: i64) -> i64 {
     }
 }
 
+fn source_timestamp_cutoff(cutoff_unix_ms: i64, sample: i64) -> i64 {
+    match sample.unsigned_abs() {
+        0..=99_999_999_999 => cutoff_unix_ms / 1_000,
+        100_000_000_000..=99_999_999_999_999 => cutoff_unix_ms,
+        100_000_000_000_000..=99_999_999_999_999_999 => cutoff_unix_ms.saturating_mul(1_000),
+        _ => cutoff_unix_ms.saturating_mul(1_000_000),
+    }
+}
+
 fn resolve_media_metadata_with_options(
     candidate: &SourceCandidate,
     resolver: &MediaResolver,
@@ -2612,10 +2810,17 @@ pub fn run() {
             .resizable(true)
             .center()
             .build()?;
+            let scheduler_state = app.state::<AppState>().inner().clone();
+            std::thread::Builder::new()
+                .name("wecom-archive-collector-scheduler".into())
+                .spawn(move || collector_scheduler(scheduler_state))
+                .map_err(|_| "无法创建采集端后台任务。")?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap,
+            get_collector_schedule_status,
+            hide_collector_window,
             discover_sources,
             collect_source,
             upload_latest_enterprise,
@@ -2624,6 +2829,126 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("desktop runtime failed");
+}
+
+fn collector_scheduler(state: AppState) {
+    let config = match load_enterprise_collector_config() {
+        Ok(config) => config,
+        Err(_) => return,
+    };
+    let schedule = config.collector_schedule.clone();
+    let mut next_run = next_schedule_at(&schedule, Local::now());
+    loop {
+        std::thread::sleep(Duration::from_secs(15));
+        let Some(due_at) = next_run else {
+            return;
+        };
+        if Local::now() < due_at {
+            continue;
+        }
+        if state
+            .collection_running
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            let guard = CollectionRunGuard(Arc::clone(&state.collection_running));
+            if let Ok(mut status) = state.schedule_status.lock() {
+                status.running = true;
+                status.last_attempt_at = Some(Utc::now().to_rfc3339());
+                status.last_error = None;
+            }
+            let result = scheduled_collect_and_upload(&state, &config);
+            if let Ok(mut status) = state.schedule_status.lock() {
+                status.running = false;
+                match result {
+                    Ok(summary) => {
+                        status.last_success_at = Some(Utc::now().to_rfc3339());
+                        status.last_message_count = Some(summary.message_count);
+                        status.last_media_count = Some(summary.media_count);
+                    }
+                    Err(error) => status.last_error = Some(error.message),
+                }
+            }
+            drop(guard);
+        }
+        next_run = next_schedule_at(&schedule, Local::now());
+    }
+}
+
+fn next_schedule_at(
+    schedule: &CollectionSchedule,
+    now: chrono::DateTime<Local>,
+) -> Option<chrono::DateTime<Local>> {
+    match schedule.mode {
+        CollectionScheduleMode::Disabled => None,
+        CollectionScheduleMode::Interval => {
+            Some(now + TimeDelta::minutes(i64::from(schedule.interval_minutes.max(1))))
+        }
+        CollectionScheduleMode::Daily => {
+            let time = NaiveTime::parse_from_str(&schedule.daily_time, "%H:%M").ok()?;
+            let today = now.date_naive().and_time(time);
+            let candidate = today.and_local_timezone(Local).earliest()?;
+            if candidate > now {
+                Some(candidate)
+            } else {
+                (today + TimeDelta::days(1))
+                    .and_local_timezone(Local)
+                    .earliest()
+            }
+        }
+    }
+}
+
+fn scheduled_collect_and_upload(
+    state: &AppState,
+    config: &EnterpriseCollectorConfig,
+) -> Result<CollectionSummary, CommandError> {
+    let candidate = WindowsSourceAdapter
+        .discover(None)
+        .map_err(|error| CommandError {
+            code: "SOURCE_DISCOVERY_FAILED",
+            message: sanitize_error(&error.to_string()),
+            recoverable: true,
+        })?
+        .into_iter()
+        .next()
+        .ok_or(CommandError {
+            code: "SOURCE_NOT_FOUND",
+            message: "未发现可支持的本机企业微信数据。".into(),
+            recoverable: true,
+        })?;
+    let media_options = MediaCollectionOptions {
+        include_files: config.include_files,
+        include_images: config.include_images,
+    };
+    let root =
+        std::env::temp_dir().join(format!("wecom-archive-collector-{}", uuid::Uuid::new_v4()));
+    let encrypted = candidate
+        .databases
+        .iter()
+        .any(|database| database.encrypted);
+    let key = resolve_collection_key(&candidate, encrypted)?;
+    let result = (|| {
+        let export = collect_candidate_with_options(
+            candidate,
+            root.join("work"),
+            key.as_ref(),
+            CollectionAuthorization {
+                notice_version: LOCAL_NOTICE_VERSION.into(),
+                notice_displayed_at: Utc::now(),
+            },
+            media_options,
+            None,
+            None,
+        )?;
+        let package = create_enterprise_package(&export, config)?;
+        post_enterprise_package(&config.upload_url, config.upload_token.as_bytes(), &package)?;
+        let summary = CollectionSummary::from(&export);
+        *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
+        Ok::<_, CommandError>(summary)
+    })();
+    let _ = fs::remove_dir_all(root);
+    result
 }
 
 impl From<&SourceCandidate> for SafeSourceCandidate {
@@ -2861,6 +3186,20 @@ mod tests {
     }
 
     #[test]
+    fn converts_incremental_cutoffs_to_source_timestamp_units() {
+        let cutoff = 1_700_000_000_500_i64;
+        assert_eq!(
+            source_timestamp_cutoff(cutoff, 1_700_000_000),
+            1_700_000_000
+        );
+        assert_eq!(source_timestamp_cutoff(cutoff, cutoff), cutoff);
+        assert_eq!(
+            source_timestamp_cutoff(cutoff, 1_700_000_000_000_000),
+            cutoff.saturating_mul(1_000)
+        );
+    }
+
+    #[test]
     fn synthetic_plain_source_runs_through_snapshot_and_export_contract() {
         let directory = TestDirectory::new();
         let source_root = directory.0.join("source");
@@ -2924,7 +3263,7 @@ mod tests {
             .unwrap();
         let work_root = directory.0.join("work");
         let export =
-            collect_candidate(candidate, work_root.clone(), None, authorization()).unwrap();
+            collect_candidate(candidate.clone(), work_root.clone(), None, authorization()).unwrap();
 
         assert_eq!(export.schema_version, "client-export.v1");
         assert_eq!(export.message_count, 1);
@@ -2944,6 +3283,39 @@ mod tests {
         assert_eq!(
             export.conversations[0].display_name.as_deref(),
             Some("与测试成员的会话")
+        );
+        let connection = Connection::open(&message_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    "message-2",
+                    "conversation-1",
+                    "participant-1",
+                    1_700_000_001_000_i64,
+                    0_i64,
+                    "text",
+                    r#"{"text":"增量消息"}"#,
+                    0_i64,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let incremental = collect_candidate_with_options_since(
+            candidate,
+            directory.0.join("work-incremental"),
+            None,
+            authorization(),
+            MediaCollectionOptions::default(),
+            None,
+            None,
+            Some(1_700_000_000_500),
+        )
+        .unwrap();
+        assert_eq!(incremental.message_count, 1);
+        assert_eq!(
+            incremental.batches[0].messages[0].body_text.as_deref(),
+            Some("增量消息")
         );
         let serialized = serde_json::to_string(&export).unwrap();
         assert!(!serialized.contains("private"));
@@ -3168,6 +3540,43 @@ mod tests {
     }
 
     #[test]
+    fn raw_wxsqlite3_decryption_merges_committed_wal_pages() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("message.db");
+        let snapshot = directory.0.join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        let key = b"0123456789abcdef";
+        let connection = sqlite3mc::create_encrypted_derived_fixture(&source, key).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+                 INSERT INTO messages VALUES (1, '旧消息');
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 INSERT INTO messages VALUES (2, '最新消息');",
+            )
+            .unwrap();
+        let snapshot_database = snapshot.join("message.db");
+        fs::copy(&source, &snapshot_database).unwrap();
+        let source_wal = PathBuf::from(format!("{}-wal", source.display()));
+        let snapshot_wal = PathBuf::from(format!("{}-wal", snapshot_database.display()));
+        assert!(source_wal.is_file(), "fixture did not leave a WAL sidecar");
+        fs::copy(source_wal, snapshot_wal).unwrap();
+
+        let plain = sqlite3mc::decrypt_raw_wxsqlite3_database(&snapshot_database, key).unwrap();
+        let opened =
+            Connection::open_with_flags(plain, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let bodies = opened
+            .prepare("SELECT body FROM messages ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(bodies, vec!["旧消息", "最新消息"]);
+    }
+
+    #[test]
     fn derived_aes128_fixture_opens_only_as_a_derived_key() {
         let directory = TestDirectory::new();
         let path = directory.0.join("derived.db");
@@ -3295,6 +3704,7 @@ mod tests {
         let export = collect_local_export_internal(
             true,
             false,
+            None,
             std::sync::Arc::new(|_, _, _| {}),
             Some(&media_sink),
         )

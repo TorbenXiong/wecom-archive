@@ -43,7 +43,7 @@ describe("global message search", () => {
     }));
     vi.stubGlobal("fetch", fetchMock);
     const onOpenSearchResult = vi.fn();
-    const onCollectLocal = vi.fn();
+    const onOpenLocalCollection = vi.fn();
 
     const { container } = render(
       <ConversationList
@@ -55,7 +55,7 @@ describe("global message search", () => {
         onExport={vi.fn()}
         localCollectionAvailable
         collectingLocal={false}
-        onCollectLocal={onCollectLocal}
+        onOpenLocalCollection={onOpenLocalCollection}
         importing={false}
         onImport={vi.fn()}
       />,
@@ -66,7 +66,7 @@ describe("global message search", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "全局搜索聊天记录" }), { target: { value: "定位" } });
     expect(await screen.findByText("需要定位的记录")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining("/api/v1/search/messages?"),
+      expect.stringMatching(/\/api\/v1\/search\/messages\?.*sort=desc/),
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     fireEvent.click(screen.getByText("需要定位的记录"));
@@ -81,8 +81,8 @@ describe("global message search", () => {
     expect([...footer!.querySelectorAll(".conversation-footer-action")].map((action) => action.textContent)).toEqual(["采集本机", "导入", "导出"]);
   });
 
-  it("offers text-only and media collection modes before import", () => {
-    const onCollectLocal = vi.fn();
+  it("opens collection configuration before starting local collection", () => {
+    const onOpenLocalCollection = vi.fn();
     render(
       <ConversationList
         token="test-token"
@@ -93,18 +93,39 @@ describe("global message search", () => {
         onExport={vi.fn()}
         localCollectionAvailable
         collectingLocal={false}
-        onCollectLocal={onCollectLocal}
+        onOpenLocalCollection={onOpenLocalCollection}
         importing={false}
         onImport={vi.fn()}
       />,
     );
 
     fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: /仅文本消息/ }));
-    expect(onCollectLocal).toHaveBeenLastCalledWith(false);
+    expect(onOpenLocalCollection).toHaveBeenCalledOnce();
+  });
 
-    fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: /包含图片和文件/ }));
-    expect(onCollectLocal).toHaveBeenLastCalledWith(true);
+  it("keeps directory statistics visible while hiding content actions without super admin", () => {
+    render(
+      <ConversationList
+        token="test-token"
+        conversations={conversations}
+        selectedId="conversation-1"
+        superAdminEnabled={false}
+        collectedUsers={[{ source_instance_id: "source-1", display_name: "成员一" }]}
+        onSelect={vi.fn()}
+        onOpenSearchResult={vi.fn()}
+        onExport={vi.fn()}
+        localCollectionAvailable={false}
+        collectingLocal={false}
+        onOpenLocalCollection={vi.fn()}
+        importing={false}
+        onImport={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("已归档 2 条消息")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "打开全局搜索" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "导出" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /已收集 1 位用户聊天记录/ }));
+    expect(screen.getByRole("dialog", { name: "已收集用户" })).toHaveTextContent("成员一");
   });
 });

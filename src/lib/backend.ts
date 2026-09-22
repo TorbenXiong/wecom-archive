@@ -32,6 +32,15 @@ export interface OfflineExportResult {
   messageCount: number;
 }
 
+export interface CollectorScheduleStatus {
+  running: boolean;
+  lastAttemptAt?: string;
+  lastSuccessAt?: string;
+  lastError?: string;
+  lastMessageCount?: number;
+  lastMediaCount?: number;
+}
+
 /**
  * Tauri serializes command failures as a plain object, while browser preview
  * and older runtimes may reject with an Error or a JSON string. Keep the
@@ -73,6 +82,7 @@ const browserBootstrap: BootstrapState = {
   organizationName: "示例组织",
   collectionNotice: "仅采集您有权归档的企业微信记录。",
   offlineExportEnabled: true,
+  collectorSchedule: { mode: "disabled", intervalMinutes: 60, dailyTime: "02:00" },
 };
 
 export const backend = {
@@ -83,6 +93,16 @@ export const backend = {
   async bootstrap(): Promise<BootstrapState> {
     if (!this.isNative()) return browserBootstrap;
     return invoke<BootstrapState>("bootstrap");
+  },
+
+  async getCollectorScheduleStatus(): Promise<CollectorScheduleStatus> {
+    if (!this.isNative()) return { running: false };
+    return invoke<CollectorScheduleStatus>("get_collector_schedule_status");
+  },
+
+  async hideCollectorWindow(): Promise<void> {
+    if (!this.isNative()) return;
+    await invoke("hide_collector_window");
   },
 
   async discoverSources(selectedRoot?: string): Promise<SourceCandidate[]> {

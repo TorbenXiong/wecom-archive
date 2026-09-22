@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_int, c_void};
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use libsqlite3_sys::{SQLITE_OK, sqlite3};
 use rusqlite::{Connection, OpenFlags};
@@ -81,7 +81,7 @@ pub fn quick_verify_raw_wxsqlite3_page(page: &[u8], key: &[u8]) -> bool {
 pub fn decrypt_raw_wxsqlite3_database(
     path: &Path,
     key: &[u8],
-) -> Result<std::path::PathBuf, CipherDatabaseError> {
+) -> Result<PathBuf, CipherDatabaseError> {
     if key.len() != 16 {
         return Err(CipherDatabaseError::InvalidKey);
     }
@@ -127,7 +127,145 @@ pub fn decrypt_raw_wxsqlite3_database(
     }
     let output_path = path.with_extension("plain.sqlite");
     std::fs::write(&output_path, &output).map_err(|_| CipherDatabaseError::Open)?;
+    merge_raw_wxsqlite3_wal(path, &output_path, key, page_size)?;
     Ok(output_path)
+}
+
+fn merge_raw_wxsqlite3_wal(
+    encrypted_database: &Path,
+    plain_database: &Path,
+    key: &[u8],
+    page_size: usize,
+) -> Result<(), CipherDatabaseError> {
+    let wal_path = PathBuf::from(format!("{}-wal", encrypted_database.display()));
+    let Ok(wal) = std::fs::read(&wal_path) else {
+        return Ok(());
+    };
+    if wal.is_empty() {
+        return Ok(());
+    }
+    if wal.len() < 32 {
+        return Err(CipherDatabaseError::Open);
+    }
+
+    let magic = read_be_u32(&wal[0..4]);
+    if magic & !1 != 0x377f_0682 || read_be_u32(&wal[8..12]) as usize != page_size {
+        return Err(CipherDatabaseError::Open);
+    }
+    let checksum_endian = if magic & 1 == 1 {
+        ChecksumEndian::Big
+    } else {
+        ChecksumEndian::Little
+    };
+    let mut checksum = wal_checksum(checksum_endian, &wal[..24], (0, 0));
+    if checksum != (read_be_u32(&wal[24..28]), read_be_u32(&wal[28..32])) {
+        return Err(CipherDatabaseError::Open);
+    }
+
+    let salt = &wal[16..24];
+    let frame_size = 24_usize
+        .checked_add(page_size)
+        .ok_or(CipherDatabaseError::Open)?;
+    let mut frames = Vec::<(u32, Vec<u8>)>::new();
+    let mut committed_frame_count = 0_usize;
+    let mut committed_database_pages = 0_u32;
+    let mut offset = 32_usize;
+    while offset
+        .checked_add(frame_size)
+        .is_some_and(|end| end <= wal.len())
+    {
+        let frame = &wal[offset..offset + frame_size];
+        if &frame[8..16] != salt {
+            break;
+        }
+        checksum = wal_checksum(checksum_endian, &frame[..8], checksum);
+        checksum = wal_checksum(checksum_endian, &frame[24..], checksum);
+        if checksum != (read_be_u32(&frame[16..20]), read_be_u32(&frame[20..24])) {
+            break;
+        }
+        let page_number = read_be_u32(&frame[..4]);
+        if page_number == 0 || page_number > i32::MAX as u32 {
+            break;
+        }
+        let mut decrypted = vec![0_u8; page_size];
+        let status = unsafe {
+            sqlite3mc_decrypt_wxsqlite3_raw_page(
+                frame[24..].as_ptr(),
+                page_size as c_int,
+                page_number as c_int,
+                key.as_ptr(),
+                key.len() as c_int,
+                decrypted.as_mut_ptr(),
+            )
+        };
+        if status != SQLITE_OK {
+            return Err(CipherDatabaseError::InvalidKey);
+        }
+        frames.push((page_number, decrypted));
+        let database_pages = read_be_u32(&frame[4..8]);
+        if database_pages != 0 {
+            committed_frame_count = frames.len();
+            committed_database_pages = database_pages;
+        }
+        offset += frame_size;
+    }
+
+    if committed_frame_count == 0 {
+        return Ok(());
+    }
+    let final_len = u64::from(committed_database_pages)
+        .checked_mul(page_size as u64)
+        .ok_or(CipherDatabaseError::Open)?;
+    let mut output = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(plain_database)
+        .map_err(|_| CipherDatabaseError::Open)?;
+    output
+        .set_len(final_len)
+        .map_err(|_| CipherDatabaseError::Open)?;
+    for (page_number, page) in frames.into_iter().take(committed_frame_count) {
+        if page_number > committed_database_pages {
+            continue;
+        }
+        let page_offset = u64::from(page_number - 1)
+            .checked_mul(page_size as u64)
+            .ok_or(CipherDatabaseError::Open)?;
+        output
+            .seek(SeekFrom::Start(page_offset))
+            .and_then(|_| output.write_all(&page))
+            .map_err(|_| CipherDatabaseError::Open)?;
+    }
+    output.flush().map_err(|_| CipherDatabaseError::Open)
+}
+
+#[derive(Clone, Copy)]
+enum ChecksumEndian {
+    Little,
+    Big,
+}
+
+fn wal_checksum(endian: ChecksumEndian, bytes: &[u8], initial: (u32, u32)) -> (u32, u32) {
+    debug_assert!(bytes.len() >= 8 && bytes.len().is_multiple_of(8));
+    let mut first = initial.0;
+    let mut second = initial.1;
+    for words in bytes.chunks_exact(8) {
+        let left = match endian {
+            ChecksumEndian::Little => u32::from_le_bytes(words[..4].try_into().unwrap()),
+            ChecksumEndian::Big => u32::from_be_bytes(words[..4].try_into().unwrap()),
+        };
+        let right = match endian {
+            ChecksumEndian::Little => u32::from_le_bytes(words[4..].try_into().unwrap()),
+            ChecksumEndian::Big => u32::from_be_bytes(words[4..].try_into().unwrap()),
+        };
+        first = first.wrapping_add(left).wrapping_add(second);
+        second = second.wrapping_add(right).wrapping_add(first);
+    }
+    (first, second)
+}
+
+fn read_be_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes(bytes.try_into().expect("four-byte SQLite WAL field"))
 }
 
 #[derive(Debug, Error)]

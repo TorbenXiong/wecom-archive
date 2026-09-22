@@ -74,6 +74,15 @@ export interface BootstrapState {
   organizationName?: string;
   collectionNotice?: string;
   offlineExportEnabled?: boolean;
+  collectorSchedule?: CollectionSchedule;
+}
+
+export type CollectionScheduleMode = "disabled" | "interval" | "daily";
+
+export interface CollectionSchedule {
+  mode: CollectionScheduleMode;
+  intervalMinutes: number;
+  dailyTime: string;
 }
 
 export interface FilterState {
@@ -85,4 +94,4 @@ export interface FilterState {
 }
 
 export type ExportScope = "current_conversation" | "current_filter" | "entire_archive";
-export type ExportFormat = "json" | "csv" | "html" | "pdf";
+export type ExportFormat = "json" | "csv" | "html" | "md";

@@ -8,6 +8,7 @@ const accessToken = "0123456789abcdefghijklmnop";
 function installApiMock() {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
+    if (url.includes("/archive/updates")) return new Promise<Response>(() => undefined);
     if (url.includes("/archive/summary")) {
       return Response.json({ conversation_count: 1, message_count: 1, media_count: 0, revision: 1, local_collection_available: true });
     }
@@ -39,11 +40,29 @@ function installApiMock() {
         raw_type: "text",
       }]);
     }
+    if (url.includes("/collection-schedules")) {
+      return Response.json({ localPlans: [], collectorPlans: [] });
+    }
     if (url.includes("/enterprise/config")) {
       const body = init?.body ? JSON.parse(String(init.body)) as { keyId?: string } : undefined;
-      return Response.json({ configured: false, organizationId: "org-1", organizationName: "", collectionNotice: "加密传输本机企业微信聊天记录到服务端", uploadUrl: "http://127.0.0.1:8787", keyId: body?.keyId || "key-1", includeMedia: false, dataRedaction: false, offlineExportEnabled: false });
+      return Response.json({ configured: false, organizationId: "org-1", organizationName: "", collectionNotice: "加密传输本机企业微信聊天记录到服务端", uploadUrl: "http://127.0.0.1:9812", keyId: body?.keyId || "key-1", includeMedia: false, dataRedaction: false, offlineExportEnabled: false });
     }
     if (url.includes("/enterprise/collectors")) {
+      if (!init?.method || init.method === "GET") {
+        return Response.json({ collectors: [{
+          collectorId: "collector-1",
+          fileName: "key-1-collector.exe",
+          organizationName: "本企业",
+          uploadUrl: "http://127.0.0.1:9812",
+          includeMedia: true,
+          dataRedaction: false,
+          offlineExportEnabled: false,
+          schedule: { mode: "interval", intervalMinutes: 60, dailyTime: "02:00" },
+          createdAt: "2026-09-21T08:00:00Z",
+          lastUploadAt: "2026-09-21T09:00:00Z",
+          executableAvailable: true,
+        }] });
+      }
       return Response.json({ fileName: "key-1.exe", directory: "D:\\serverData\\collectors", organizationId: "org-1", keyId: "key-1", collectorId: "collector-1", artifact: "{}", executableGenerated: true });
     }
     if (url.includes("/imports/enterprise")) {
@@ -82,13 +101,18 @@ afterEach(() => {
 });
 
 describe("archive workspace", () => {
-  it("opens the export directory from both page toolbars and shows failures", async () => {
+  it("shows the export directory in the export dialog instead of the conversation toolbar", async () => {
     installApiMock();
     render(<App />);
     await connect();
+    expect(screen.queryByRole("button", { name: "导出目录" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "导出" }));
+    const dialog = screen.getByRole("dialog", { name: "准备导出" });
+    const cornerActions = screen.getByRole("button", { name: "导出目录" }).parentElement;
+    expect(cornerActions).toHaveClass("export-dialog-corner-actions");
+    expect(dialog).toContainElement(cornerActions);
     fireEvent.click(screen.getByRole("button", { name: "导出目录" }));
     await waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith("/exports/open-directory"))).toBe(true));
-    fireEvent.click(screen.getByRole("button", { name: "本机" }));
     vi.mocked(fetch).mockResolvedValueOnce(Response.json({ message: "无法打开导出目录。" }, { status: 500 }));
     fireEvent.click(screen.getByRole("button", { name: "导出目录" }));
     expect(await screen.findByText("无法打开导出目录。")).toBeInTheDocument();
@@ -241,11 +265,34 @@ describe("archive workspace", () => {
     expect(screen.queryByText("采集前向员工展示，请清晰说明用途和范围。")).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "采集端配置" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "生成采集端" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "采集端列表" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "采集端目录" })).toBeInTheDocument();
+    const collectorActions = screen.getByRole("button", { name: "生成采集端" }).closest("footer");
+    expect([...(collectorActions?.querySelectorAll("button") ?? [])].map((button) => button.textContent)).toEqual(["采集端目录", "采集端列表", "生成采集端"]);
+    fireEvent.click(screen.getByRole("button", { name: "采集端列表" }));
+    const collectorList = await screen.findByRole("dialog", { name: "已生成采集端" });
+    expect(collectorList).toHaveTextContent("key-1-collector.exe");
+    expect(collectorList).toHaveTextContent("每 60 分钟");
+    expect(collectorList).toHaveTextContent("包含图片和文件 · 文件可用");
+    fireEvent.click(screen.getByRole("button", { name: "关闭采集端列表" }));
     expect(screen.getByLabelText("加密密钥：")).toHaveValue("key-1");
     expect(screen.getByLabelText("访问令牌：")).toHaveValue(accessToken);
     expect(screen.getByRole("button", { name: "重新生成加密密钥" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重新生成服务端访问令牌" })).toBeInTheDocument();
     expect(screen.getByLabelText("支持离线导出")).toBeInTheDocument();
+    expect(screen.getByText("采集计划", { selector: ".collector-continuous-row strong" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /保存计划/ })).not.toBeInTheDocument();
+    expect(screen.queryByText("触发方式")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("按间隔"));
+    fireEvent.click(screen.getByLabelText("按间隔"));
+    expect(screen.getByLabelText("按间隔")).not.toBeChecked();
+    fireEvent.click(screen.getByLabelText("按间隔"));
+    expect(vi.mocked(fetch).mock.calls.some(([url, init]) => String(url).includes("/enterprise/config") && init?.method === "PUT")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "生成采集端" }));
+    await waitFor(() => {
+      const configCall = vi.mocked(fetch).mock.calls.find(([url, init]) => String(url).includes("/enterprise/config") && init?.method === "PUT");
+      expect(JSON.parse(String(configCall?.[1]?.body))).toMatchObject({ collectorSchedule: { mode: "interval", intervalMinutes: 60, dailyTime: "02:00" } });
+    });
     expect(screen.getByRole("button", { name: "生成采集端" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "保存配置" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "导出记录" })).not.toBeInTheDocument();
@@ -269,7 +316,8 @@ describe("archive workspace", () => {
     render(<App />);
     await connect();
     fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: /仅文本消息/ }));
+    expect(await screen.findByRole("dialog", { name: "本机采集" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "仅采集文本" }));
     expect(screen.getByRole("dialog", { name: "正在采集本机数据" })).toBeInTheDocument();
     expect(screen.getByRole("progressbar", { name: "本机采集进度" })).toBeInTheDocument();
     expect(await screen.findByText("本机采集完成：新增 3 条，更新 1 条消息。")).toBeInTheDocument();
@@ -281,7 +329,7 @@ describe("archive workspace", () => {
     render(<App />);
     await connect();
     fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
-    fireEvent.click(screen.getByRole("menuitem", { name: /包含图片和文件/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "包含全内容" }));
     expect(await screen.findByText("本机采集完成：新增 3 条，更新 1 条消息；采集媒体 5 项，1 项源文件未找到。")).toBeInTheDocument();
     expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/collections/local?include_media=true"))).toBe(true);
   });
@@ -291,11 +339,14 @@ describe("archive workspace", () => {
     render(<App />);
     await connect();
     const navigation = screen.getByRole("navigation", { name: "主导航" });
-    expect([...navigation.querySelectorAll("button")].map((button) => button.textContent)).toEqual(["本机", "采集端", "会话", "设置"]);
+    expect([...navigation.querySelectorAll("button")].map((button) => button.textContent)).toEqual(["本机", "采集端", "会话", "采集计划", "设置"]);
+    expect(screen.queryByText("离线运行")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "本机" }));
     expect(await screen.findByRole("heading", { name: "快速导出本机记录", level: 2 })).toBeInTheDocument();
     expect(screen.queryByText("本机数据")).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "本机导出", level: 1 })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "MD" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "PDF" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "CSV" }));
     const redaction = screen.getByRole("checkbox", { name: "数据脱敏" });
     const simplify = screen.getByRole("checkbox", { name: "简化信息" });
@@ -307,13 +358,19 @@ describe("archive workspace", () => {
     expect(simplify.closest("label")?.getAttribute("title")).toContain("去掉系统 ID");
     expect(pretty.closest("label")?.getAttribute("title")).toContain("易读排版");
     expect(redaction.closest(".export-presentation-options")?.querySelectorAll("label")).toHaveLength(3);
+    const configRow = redaction.closest(".local-export-config-row");
+    expect(configRow).not.toBeNull();
+    expect(configRow).toContainElement(screen.getByRole("combobox", { name: "会话时间排序" }));
+    expect(configRow).toContainElement(screen.getByRole("combobox", { name: "会话内容时间排序" }));
+    expect(screen.getByRole("combobox", { name: "会话时间排序" })).toHaveValue("descending");
+    expect(screen.getByRole("combobox", { name: "会话内容时间排序" })).toHaveValue("descending");
     expect(screen.queryByText(/简化 JSON 仅供阅读/)).not.toBeInTheDocument();
     expect(screen.queryByText(/关闭时紧凑输出/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "开始导出" }));
     expect(await screen.findByText(/本机导出完成：local-export.csv/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "打开导出目录" })).toBeInTheDocument();
     const exportCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith("/exports/local"));
-    expect(JSON.parse(String(exportCall?.[1]?.body))).toEqual({ format: "csv", dataRedaction: true, simplify: true, pretty: true });
+    expect(JSON.parse(String(exportCall?.[1]?.body))).toEqual({ format: "csv", dataRedaction: true, simplify: true, pretty: true, conversationOrder: "descending", messageOrder: "descending" });
   });
 
   it.each([[false, false], [true, false], [false, true], [true, true]])("sends independent server export options simplify=%s pretty=%s", async (simplify, pretty) => {
@@ -321,6 +378,8 @@ describe("archive workspace", () => {
     render(<App />);
     await connect();
     fireEvent.click(screen.getByRole("button", { name: "导出" }));
+    expect(screen.getByRole("button", { name: "MD" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "PDF" })).not.toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: "简化信息" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "美化信息" })).toBeChecked();
     if (!simplify) fireEvent.click(screen.getByRole("checkbox", { name: "简化信息" }));
@@ -330,6 +389,20 @@ describe("archive workspace", () => {
       const exportCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith("/exports"));
       expect(exportCall).toBeDefined();
       expect(JSON.parse(String(exportCall?.[1]?.body))).toMatchObject({ simplify, pretty, dataRedaction: true });
+      expect(JSON.parse(String(exportCall?.[1]?.body))).toMatchObject({ conversationOrder: "descending", messageOrder: "descending" });
+    });
+  });
+
+  it("sends independent conversation and message time orders", async () => {
+    installApiMock();
+    render(<App />);
+    await connect();
+    fireEvent.click(screen.getByRole("button", { name: "导出" }));
+    fireEvent.change(screen.getByLabelText("会话内容时间排序"), { target: { value: "ascending" } });
+    fireEvent.click(screen.getByRole("button", { name: "开始导出" }));
+    await waitFor(() => {
+      const exportCall = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith("/exports"));
+      expect(JSON.parse(String(exportCall?.[1]?.body))).toMatchObject({ conversationOrder: "descending", messageOrder: "ascending" });
     });
   });
 
@@ -346,17 +419,12 @@ describe("archive workspace", () => {
   it("reloads the selected conversation when a collector upload changes the archive revision", async () => {
     let revision = 1;
     let messageRequests = 0;
-    let poll: (() => Promise<unknown>) | undefined;
-    const realSetInterval = window.setInterval.bind(window);
-    vi.spyOn(window, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
-      if (timeout === 5000) {
-        poll = handler as () => Promise<unknown>;
-        return 1;
-      }
-      return realSetInterval(handler, timeout, ...args);
-    }) as typeof window.setInterval);
+    let resolveUpdate: ((response: Response) => void) | undefined;
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
+      if (url.includes("/archive/updates")) {
+        return new Promise<Response>((resolve) => { resolveUpdate = resolve; });
+      }
       if (url.includes("/archive/summary")) return Response.json({ conversation_count: 1, message_count: revision, media_count: 0, revision, local_collection_available: false });
       if (url.includes("/conversations")) return Response.json([{ conversation_id: "conversation-1", display_name: "自动刷新会话", conversation_type: "group", last_message_at: "2026-09-15T10:00:00Z", message_count: revision, media_count: 0, participant_count: 3 }]);
       if (url.includes("/messages/count")) return Response.json({ total: revision });
@@ -374,9 +442,9 @@ describe("archive workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "会话" }));
     await screen.findByRole("heading", { name: "自动刷新会话", level: 1 });
     expect(await screen.findByText("刷新前消息")).toBeInTheDocument();
+    await waitFor(() => expect(resolveUpdate).toBeDefined());
     revision = 2;
-    expect(poll).toBeDefined();
-    await act(async () => { await poll?.(); });
+    await act(async () => { resolveUpdate?.(Response.json({ revision: 2 })); });
     await waitFor(() => expect(messageRequests).toBeGreaterThan(1));
     expect(await screen.findByText("采集端上传后的消息")).toBeInTheDocument();
   });

@@ -6,6 +6,15 @@ import { backend } from "../lib/backend";
 afterEach(() => vi.restoreAllMocks());
 
 describe("collector", () => {
+  it("performs the first automatic upload immediately when a continuous plan is enabled", async () => {
+    vi.spyOn(backend, "bootstrap").mockResolvedValue({ organizationName: "计划企业", collectionNotice: "测试告知", offlineExportEnabled: false, collectorSchedule: { mode: "interval", intervalMinutes: 15, dailyTime: "02:00" } });
+    const uploadLatest = vi.spyOn(backend, "uploadLatest").mockResolvedValue({ messageCount: 238 });
+    render(<ClientApp />);
+
+    expect(await screen.findByText(/完成首次自动上传/)).toBeInTheDocument();
+    expect(uploadLatest).toHaveBeenCalledOnce();
+  });
+
   it("automatically prepares local data and uploads it to the archive workspace", async () => {
     const uploadLatest = vi.spyOn(backend, "uploadLatest");
     render(<ClientApp />);

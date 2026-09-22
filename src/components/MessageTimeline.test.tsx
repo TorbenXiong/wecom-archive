@@ -59,7 +59,7 @@ describe("message timeline", () => {
     mediaApi.openMediaFile.mockClear();
   });
 
-  it("shows messages in chronological order and offers floating jumps to both edges", () => {
+  it("shows messages in descending time order by default and offers floating jumps to both edges", () => {
     const { container } = render(
         <MessageTimeline
           token="test-token"
@@ -78,8 +78,8 @@ describe("message timeline", () => {
       fireEvent.scroll(scroll!);
       expect(
         [...container.querySelectorAll("[data-message-id]")].map((item) => item.getAttribute("data-message-id")),
-      ).toEqual(["older-message", "newer-message"]);
-      expect(screen.getByRole("button", { name: "按时间升序" })).toBeInTheDocument();
+      ).toEqual(["newer-message", "older-message"]);
+      expect(screen.getByRole("button", { name: "按时间降序" })).toBeInTheDocument();
 
       expect(screen.getByRole("button", { name: "到最上面" })).toBeInTheDocument();
       const jumpButton = screen.getByRole("button", { name: "到最下面" });
@@ -97,7 +97,7 @@ describe("message timeline", () => {
     expect(container.querySelector(".sender-avatar")).toBeNull();
     const firstMeta = container.querySelector(".message-meta");
     expect(firstMeta).not.toBeNull();
-    expect(firstMeta?.querySelector(".sender-name")).toHaveTextContent("成员二");
+    expect(firstMeta?.querySelector(".sender-name")).toHaveTextContent("成员一");
     expect(firstMeta?.querySelector(".message-time")?.textContent).toMatch(/^2026-09-15.+:\d{2}:00$/);
   });
 
