@@ -211,7 +211,7 @@ struct EnterpriseConfig {
     include_files: bool,
     #[serde(default)]
     include_images: bool,
-    #[serde(default)]
+    #[serde(default = "default_data_redaction")]
     data_redaction: bool,
     #[serde(default)]
     offline_export_enabled: bool,
@@ -317,6 +317,10 @@ fn default_super_admin_enabled() -> bool {
     true
 }
 
+fn default_data_redaction() -> bool {
+    true
+}
+
 fn default_schedule_daily_time() -> String {
     "02:00".into()
 }
@@ -341,7 +345,7 @@ struct EnterpriseCollectorRecord {
     upload_url: String,
     #[serde(default)]
     include_media: bool,
-    #[serde(default)]
+    #[serde(default = "default_data_redaction")]
     data_redaction: bool,
     #[serde(default)]
     offline_export_enabled: bool,
@@ -520,6 +524,7 @@ struct ImportResponse {
     revised: u64,
     media_count: u64,
     missing_media_count: u64,
+    completed_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -754,7 +759,7 @@ fn start_desktop_server_inner(
     local_collector: Option<LocalCollector>,
 ) -> Result<DesktopServer, String> {
     let (shutdown_sender, shutdown_receiver) = std::sync::mpsc::channel();
-    let collector_template = std::env::current_exe().ok();
+    let collector_template = find_collector_template();
     let prepared = prepare_server(collector_template, local_collector)?;
     let page_url = format!(
         "http://{}/#token={}",
@@ -1151,7 +1156,7 @@ fn new_enterprise_config() -> EnterpriseConfig {
         upload_url: default_upload_url(),
         include_files: false,
         include_images: false,
-        data_redaction: false,
+        data_redaction: true,
         offline_export_enabled: false,
         super_admin_enabled: default_super_admin_enabled(),
         local_collection_plans: Vec::new(),
@@ -1709,7 +1714,7 @@ async fn open_collector_directory(
     authorize(&headers, &state.token_sha256)?;
     let directory = state.data_root.join("collectors");
     if !directory.is_dir() {
-        return Err(ApiError::store());
+        return Err(ApiError::collector_directory_missing());
     }
     #[cfg(windows)]
     {
@@ -1753,11 +1758,7 @@ fn collector_signing_payload(
 }
 
 fn find_collector_template() -> Option<PathBuf> {
-    let executable = std::env::current_exe()
-        .ok()?
-        .parent()?
-        .join("WeComArchive.exe");
-    executable.is_file().then_some(executable)
+    std::env::current_exe().ok().filter(|path| path.is_file())
 }
 
 async fn import_enterprise(
@@ -1819,7 +1820,7 @@ async fn import_enterprise(
     let export = archive_transfer::validate_enterprise_plaintext(&package, &plaintext)
         .map_err(|_| ApiError::invalid_export())?;
     let result = ingest_export(&state, export).await;
-    if result.is_ok()
+    if let Ok(response) = &result
         && let Some(collector_id) = collector_id
         && let Ok(mut config) = state.enterprise_config.lock()
         && let Some(collector) = config
@@ -1827,7 +1828,7 @@ async fn import_enterprise(
             .iter_mut()
             .find(|collector| collector.collector_id == collector_id)
     {
-        collector.last_upload_at = Some(Utc::now().to_rfc3339());
+        collector.last_upload_at = Some(response.0.completed_at.clone());
         let _ = persist_enterprise_config(&state.data_root, &config);
     }
     result
@@ -1885,7 +1886,11 @@ async fn ingest_export(
     })
     .await
     .map_err(|_| ApiError::store())??;
-    let _ = state.archive_update.send(revision);
+    // Keep the latest revision even when the workspace page is not currently
+    // listening. `send` drops the value when there are no receivers, which
+    // made the first collector upload invisible until a later upload.
+    state.archive_update.send_replace(revision);
+    let completed_at = Utc::now().to_rfc3339();
     Ok(Json(ImportResponse {
         export_id,
         batch_count,
@@ -1894,6 +1899,7 @@ async fn ingest_export(
         revised: summary.revised,
         media_count,
         missing_media_count,
+        completed_at,
     }))
 }
 
@@ -3449,6 +3455,17 @@ impl ApiError {
             body: ErrorResponse {
                 code: "ARCHIVE_STORE_FAILED",
                 message: "服务端归档写入失败，诊断信息已脱敏。".into(),
+                recoverable: true,
+            },
+        }
+    }
+
+    fn collector_directory_missing() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: ErrorResponse {
+                code: "COLLECTOR_DIRECTORY_MISSING",
+                message: "暂未生成过采集端，请先生成采集端。".into(),
                 recoverable: true,
             },
         }

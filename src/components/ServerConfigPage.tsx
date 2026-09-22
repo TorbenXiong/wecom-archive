@@ -37,7 +37,8 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
   const [keyDraft, setKeyDraft] = useState("");
   const [tokenDraft, setTokenDraft] = useState(token);
   const [includeMedia, setIncludeMedia] = useState(false);
-  const [dataRedaction, setDataRedaction] = useState(false);
+  const [dataRedaction, setDataRedaction] = useState(true);
+  const [loadedToken, setLoadedToken] = useState<string>();
   const [offlineExportEnabled, setOfflineExportEnabled] = useState(false);
   const [collectorSchedule, setCollectorSchedule] = useState<CollectionSchedule>(DEFAULT_COLLECTION_SCHEDULE);
   const [status, setStatus] = useState<string>();
@@ -48,20 +49,43 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
   const [collectors, setCollectors] = useState<CollectorPlan[]>([]);
 
   useEffect(() => {
+    let cancelled = false;
     getEnterpriseConfig(token)
       .then((config) => {
+        if (cancelled) return;
         setOrganizationName(config.organizationName || DEFAULT_ORGANIZATION_NAME);
         setCollectionNotice(config.collectionNotice);
         setUploadUrl(config.uploadUrl || "http://127.0.0.1:9812");
         setKeyId(config.keyId);
         setKeyDraft(config.keyId);
         setIncludeMedia(config.includeMedia ?? false);
-        setDataRedaction(config.dataRedaction ?? false);
+        setDataRedaction(config.dataRedaction ?? true);
         setOfflineExportEnabled(config.offlineExportEnabled ?? false);
         setCollectorSchedule(config.collectorSchedule ?? DEFAULT_COLLECTION_SCHEDULE);
+        try {
+          const draft = JSON.parse(sessionStorage.getItem(`collector-config-draft:${token}`) || "null");
+          if (draft && typeof draft === "object") {
+            if (typeof draft.organizationName === "string") setOrganizationName(draft.organizationName);
+            if (typeof draft.collectionNotice === "string") setCollectionNotice(draft.collectionNotice);
+            if (typeof draft.uploadUrl === "string") setUploadUrl(draft.uploadUrl);
+            if (typeof draft.includeMedia === "boolean") setIncludeMedia(draft.includeMedia);
+            if (typeof draft.dataRedaction === "boolean") setDataRedaction(draft.dataRedaction);
+            if (typeof draft.offlineExportEnabled === "boolean") setOfflineExportEnabled(draft.offlineExportEnabled);
+            if (draft.collectorSchedule) setCollectorSchedule(draft.collectorSchedule);
+          }
+        } catch { /* Ignore an invalid navigation draft and use the server config. */ }
+        setLoadedToken(token);
       })
-      .catch(() => showStatus("无法读取采集端配置。", "error"));
+      .catch(() => { if (!cancelled) showStatus("无法读取采集端配置。", "error"); });
+    return () => { cancelled = true; };
   }, [token]);
+
+  useEffect(() => {
+    if (loadedToken !== token) return;
+    try {
+      sessionStorage.setItem(`collector-config-draft:${token}`, JSON.stringify({ organizationName, collectionNotice, uploadUrl, includeMedia, dataRedaction, offlineExportEnabled, collectorSchedule }));
+    } catch { /* Draft persistence is best effort. */ }
+  }, [loadedToken, token, organizationName, collectionNotice, uploadUrl, includeMedia, dataRedaction, offlineExportEnabled, collectorSchedule]);
 
   useEffect(() => {
     setTokenDraft(token);
@@ -123,7 +147,15 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
   });
 
   const openCollectorDirectory = () => run(async () => {
-    await openEnterpriseCollectorDirectory(token);
+    try {
+      await openEnterpriseCollectorDirectory(token);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("暂未生成过采集端")) {
+        showStatus("暂未生成过采集端，请先生成采集端。", "error");
+        return;
+      }
+      throw error;
+    }
     showStatus("已打开采集端目录。");
   });
 

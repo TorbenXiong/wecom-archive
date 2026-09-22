@@ -19,6 +19,8 @@ use message_parser::{RawMessageRow, normalize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use source_windows::WindowsSourceAdapter;
+use tauri::menu::{MenuBuilder, MenuItem};
+use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, State};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -53,7 +55,7 @@ struct EnterpriseCollectorConfig {
     include_files: bool,
     #[serde(default)]
     include_images: bool,
-    #[serde(default)]
+    #[serde(default = "default_data_redaction")]
     data_redaction: bool,
     #[serde(default)]
     offline_export_enabled: bool,
@@ -83,6 +85,10 @@ struct CollectionSchedule {
 
 fn default_schedule_interval_minutes() -> u32 {
     60
+}
+
+fn default_data_redaction() -> bool {
+    true
 }
 
 fn default_schedule_daily_time() -> String {
@@ -144,10 +150,8 @@ impl MediaResolver {
             for root in &roots {
                 index_media_directory(root, root, 0, &mut files_by_key);
             }
-            for paths in files_by_key.values_mut() {
-                paths.sort();
-                paths.dedup();
-            }
+            // resolve() only needs the first authorized hit. Sorting every
+            // bucket made each scheduled run pay an avoidable O(n log n) cost.
         }
         Self {
             roots,
@@ -337,6 +341,12 @@ struct UploadResult {
     message_count: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnterpriseUploadResponse {
+    completed_at: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OfflineExportResult {
@@ -350,7 +360,9 @@ struct AppState {
     discovered_sources: Arc<Mutex<BTreeMap<String, SourceCandidate>>>,
     latest_export: Arc<Mutex<Option<ClientExportV1>>>,
     collection_running: Arc<AtomicBool>,
+    scheduler_shutdown: Arc<AtomicBool>,
     schedule_status: Arc<Mutex<CollectorScheduleStatus>>,
+    uploaded_messages: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -362,6 +374,45 @@ struct CollectorScheduleStatus {
     last_error: Option<String>,
     last_message_count: Option<u64>,
     last_media_count: Option<u64>,
+    uploaded_count: u64,
+    next_run_at: Option<String>,
+}
+
+fn message_fingerprints(export: &ClientExportV1) -> BTreeMap<String, String> {
+    export
+        .batches
+        .iter()
+        .flat_map(|batch| &batch.messages)
+        .filter_map(|message| {
+            let mut stable = message.clone();
+            stable.collection_batch_id = uuid::Uuid::nil();
+            serde_json::to_vec(&stable).ok().map(|bytes| {
+                (
+                    message.stable_message_id.clone(),
+                    hex::encode(Sha256::digest(bytes)),
+                )
+            })
+        })
+        .collect()
+}
+
+fn has_upload_changes(state: &AppState, export: &ClientExportV1) -> bool {
+    let current = message_fingerprints(export);
+    state.uploaded_messages.lock().map_or(true, |uploaded| {
+        current
+            .iter()
+            .any(|(id, fingerprint)| uploaded.get(id) != Some(fingerprint))
+    })
+}
+
+fn record_upload_success(state: &AppState, export: &ClientExportV1) {
+    let current = message_fingerprints(export);
+    if let (Ok(mut uploaded), Ok(mut status)) =
+        (state.uploaded_messages.lock(), state.schedule_status.lock())
+    {
+        uploaded.extend(current);
+        status.uploaded_count = uploaded.len() as u64;
+    }
 }
 
 #[tauri::command]
@@ -401,14 +452,20 @@ fn hide_collector_window(window: tauri::WebviewWindow) -> Result<(), CommandErro
 }
 
 #[tauri::command]
-fn discover_sources(state: State<'_, AppState>) -> Result<Vec<SafeSourceCandidate>, CommandError> {
-    let candidates = WindowsSourceAdapter
-        .discover(None)
-        .map_err(|error| CommandError {
-            code: "SOURCE_DISCOVERY_FAILED",
-            message: sanitize_error(&error.to_string()),
-            recoverable: true,
-        })?;
+async fn discover_sources(
+    state: State<'_, AppState>,
+) -> Result<Vec<SafeSourceCandidate>, CommandError> {
+    let candidates = tauri::async_runtime::spawn_blocking(|| {
+        WindowsSourceAdapter
+            .discover(None)
+            .map_err(|error| CommandError {
+                code: "SOURCE_DISCOVERY_FAILED",
+                message: sanitize_error(&error.to_string()),
+                recoverable: true,
+            })
+    })
+    .await
+    .map_err(|_| internal_error())??;
     store_candidates(&state, candidates)
 }
 
@@ -444,36 +501,38 @@ async fn collect_source(
             message: "数据源授权已失效，请重新发现。".into(),
             recoverable: true,
         })?;
-    let config = load_enterprise_collector_config()?;
-    let media_options = MediaCollectionOptions {
-        include_files: config.include_files,
-        include_images: config.include_images,
-    };
-    let root =
-        std::env::temp_dir().join(format!("wecom-archive-collector-{}", uuid::Uuid::new_v4()));
-    let encrypted = candidate
-        .databases
-        .iter()
-        .any(|database| database.encrypted);
-    let key = resolve_collection_key(&candidate, encrypted)?;
-    let work_root = root.join("work");
+    // 密钥探针、快照复制和数据库读取都可能耗时较长，必须全部放到阻塞线程，
+    // 否则 Tauri 主线程会被拖住，窗口表现为“未响应”或只显示空白页。
     let result = tauri::async_runtime::spawn_blocking(move || {
-        collect_candidate_with_options(
+        let config = load_enterprise_collector_config()?;
+        let media_options = MediaCollectionOptions {
+            include_files: config.include_files,
+            include_images: config.include_images,
+        };
+        let root =
+            std::env::temp_dir().join(format!("wecom-archive-collector-{}", uuid::Uuid::new_v4()));
+        let encrypted = candidate
+            .databases
+            .iter()
+            .any(|database| database.encrypted);
+        let key = resolve_collection_key(&candidate, encrypted)?;
+        let result = collect_candidate_with_options(
             candidate,
-            work_root,
+            root.join("work"),
             key.as_ref(),
             authorization,
             media_options,
             None,
             None,
-        )
+        );
+        let _ = fs::remove_dir_all(root);
+        result
     })
     .await
     .map_err(|_| internal_error())?;
     let export = result?;
     let summary = CollectionSummary::from(&export);
     *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
-    let _ = fs::remove_dir_all(&root);
     Ok(summary)
 }
 
@@ -569,23 +628,59 @@ fn collect_local_export_internal(
 }
 
 #[tauri::command]
-fn upload_latest_enterprise(state: State<'_, AppState>) -> Result<UploadResult, CommandError> {
-    let config = load_enterprise_collector_config()?;
-    let export = state
-        .latest_export
-        .lock()
-        .map_err(|_| internal_error())?
-        .clone()
-        .ok_or(CommandError {
-            code: "COLLECTION_RESULT_MISSING",
-            message: "没有可上传的采集结果，请先完成采集。".into(),
-            recoverable: true,
-        })?;
-    let package = create_enterprise_package(&export, &config)?;
-    post_enterprise_package(&config.upload_url, config.upload_token.as_bytes(), &package)?;
-    Ok(UploadResult {
-        message_count: export.message_count,
-    })
+async fn upload_latest_enterprise(
+    state: State<'_, AppState>,
+) -> Result<UploadResult, CommandError> {
+    let state = state.inner().clone();
+    if let Ok(mut status) = state.schedule_status.lock() {
+        status.running = true;
+        status.last_error = None;
+    }
+    let status_state = state.clone();
+    let finish_state = state.clone();
+    let schedule = load_enterprise_collector_config()?.collector_schedule;
+    let result: Result<UploadResult, CommandError> =
+        tauri::async_runtime::spawn_blocking(move || {
+            let config = load_enterprise_collector_config()?;
+            let export = state
+                .latest_export
+                .lock()
+                .map_err(|_| internal_error())?
+                .clone()
+                .ok_or(CommandError {
+                    code: "COLLECTION_RESULT_MISSING",
+                    message: "没有可上传的采集结果，请先完成采集。".into(),
+                    recoverable: true,
+                })?;
+            if !has_upload_changes(&state, &export) {
+                return Ok(UploadResult { message_count: 0 });
+            }
+            let package = create_enterprise_package(&export, &config)?;
+            let completed_at = post_enterprise_package(
+                &config.upload_url,
+                config.upload_token.as_bytes(),
+                &package,
+            )?;
+            record_upload_success(&state, &export);
+            if let Ok(mut status) = status_state.schedule_status.lock() {
+                status.last_success_at = Some(completed_at);
+                status.last_message_count = Some(export.message_count);
+                status.last_media_count = Some(export.media_count);
+            }
+            set_next_run_from_completion(&status_state, &schedule);
+            Ok(UploadResult {
+                message_count: export.message_count,
+            })
+        })
+        .await
+        .map_err(|_| internal_error())?;
+    if let Ok(mut status) = finish_state.schedule_status.lock() {
+        status.running = false;
+        if let Err(error) = &result {
+            status.last_error = Some(error.message.clone());
+        }
+    }
+    result
 }
 
 #[tauri::command]
@@ -677,7 +772,7 @@ fn post_enterprise_package(
     endpoint: &str,
     token: &[u8],
     package: &[u8],
-) -> Result<(), CommandError> {
+) -> Result<String, CommandError> {
     if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
         return Err(CommandError {
             code: "ENTERPRISE_UPLOAD_FAILED",
@@ -705,7 +800,7 @@ fn post_enterprise_package(
             endpoint,
         ])
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(0x0800_0000)
         .spawn()
@@ -739,7 +834,13 @@ fn post_enterprise_package(
             recoverable: true,
         });
     }
-    Ok(())
+    serde_json::from_slice::<EnterpriseUploadResponse>(&output.stdout)
+        .map(|response| response.completed_at)
+        .map_err(|_| CommandError {
+            code: "ENTERPRISE_UPLOAD_FAILED",
+            message: "服务端未返回有效的上传完成时间。".into(),
+            recoverable: true,
+        })
 }
 
 fn load_enterprise_collector_config() -> Result<EnterpriseCollectorConfig, CommandError> {
@@ -2804,12 +2905,58 @@ pub fn run() {
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
             )
-            .title("企业微信记录归档")
+            .title("企业微信采集端")
             .inner_size(440.0, 360.0)
             .min_inner_size(420.0, 340.0)
             .resizable(true)
             .center()
+            .icon(collector_tray_icon())?
             .build()?;
+            let quit = MenuItem::with_id(app, "quit", "退出采集端", true, None::<&str>)?;
+            let menu = MenuBuilder::new(app).items(&[&quit]).build()?;
+            let schedule_tip = load_enterprise_collector_config()
+                .ok()
+                .map(|config| describe_collector_schedule(&config.collector_schedule))
+                .unwrap_or_else(|| "采集计划加载中".into());
+            let mut tray = TrayIconBuilder::with_id("collector-tray")
+                .menu(&menu)
+                .tooltip(schedule_tip.clone())
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "quit" => app.exit(0),
+                    _ => {}
+                });
+            tray = tray.icon(collector_tray_icon());
+            tray.build(app)?;
+            let tray_app = app.handle().clone();
+            let tray_state = app.state::<AppState>().inner().clone();
+            std::thread::spawn(move || {
+                while !tray_state.scheduler_shutdown.load(Ordering::Acquire) {
+                    let tip = tray_state.schedule_status.lock().ok().map(|status| {
+                        let last = status
+                            .last_success_at
+                            .as_deref()
+                            .map(format_status_time)
+                            .unwrap_or_else(|| "暂无".into());
+                        let next = status.next_run_at.as_deref().unwrap_or("计算中");
+                        let state = if status.running {
+                            "上传中"
+                        } else if status.last_error.is_some() {
+                            "最近失败"
+                        } else {
+                            "运行正常"
+                        };
+                        format!(
+                            "{}\n状态：{}\n上次上传：{}\n下次上传：{}\n已上传：{} 条",
+                            schedule_tip, state, last, next, status.uploaded_count
+                        )
+                    });
+                    if let (Some(tray), Some(tip)) = (tray_app.tray_by_id("collector-tray"), tip) {
+                        let _ = tray.set_tooltip(Some(tip));
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            });
             let scheduler_state = app.state::<AppState>().inner().clone();
             std::thread::Builder::new()
                 .name("wecom-archive-collector-scheduler".into())
@@ -2827,6 +2974,17 @@ pub fn run() {
             export_latest_enterprise,
             open_offline_export_directory,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            if matches!(event, tauri::WindowEvent::Destroyed)
+                && let Some(state) = window.try_state::<AppState>()
+            {
+                state.scheduler_shutdown.store(true, Ordering::Release);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("desktop runtime failed");
 }
@@ -2838,11 +2996,25 @@ fn collector_scheduler(state: AppState) {
     };
     let schedule = config.collector_schedule.clone();
     let mut next_run = next_schedule_at(&schedule, Local::now());
+    set_next_run(&state, next_run);
     loop {
         std::thread::sleep(Duration::from_secs(15));
+        if state.scheduler_shutdown.load(Ordering::Acquire) {
+            return;
+        }
         let Some(due_at) = next_run else {
             return;
         };
+        if schedule.mode == CollectionScheduleMode::Interval
+            && let Ok(status) = state.schedule_status.lock()
+            && let Some(value) = status.next_run_at.as_deref()
+            && let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        {
+            next_run = parsed.and_local_timezone(Local).earliest();
+            if Local::now() < next_run.unwrap_or_else(Local::now) {
+                continue;
+            }
+        }
         if Local::now() < due_at {
             continue;
         }
@@ -2861,17 +3033,92 @@ fn collector_scheduler(state: AppState) {
             if let Ok(mut status) = state.schedule_status.lock() {
                 status.running = false;
                 match result {
-                    Ok(summary) => {
-                        status.last_success_at = Some(Utc::now().to_rfc3339());
-                        status.last_message_count = Some(summary.message_count);
-                        status.last_media_count = Some(summary.media_count);
+                    Ok(outcome) => {
+                        status.last_message_count = Some(outcome.summary.message_count);
+                        status.last_media_count = Some(outcome.summary.media_count);
+                        if let Some(completed_at) = outcome.completed_at {
+                            status.last_success_at = Some(completed_at);
+                        }
                     }
                     Err(error) => status.last_error = Some(error.message),
                 }
             }
             drop(guard);
         }
-        next_run = next_schedule_at(&schedule, Local::now());
+        if state.scheduler_shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        next_run = if schedule.mode == CollectionScheduleMode::Interval {
+            Some(Local::now() + TimeDelta::minutes(i64::from(schedule.interval_minutes.max(1))))
+        } else {
+            next_schedule_at(&schedule, Local::now())
+        };
+        set_next_run(&state, next_run);
+    }
+}
+
+fn set_next_run(state: &AppState, next: Option<chrono::DateTime<Local>>) {
+    if let Ok(mut status) = state.schedule_status.lock() {
+        status.next_run_at = next.map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string());
+    }
+}
+
+fn set_next_run_from_completion(state: &AppState, schedule: &CollectionSchedule) {
+    let next = state
+        .schedule_status
+        .lock()
+        .ok()
+        .and_then(|status| status.last_success_at.clone())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+        .map(|value| value.with_timezone(&Local))
+        .and_then(|value| next_schedule_at(schedule, value));
+    set_next_run(state, next);
+}
+
+fn format_status_time(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| {
+            time.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|_| value.to_owned())
+}
+
+fn collector_tray_icon() -> tauri::image::Image<'static> {
+    let mut pixels = Vec::with_capacity(32 * 32 * 4);
+    for y in 0..32_u32 {
+        for x in 0..32_u32 {
+            let edge = x < 3 || x > 28 || y < 3 || y > 28;
+            let paper = x >= 8 && x <= 23 && y >= 6 && y <= 26;
+            let line = paper && (y == 13 || y == 17 || y == 21) && x >= 11 && x <= 21;
+            let (r, g, b, a) = if edge {
+                (22, 128, 60, 255)
+            } else if line {
+                (22, 128, 60, 255)
+            } else if paper {
+                (255, 255, 255, 255)
+            } else {
+                (22, 128, 60, 255)
+            };
+            pixels.extend([r, g, b, a]);
+        }
+    }
+    tauri::image::Image::new_owned(pixels, 32, 32)
+}
+
+fn describe_collector_schedule(schedule: &CollectionSchedule) -> String {
+    match schedule.mode {
+        CollectionScheduleMode::Disabled => "采集计划未启用".into(),
+        CollectionScheduleMode::Interval => {
+            format!(
+                "采集计划：每 {} 分钟自动采集并上传",
+                schedule.interval_minutes.max(1)
+            )
+        }
+        CollectionScheduleMode::Daily => {
+            format!("采集计划：每天 {} 自动采集并上传", schedule.daily_time)
+        }
     }
 }
 
@@ -2899,10 +3146,15 @@ fn next_schedule_at(
     }
 }
 
+struct ScheduledCollectionOutcome {
+    summary: CollectionSummary,
+    completed_at: Option<String>,
+}
+
 fn scheduled_collect_and_upload(
     state: &AppState,
     config: &EnterpriseCollectorConfig,
-) -> Result<CollectionSummary, CommandError> {
+) -> Result<ScheduledCollectionOutcome, CommandError> {
     let candidate = WindowsSourceAdapter
         .discover(None)
         .map_err(|error| CommandError {
@@ -2941,11 +3193,25 @@ fn scheduled_collect_and_upload(
             None,
             None,
         )?;
+        let changed = has_upload_changes(state, &export);
+        if !changed {
+            let summary = CollectionSummary::from(&export);
+            *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
+            return Ok(ScheduledCollectionOutcome {
+                summary,
+                completed_at: None,
+            });
+        }
         let package = create_enterprise_package(&export, config)?;
-        post_enterprise_package(&config.upload_url, config.upload_token.as_bytes(), &package)?;
+        let completed_at =
+            post_enterprise_package(&config.upload_url, config.upload_token.as_bytes(), &package)?;
+        record_upload_success(state, &export);
         let summary = CollectionSummary::from(&export);
         *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
-        Ok::<_, CommandError>(summary)
+        Ok::<_, CommandError>(ScheduledCollectionOutcome {
+            summary,
+            completed_at: Some(completed_at),
+        })
     })();
     let _ = fs::remove_dir_all(root);
     result
