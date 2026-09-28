@@ -626,21 +626,19 @@ fn collect_local_export_internal(
     media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
 ) -> Result<ClientExportV1, String> {
     progress(6, "发现数据源", "正在查找当前登录的企业微信数据。");
-    let candidate = WindowsSourceAdapter
+    let candidates = WindowsSourceAdapter
         .discover(None)
-        .map_err(|_| "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned())?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned())?;
+        .map_err(|_| "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned())?;
     progress(15, "读取授权", "已发现数据源，正在准备只读访问。");
     let temporary_root =
         std::env::temp_dir().join(format!("wecom-archive-local-{}", uuid::Uuid::new_v4()));
     let result = (|| {
-        let encrypted = candidate
-            .databases
-            .iter()
-            .any(|database| database.encrypted);
-        let key = resolve_collection_key(&candidate, encrypted)?;
+        let (candidate, key) = choose_collectable_source(candidates, &mut |source| {
+            resolve_collection_key(
+                source,
+                source.databases.iter().any(|database| database.encrypted),
+            )
+        })?;
         progress(25, "创建快照", "正在只读复制数据库及一致性文件。");
         let export = collect_candidate_with_options_since(
             candidate,
@@ -1432,6 +1430,26 @@ fn resolve_collection_key(
         message: "自动解析未找到可验证的数据库密钥；未读取或导出任何消息。".into(),
         recoverable: true,
     })
+}
+
+fn choose_collectable_source(
+    candidates: Vec<SourceCandidate>,
+    resolve_key: &mut dyn FnMut(&SourceCandidate) -> Result<Option<SourceKey>, CommandError>,
+) -> Result<(SourceCandidate, Option<SourceKey>), CommandError> {
+    // Only the logged-in account's key is present in memory, so an account whose key
+    // cannot be resolved is not a failure — it is just not the account to collect.
+    let mut last_error = None;
+    for candidate in candidates {
+        match resolve_key(&candidate) {
+            Ok(key) => return Ok((candidate, key)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or(CommandError {
+        code: "SOURCE_NOT_FOUND",
+        message: "未发现可支持的本机企业微信数据，请确认客户端已登录。".into(),
+        recoverable: true,
+    }))
 }
 
 fn key_opens_candidate(candidate: &SourceCandidate, key: &SourceKey) -> bool {
@@ -3674,18 +3692,11 @@ fn scheduled_collect_and_upload(
     state: &AppState,
     config: &EnterpriseCollectorConfig,
 ) -> Result<ScheduledCollectionOutcome, CommandError> {
-    let candidate = WindowsSourceAdapter
+    let candidates = WindowsSourceAdapter
         .discover(None)
         .map_err(|error| CommandError {
             code: "SOURCE_DISCOVERY_FAILED",
             message: sanitize_error(&error.to_string()),
-            recoverable: true,
-        })?
-        .into_iter()
-        .next()
-        .ok_or(CommandError {
-            code: "SOURCE_NOT_FOUND",
-            message: "未发现可支持的本机企业微信数据。".into(),
             recoverable: true,
         })?;
     let media_options = MediaCollectionOptions {
@@ -3694,11 +3705,12 @@ fn scheduled_collect_and_upload(
     };
     let root =
         std::env::temp_dir().join(format!("wecom-archive-collector-{}", uuid::Uuid::new_v4()));
-    let encrypted = candidate
-        .databases
-        .iter()
-        .any(|database| database.encrypted);
-    let key = resolve_collection_key(&candidate, encrypted)?;
+    let (candidate, key) = choose_collectable_source(candidates, &mut |source| {
+        resolve_collection_key(
+            source,
+            source.databases.iter().any(|database| database.encrypted),
+        )
+    })?;
     let result = (|| {
         let export = collect_candidate_with_options(
             candidate,
@@ -4224,6 +4236,52 @@ mod tests {
             MessageType::Text
         );
         assert!(text_only.media_blobs.is_empty());
+    }
+
+    #[test]
+    fn collectable_source_skips_accounts_whose_key_cannot_open_them() {
+        let directory = TestDirectory::new();
+        let candidate = |name: &str| SourceCandidate {
+            source_id: name.into(),
+            display_path: format!("…\\{name}"),
+            root_path: directory.0.join(name),
+            databases: vec![archive_domain::SourceDatabase {
+                kind: "message".into(),
+                path: directory.0.join(name).join("message.db"),
+                wal_path: None,
+                shm_path: None,
+                encrypted: true,
+                page_size_hint: Some(4096),
+            }],
+            media_roots: vec![],
+            client_version: None,
+            capability: SourceCapability::ProbeRequired,
+        };
+
+        let mut tried: Vec<String> = Vec::new();
+        let (chosen, key) = choose_collectable_source(
+            vec![candidate("stale-largest"), candidate("logged-in")],
+            &mut |source| {
+                tried.push(source.source_id.clone());
+                if source.source_id == "logged-in" {
+                    Ok(Some(SourceKey::passphrase(b"verified-key")))
+                } else {
+                    Err(CommandError {
+                        code: "SOURCE_KEY_NOT_FOUND",
+                        message: "自动解析未找到可验证的数据库密钥。".into(),
+                        recoverable: true,
+                    })
+                }
+            },
+        )
+        .expect("the account whose key opens its database should be the one collected");
+
+        assert_eq!(chosen.source_id, "logged-in");
+        assert!(key.is_some());
+        assert_eq!(
+            tried,
+            vec!["stale-largest".to_string(), "logged-in".to_string()]
+        );
     }
 
     #[test]
