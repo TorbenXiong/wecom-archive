@@ -21,14 +21,12 @@ use archive_transfer::{
     write_importable_json_formatted,
 };
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-#[cfg(test)]
-use chrono::TimeZone;
-use chrono::{Local, NaiveTime, TimeDelta, Utc};
+use chrono::{Local, NaiveDate, NaiveTime, TimeDelta, TimeZone, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,6 +34,24 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+static EXPORT_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+fn next_export_file(export_root: &Path, extension: &str) -> (String, PathBuf) {
+    loop {
+        let file_name = format!(
+            "wecom-{}.{}",
+            Local::now().format("%Y%m%d-%H%M%S"),
+            extension
+        );
+        let target = export_root.join(&file_name);
+        if !target.exists() {
+            return (file_name, target);
+        }
+        // Keep the timestamp truthful while avoiding a same-second overwrite.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 
 #[path = "../../../crates/source-windows/src/enterprise_crypto.rs"]
 #[allow(dead_code)]
@@ -139,6 +155,7 @@ mod dpapi_protect {
 
 const DATA_ROOT_ENV: &str = "WECOM_ARCHIVE_SERVER_DATA";
 const LISTEN_ENV: &str = "WECOM_ARCHIVE_SERVER_LISTEN";
+const ALLOW_REMOTE_ENV: &str = "WECOM_ARCHIVE_SERVER_ALLOW_REMOTE";
 const DEFAULT_SERVER_PORT: u16 = 9812;
 const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:9812";
 const MAX_CLIENT_EXPORT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -163,6 +180,7 @@ struct AppState {
     local_collection_progress: Arc<Mutex<LocalCollectionProgress>>,
     local_collection_running: Arc<AtomicBool>,
     archive_update: watch::Sender<u64>,
+    network_mode: &'static str,
 }
 
 pub type LocalCollectionProgressReporter = Arc<dyn Fn(u8, &str, &str) + Send + Sync>;
@@ -299,16 +317,6 @@ enum CollectionScheduleMode {
     Daily,
 }
 
-impl CollectionScheduleMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::Interval => "interval",
-            Self::Daily => "daily",
-        }
-    }
-}
-
 fn default_schedule_interval_minutes() -> u32 {
     60
 }
@@ -342,6 +350,8 @@ struct EnterpriseCollectorRecord {
     #[serde(default)]
     organization_name: String,
     #[serde(default)]
+    collection_notice: String,
+    #[serde(default)]
     upload_url: String,
     #[serde(default)]
     include_media: bool,
@@ -353,9 +363,44 @@ struct EnterpriseCollectorRecord {
     schedule: CollectionSchedule,
     #[serde(default)]
     last_upload_at: Option<String>,
+    #[serde(default)]
+    last_run_at: Option<String>,
     public_key_hex: String,
     private_key_protected_hex: String,
     upload_token_sha256: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default = "default_collector_protocol_version")]
+    protocol_version: String,
+    #[serde(default)]
+    client_version: Option<String>,
+    #[serde(default)]
+    registered_at: Option<String>,
+    #[serde(default)]
+    last_seen_at: Option<String>,
+    #[serde(default)]
+    last_client_ip: Option<String>,
+    #[serde(default = "default_collector_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    revoked_at: Option<String>,
+    #[serde(default)]
+    config_revision: u64,
+    #[serde(default)]
+    last_applied_revision: u64,
+    #[serde(default)]
+    last_error: Option<String>,
+    #[serde(default)]
+    manual_collection_request_id: Option<String>,
+    #[serde(default)]
+    last_manual_collection_request_id: Option<String>,
+}
+
+fn default_collector_protocol_version() -> String {
+    "collector-control.v1".into()
+}
+fn default_collector_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,6 +437,7 @@ struct SuperAdminResponse {
 #[serde(rename_all = "camelCase")]
 struct EnterpriseConfigRequest {
     organization_name: String,
+    #[serde(default)]
     collection_notice: String,
     upload_url: String,
     key_id: Option<String>,
@@ -468,6 +514,110 @@ struct CollectionSchedulesResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct CollectionTargetsResponse {
+    targets: Vec<CollectionTargetResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionTargetResponse {
+    target_id: String,
+    kind: String,
+    display_name: String,
+    status: String,
+    last_seen_at: Option<String>,
+    client_ip: Option<String>,
+    client_version: Option<String>,
+    config_revision: Option<u64>,
+    last_applied_revision: Option<u64>,
+    last_error: Option<String>,
+    include_media: Option<bool>,
+    data_redaction: Option<bool>,
+    offline_export_enabled: Option<bool>,
+    plans: Vec<CollectionPlanResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionPlanResponse {
+    id: String,
+    name: String,
+    include_media: bool,
+    schedule: CollectionSchedule,
+    created_at: String,
+    updated_at: String,
+    last_run_at: Option<String>,
+    last_upload_at: Option<String>,
+    last_status: Option<String>,
+    last_detail: Option<String>,
+    next_run_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorDesiredConfigResponse {
+    collector_id: String,
+    display_name: String,
+    enabled: bool,
+    config_revision: u64,
+    organization_id: String,
+    organization_name: String,
+    collection_notice: String,
+    upload_url: String,
+    key_id: String,
+    public_key_hex: String,
+    include_media: bool,
+    data_redaction: bool,
+    offline_export_enabled: bool,
+    schedule: CollectionSchedule,
+    manual_collection_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorControlEnvelopeResponse {
+    schema_version: &'static str,
+    config_revision: u64,
+    expires_at: String,
+    config: CollectorDesiredConfigResponse,
+    signature_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorHeartbeatRequest {
+    client_version: Option<String>,
+    current_config_revision: Option<u64>,
+    last_applied_revision: Option<u64>,
+    last_run_at: Option<String>,
+    last_success_at: Option<String>,
+    last_error: Option<String>,
+    last_manual_collection_request_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorHeartbeatResponse {
+    status: String,
+    config: Option<CollectorDesiredConfigResponse>,
+    control: Option<CollectorControlEnvelopeResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorUpdateRequest {
+    display_name: String,
+    enabled: bool,
+    include_media: bool,
+    data_redaction: bool,
+    offline_export_enabled: bool,
+    #[serde(default)]
+    collection_notice: String,
+    schedule: CollectionSchedule,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CollectorPlanResponse {
     collector_id: String,
     file_name: String,
@@ -479,6 +629,7 @@ struct CollectorPlanResponse {
     schedule: CollectionSchedule,
     created_at: String,
     last_upload_at: Option<String>,
+    last_run_at: Option<String>,
     next_run_at: Option<String>,
     executable_available: bool,
 }
@@ -626,6 +777,10 @@ struct ExportRequest {
     scope: ExportScope,
     format: ExportFormat,
     conversation_id: Option<String>,
+    #[serde(default)]
+    conversation_ids: Vec<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
     participant_id: Option<String>,
     text: Option<String>,
     message_type: Option<String>,
@@ -640,6 +795,27 @@ struct ExportRequest {
     conversation_order: ExportOrder,
     #[serde(default)]
     message_order: ExportOrder,
+}
+
+fn parse_export_date(
+    value: Option<&str>,
+    end_of_day: bool,
+) -> Result<Option<chrono::DateTime<Utc>>, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let date =
+        NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| ApiError::invalid_query())?;
+    let date_time = if end_of_day {
+        date.checked_add_signed(TimeDelta::days(1))
+            .ok_or_else(ApiError::invalid_query)?
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(ApiError::invalid_query)?
+    } else {
+        date.and_hms_opt(0, 0, 0)
+            .ok_or_else(ApiError::invalid_query)?
+    };
+    Ok(Some(Utc.from_utc_datetime(&date_time)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -808,15 +984,28 @@ fn prepare_server(
     let access_token_path = data_root.join(ACCESS_TOKEN_FILE);
     let token = load_or_generate_access_token(&access_token_path)
         .map_err(|_| "服务端访问令牌初始化失败，请检查 serverData 目录权限。".to_owned())?;
-    let address = std::env::var(LISTEN_ENV)
+    let enterprise_config = load_enterprise_config(&data_root);
+    let (address, automatic_remote) = std::env::var(LISTEN_ENV)
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            DEFAULT_SERVER_PORT,
+        .map(|address| (address, false))
+        .or_else(|| {
+            configured_private_listen_address(&enterprise_config.upload_url)
+                .map(|address| (address, true))
+        })
+        .unwrap_or((
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_SERVER_PORT),
+            false,
         ));
-    if !address.ip().is_loopback() {
-        return Err("服务端只允许监听本机回环地址。".into());
+    if !address.ip().is_loopback()
+        && !automatic_remote
+        && !std::env::var(ALLOW_REMOTE_ENV)
+            .ok()
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        return Err(format!(
+            "远程采集端需要显式启用 {ALLOW_REMOTE_ENV}=true 后才能监听非回环地址。"
+        ));
     }
 
     let archive_path = Arc::new(data_root.join("archive.db"));
@@ -827,12 +1016,17 @@ fn prepare_server(
         archive_path,
         token_sha256: Arc::new(Mutex::new(Sha256::digest(token.as_bytes()).into())),
         access_token_path: Arc::new(access_token_path),
-        enterprise_config: Arc::new(Mutex::new(load_enterprise_config(&data_root))),
+        enterprise_config: Arc::new(Mutex::new(enterprise_config)),
         collector_template: collector_template.map(Arc::new),
         local_collector,
         local_collection_progress: Arc::new(Mutex::new(LocalCollectionProgress::default())),
         local_collection_running: Arc::new(AtomicBool::new(false)),
         archive_update,
+        network_mode: if address.ip().is_loopback() {
+            "loopback_only"
+        } else {
+            "configured_remote"
+        },
     };
 
     let app = Router::new()
@@ -869,6 +1063,23 @@ fn prepare_server(
         .route(
             "/api/v1/enterprise/collectors",
             get(list_collectors).post(generate_collector),
+        )
+        .route("/api/v1/collection-targets", get(get_collection_targets))
+        .route(
+            "/api/v1/collectors/{collector_id}",
+            get(get_collector).put(update_collector),
+        )
+        .route(
+            "/api/v1/collectors/{collector_id}/heartbeat",
+            post(collector_heartbeat),
+        )
+        .route(
+            "/api/v1/collectors/{collector_id}/revoke",
+            post(revoke_collector),
+        )
+        .route(
+            "/api/v1/collectors/{collector_id}/collect",
+            post(request_collector_collection),
         )
         .route(
             "/api/v1/enterprise/collectors/open-directory",
@@ -961,12 +1172,17 @@ async fn serve(
         let _ = sender.send(Ok(()));
     }
     let scheduler = tokio::spawn(run_local_collection_scheduler(prepared.state.clone()));
-    axum::serve(listener, prepared.router)
-        .with_graceful_shutdown(async move {
-            let _ = tokio::task::spawn_blocking(move || shutdown_receiver.recv()).await;
-        })
-        .await
-        .map_err(|_| "本机归档服务异常退出。".to_owned())?;
+    axum::serve(
+        listener,
+        prepared
+            .router
+            .into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = tokio::task::spawn_blocking(move || shutdown_receiver.recv()).await;
+    })
+    .await
+    .map_err(|_| "本机归档服务异常退出。".to_owned())?;
     scheduler.abort();
     Ok(())
 }
@@ -1019,11 +1235,11 @@ fn default_data_root() -> PathBuf {
         .join("serverData")
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         schema: "server-api.v1",
-        network_mode: "loopback_only",
+        network_mode: state.network_mode,
     })
 }
 
@@ -1262,6 +1478,7 @@ fn collector_plan_responses(
             schedule: collector.schedule.clone(),
             created_at: collector.created_at.clone(),
             last_upload_at: collector.last_upload_at.clone(),
+            last_run_at: collector.last_run_at.clone(),
             next_run_at: estimated_next_run(
                 &collector.schedule,
                 collector
@@ -1279,6 +1496,210 @@ fn collector_plan_responses(
     plans
 }
 
+fn collector_status(collector: &EnterpriseCollectorRecord, now: chrono::DateTime<Utc>) -> String {
+    if collector.revoked_at.is_some() {
+        return "revoked".into();
+    }
+    if !collector.enabled {
+        return "disabled".into();
+    }
+    let online = collector
+        .last_seen_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| now.signed_duration_since(value.with_timezone(&Utc)) <= TimeDelta::minutes(5))
+        .unwrap_or(false);
+    if online {
+        "online".into()
+    } else {
+        "offline".into()
+    }
+}
+
+fn collector_display_name(collector: &EnterpriseCollectorRecord) -> String {
+    let name = collector.display_name.trim();
+    let generated_default = name.is_empty() || name.starts_with("采集端 ");
+    if generated_default {
+        collector
+            .last_client_ip
+            .clone()
+            .unwrap_or_else(|| "采集端".into())
+    } else {
+        name.into()
+    }
+}
+
+fn collector_has_connected(collector: &EnterpriseCollectorRecord) -> bool {
+    collector.last_client_ip.is_some()
+        || collector.client_version.is_some()
+        || collector.last_applied_revision > 0
+        || collector.last_run_at.is_some()
+        || collector.last_upload_at.is_some()
+}
+
+fn collector_desired_config(
+    config: &EnterpriseConfig,
+    collector: &EnterpriseCollectorRecord,
+) -> CollectorDesiredConfigResponse {
+    CollectorDesiredConfigResponse {
+        collector_id: collector.collector_id.clone(),
+        display_name: collector_display_name(collector),
+        enabled: collector.enabled && collector.revoked_at.is_none(),
+        config_revision: collector.config_revision,
+        organization_id: config.organization_id.clone(),
+        organization_name: collector.organization_name.clone(),
+        collection_notice: collector.collection_notice.clone(),
+        upload_url: collector.upload_url.clone(),
+        key_id: collector.key_id.clone(),
+        public_key_hex: config.public_key_hex.clone(),
+        include_media: collector.include_media,
+        data_redaction: collector.data_redaction,
+        offline_export_enabled: collector.offline_export_enabled,
+        schedule: collector.schedule.clone(),
+        manual_collection_request_id: collector.manual_collection_request_id.clone(),
+    }
+}
+
+fn collector_control_payload(
+    config: &CollectorDesiredConfigResponse,
+    config_revision: u64,
+    expires_at: &str,
+) -> Result<Vec<u8>, ApiError> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": "collector-control.v1",
+        "configRevision": config_revision,
+        "expiresAt": expires_at,
+        "config": config,
+    }))
+    .map_err(|_| ApiError::store())
+}
+
+fn signed_collector_control(
+    config: &EnterpriseConfig,
+    desired: CollectorDesiredConfigResponse,
+) -> Result<CollectorControlEnvelopeResponse, ApiError> {
+    let expires_at = (Utc::now() + TimeDelta::minutes(15)).to_rfc3339();
+    let payload = collector_control_payload(&desired, desired.config_revision, &expires_at)?;
+    let signing_private = dpapi_protect::unprotect(
+        &decode_hex(&config.signing_private_key_protected_hex).map_err(|_| ApiError::store())?,
+    )
+    .map_err(|_| ApiError::store())?;
+    let signature =
+        enterprise_crypto::sign(&signing_private, &payload).map_err(|_| ApiError::store())?;
+    Ok(CollectorControlEnvelopeResponse {
+        schema_version: "collector-control.v1",
+        config_revision: desired.config_revision,
+        expires_at,
+        config: desired,
+        signature_hex: encode_hex(&signature),
+    })
+}
+
+fn collection_target_response(
+    config: &EnterpriseConfig,
+    data_root: &Path,
+    now: chrono::DateTime<Local>,
+) -> CollectionTargetsResponse {
+    let server_plans = config
+        .local_collection_plans
+        .iter()
+        .map(|plan| CollectionPlanResponse {
+            id: plan.id.clone(),
+            name: plan.name.clone(),
+            include_media: plan.include_media,
+            schedule: plan.schedule.clone(),
+            created_at: plan.created_at.clone(),
+            updated_at: plan.updated_at.clone(),
+            last_run_at: plan.last_run_at.clone(),
+            last_upload_at: None,
+            last_status: plan.last_status.clone(),
+            last_detail: plan.last_detail.clone(),
+            next_run_at: estimated_next_run(
+                &plan.schedule,
+                plan.last_run_at
+                    .as_deref()
+                    .or(Some(plan.created_at.as_str())),
+                now,
+            ),
+        })
+        .collect();
+    let mut targets = vec![CollectionTargetResponse {
+        target_id: "server".into(),
+        kind: "server".into(),
+        display_name: if config.organization_name.is_empty() {
+            "服务端".into()
+        } else {
+            config.organization_name.clone()
+        },
+        status: "online".into(),
+        last_seen_at: None,
+        client_ip: None,
+        client_version: None,
+        config_revision: None,
+        last_applied_revision: None,
+        last_error: None,
+        include_media: Some(config.include_files || config.include_images),
+        data_redaction: Some(config.data_redaction),
+        offline_export_enabled: Some(config.offline_export_enabled),
+        plans: server_plans,
+    }];
+    for collector in config
+        .collectors
+        .iter()
+        .filter(|collector| collector_has_connected(collector))
+    {
+        let plan = CollectionPlanResponse {
+            id: collector.collector_id.clone(),
+            name: if collector.display_name.is_empty() {
+                collector.file_name.clone()
+            } else {
+                collector.display_name.clone()
+            },
+            include_media: collector.include_media,
+            schedule: collector.schedule.clone(),
+            created_at: collector.created_at.clone(),
+            updated_at: collector
+                .last_seen_at
+                .clone()
+                .unwrap_or_else(|| collector.created_at.clone()),
+            last_run_at: collector.last_run_at.clone(),
+            last_upload_at: collector.last_upload_at.clone(),
+            last_status: collector
+                .last_error
+                .as_ref()
+                .map(|_| "error".into())
+                .or_else(|| Some("success".into())),
+            last_detail: collector.last_error.clone(),
+            next_run_at: estimated_next_run(
+                &collector.schedule,
+                collector
+                    .last_upload_at
+                    .as_deref()
+                    .or(Some(collector.created_at.as_str())),
+                now,
+            ),
+        };
+        targets.push(CollectionTargetResponse {
+            target_id: collector.collector_id.clone(),
+            kind: "collector".into(),
+            display_name: collector_display_name(collector),
+            status: collector_status(collector, Utc::now()),
+            last_seen_at: collector.last_seen_at.clone(),
+            client_ip: collector.last_client_ip.clone(),
+            client_version: collector.client_version.clone(),
+            config_revision: Some(collector.config_revision),
+            last_applied_revision: Some(collector.last_applied_revision),
+            last_error: collector.last_error.clone(),
+            include_media: Some(collector.include_media),
+            data_redaction: Some(collector.data_redaction),
+            offline_export_enabled: Some(collector.offline_export_enabled),
+            plans: vec![plan],
+        });
+    }
+    let _ = data_root;
+    CollectionTargetsResponse { targets }
+}
+
 fn default_upload_url() -> String {
     DEFAULT_SERVER_URL.into()
 }
@@ -1293,6 +1714,47 @@ fn normalize_upload_url(value: &str) -> Result<String, ApiError> {
         return Err(ApiError::invalid_query());
     }
     Ok(value.to_owned())
+}
+
+/// Derive a listener from a saved collector URL only when it explicitly points
+/// at a private network address. Public addresses and host names must never
+/// cause the desktop service to bind broadly without an explicit override.
+fn configured_private_listen_address(upload_url: &str) -> Option<SocketAddr> {
+    let trimmed = upload_url.trim();
+    let authority = if let Some(value) = trimmed.strip_prefix("http://") {
+        value
+    } else if let Some(value) = trimmed.strip_prefix("https://") {
+        value
+    } else {
+        return None;
+    };
+    let authority = authority.split(['/', '?', '#']).next()?.trim();
+    let authority = authority.rsplit('@').next()?.trim();
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        let suffix = &rest[end + 1..];
+        let port = suffix.strip_prefix(':')?.parse::<u16>().ok()?;
+        (host, port)
+    } else {
+        let (host, port) = authority.rsplit_once(':')?;
+        if host.is_empty() || host.contains(':') {
+            return None;
+        }
+        (host, port.parse::<u16>().ok()?)
+    };
+    let ip = host.parse::<IpAddr>().ok()?;
+    let private = match ip {
+        IpAddr::V4(ip) => ip.is_private(),
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    };
+    if !private || port == 0 {
+        return None;
+    }
+    Some(SocketAddr::new(ip, port))
 }
 
 fn upload_endpoint(base_url: &str) -> String {
@@ -1489,7 +1951,7 @@ async fn update_enterprise_config(
     Json(request): Json<EnterpriseConfigRequest>,
 ) -> Result<Json<EnterpriseConfigResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    if request.organization_name.trim().is_empty() || request.collection_notice.trim().is_empty() {
+    if request.organization_name.trim().is_empty() {
         return Err(ApiError::invalid_query());
     }
     let upload_url = normalize_upload_url(&request.upload_url)?;
@@ -1522,7 +1984,9 @@ async fn update_enterprise_config(
         }
     }
     config.organization_name = request.organization_name.trim().to_owned();
-    config.collection_notice = request.collection_notice.trim().to_owned();
+    if !request.collection_notice.trim().is_empty() {
+        config.collection_notice = request.collection_notice.trim().to_owned();
+    }
     config.upload_url = upload_url;
     config.include_files = request.include_media;
     config.include_images = request.include_media;
@@ -1579,35 +2043,67 @@ async fn generate_collector(
         return Err(ApiError::invalid_query());
     }
     let upload_url = upload_endpoint(&config.upload_url);
-    let signing_private = dpapi_protect::unprotect(
-        &decode_hex(&config.signing_private_key_protected_hex).map_err(|_| ApiError::store())?,
-    )
-    .map_err(|_| ApiError::store())?;
     let collector_id = Uuid::new_v4().to_string();
     let upload_token = random_access_token();
     let upload_token_sha256 = encode_hex(&Sha256::digest(upload_token.as_bytes()));
     let key_id = config.key_id.clone();
-    let public_key_hex = config.public_key_hex.clone();
-    let signing_payload = collector_signing_payload(&config, &upload_url, &upload_token);
-    let signature = enterprise_crypto::sign(&signing_private, signing_payload.as_bytes())
-        .map_err(|_| ApiError::store())?;
+    let now = Utc::now();
+    let record = EnterpriseCollectorRecord {
+        collector_id: collector_id.clone(),
+        key_id: key_id.clone(),
+        created_at: now.to_rfc3339(),
+        file_name: String::new(),
+        organization_name: config.organization_name.clone(),
+        collection_notice: config.collection_notice.clone(),
+        upload_url: upload_url.clone(),
+        include_media: config.include_files || config.include_images,
+        data_redaction: config.data_redaction,
+        offline_export_enabled: config.offline_export_enabled,
+        schedule: config.collector_schedule.clone(),
+        last_upload_at: None,
+        last_run_at: None,
+        public_key_hex: String::new(),
+        private_key_protected_hex: String::new(),
+        upload_token_sha256,
+        display_name: format!("采集端 {}", &collector_id[..8]),
+        protocol_version: "collector-control.v1".into(),
+        client_version: None,
+        registered_at: Some(now.to_rfc3339()),
+        last_seen_at: None,
+        last_client_ip: None,
+        enabled: true,
+        revoked_at: None,
+        config_revision: 1,
+        last_applied_revision: 0,
+        last_error: None,
+        manual_collection_request_id: None,
+        last_manual_collection_request_id: None,
+    };
+    let desired = collector_desired_config(&config, &record);
+    let control = signed_collector_control(&config, desired.clone())?;
     let artifact = serde_json::json!({
         "schemaVersion": "enterprise-collector.v1",
+        "collectorId": collector_id.clone(),
+        "configRevision": desired.config_revision,
+        "configExpiresAt": control.expires_at,
+        "displayName": desired.display_name,
         "organizationId": config.organization_id,
         "organizationName": config.organization_name,
         "collectionNotice": config.collection_notice,
-        "keyId": key_id,
+        "keyId": key_id.clone(),
         "encryption": "aes-256-gcm+rsa-oaep-sha256",
-        "publicKeyHex": public_key_hex,
+        "publicKeyHex": config.public_key_hex,
         "signingPublicKeyHex": config.signing_public_key_hex,
-        "signatureHex": encode_hex(&signature),
-        "uploadUrl": upload_url,
-        "uploadToken": upload_token,
+        "signatureHex": control.signature_hex.clone(),
+        "uploadUrl": upload_url.clone(),
+        "uploadToken": upload_token.clone(),
         "includeFiles": config.include_files,
         "includeImages": config.include_images,
         "includeMedia": config.include_files || config.include_images,
         "dataRedaction": config.data_redaction,
         "offlineExportEnabled": config.offline_export_enabled,
+        "enabled": desired.enabled,
+        "manualCollectionRequestId": desired.manual_collection_request_id,
         "collectorSchedule": &config.collector_schedule,
         "formats": ["enterprise-package.v1"],
     });
@@ -1645,31 +2141,9 @@ async fn generate_collector(
             generated
         });
     if executable_generated {
-        let legacy_config_path = collector_root.join(format!("{file_name}.wca-collector"));
-        if legacy_config_path.is_file() {
-            let _ = std::fs::remove_file(legacy_config_path);
-        }
-        let collector_organization_name = config.organization_name.clone();
-        let collector_include_media = config.include_files || config.include_images;
-        let collector_data_redaction = config.data_redaction;
-        let collector_offline_export_enabled = config.offline_export_enabled;
-        let collector_schedule = config.collector_schedule.clone();
-        config.collectors.push(EnterpriseCollectorRecord {
-            collector_id: collector_id.clone(),
-            key_id: key_id.clone(),
-            created_at: Utc::now().to_rfc3339(),
-            file_name: file_name.clone(),
-            organization_name: collector_organization_name,
-            upload_url: upload_url.clone(),
-            include_media: collector_include_media,
-            data_redaction: collector_data_redaction,
-            offline_export_enabled: collector_offline_export_enabled,
-            schedule: collector_schedule,
-            last_upload_at: None,
-            public_key_hex: String::new(),
-            private_key_protected_hex: String::new(),
-            upload_token_sha256,
-        });
+        let mut record = record;
+        record.file_name = file_name.clone();
+        config.collectors.push(record);
         if let Err(error) = persist_enterprise_config(&state.data_root, &config) {
             config
                 .collectors
@@ -1707,6 +2181,210 @@ async fn list_collectors(
     }))
 }
 
+async fn get_collection_targets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectionTargetsResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    Ok(Json(collection_target_response(
+        &config,
+        &state.data_root,
+        Local::now(),
+    )))
+}
+
+fn collector_by_device_token<'a>(
+    config: &'a mut EnterpriseConfig,
+    collector_id: &str,
+    headers: &HeaderMap,
+) -> Result<&'a mut EnterpriseCollectorRecord, ApiError> {
+    let token = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(ApiError::unauthorized)?;
+    let token_hash = encode_hex(&Sha256::digest(token.as_bytes()));
+    config
+        .collectors
+        .iter_mut()
+        .find(|collector| {
+            collector.collector_id == collector_id
+                && collector.upload_token_sha256 == token_hash
+                && collector.revoked_at.is_none()
+        })
+        .ok_or_else(ApiError::unauthorized)
+}
+
+async fn collector_heartbeat(
+    State(state): State<AppState>,
+    AxumPath(collector_id): AxumPath<String>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<CollectorHeartbeatRequest>,
+) -> Result<Json<CollectorHeartbeatResponse>, ApiError> {
+    let mut config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    let snapshot = {
+        let collector = collector_by_device_token(&mut config, &collector_id, &headers)?;
+        collector.last_seen_at = Some(Utc::now().to_rfc3339());
+        collector.last_client_ip = Some(remote_addr.ip().to_string());
+        collector.client_version = request.client_version;
+        collector.last_applied_revision = request
+            .last_applied_revision
+            .unwrap_or(collector.last_applied_revision);
+        collector.last_error = request.last_error;
+        if let Some(last_run) = request.last_run_at {
+            collector.last_run_at = Some(last_run);
+        }
+        if let Some(last_success) = request.last_success_at {
+            collector.last_upload_at = Some(last_success);
+        }
+        if let Some(completed_id) = request.last_manual_collection_request_id {
+            if collector.manual_collection_request_id.as_deref() == Some(completed_id.as_str()) {
+                collector.last_manual_collection_request_id = Some(completed_id);
+                collector.manual_collection_request_id = None;
+                collector.config_revision = collector.config_revision.saturating_add(1);
+            }
+        }
+        collector.clone()
+    };
+    persist_enterprise_config(&state.data_root, &config)?;
+    let should_send = request.current_config_revision.unwrap_or(0) < snapshot.config_revision;
+    let control = if should_send {
+        Some(signed_collector_control(
+            &config,
+            collector_desired_config(&config, &snapshot),
+        )?)
+    } else {
+        None
+    };
+    Ok(Json(CollectorHeartbeatResponse {
+        status: if snapshot.enabled {
+            "ok".into()
+        } else {
+            "disabled".into()
+        },
+        config: control.as_ref().map(|value| value.config.clone()),
+        control,
+    }))
+}
+
+async fn get_collector(
+    State(state): State<AppState>,
+    AxumPath(collector_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    let collector = config
+        .collectors
+        .iter()
+        .find(|item| item.collector_id == collector_id)
+        .ok_or_else(ApiError::invalid_query)?;
+    Ok(Json(serde_json::json!({
+        "collector": collector_plan_responses(&config, Some(&state.data_root.join("collectors")), Local::now()).into_iter().find(|item| item.collector_id == collector_id),
+        "status": collector_status(collector, Utc::now()),
+        "config": collector_desired_config(&config, collector),
+    })))
+}
+
+async fn update_collector(
+    State(state): State<AppState>,
+    AxumPath(collector_id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<CollectorUpdateRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let display_name = validate_plan_name(&request.display_name)?;
+    request.schedule.validate()?;
+    let mut config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    let collector = config
+        .collectors
+        .iter_mut()
+        .find(|item| item.collector_id == collector_id)
+        .ok_or_else(ApiError::invalid_query)?;
+    collector.display_name = display_name;
+    collector.enabled = request.enabled;
+    collector.include_media = request.include_media;
+    collector.data_redaction = request.data_redaction;
+    collector.offline_export_enabled = request.offline_export_enabled;
+    if !request.collection_notice.trim().is_empty() {
+        collector.collection_notice = request.collection_notice.trim().to_owned();
+    }
+    collector.schedule = request.schedule;
+    collector.config_revision = collector.config_revision.saturating_add(1);
+    persist_enterprise_config(&state.data_root, &config)?;
+    let snapshot = config
+        .collectors
+        .iter()
+        .find(|item| item.collector_id == collector_id)
+        .ok_or_else(ApiError::invalid_query)?;
+    Ok(Json(
+        serde_json::json!({ "config": collector_desired_config(&config, snapshot), "status": "updated" }),
+    ))
+}
+
+async fn revoke_collector(
+    State(state): State<AppState>,
+    AxumPath(collector_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let mut config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    let collector = config
+        .collectors
+        .iter_mut()
+        .find(|item| item.collector_id == collector_id)
+        .ok_or_else(ApiError::invalid_query)?;
+    collector.enabled = false;
+    collector.revoked_at = Some(Utc::now().to_rfc3339());
+    collector.config_revision = collector.config_revision.saturating_add(1);
+    persist_enterprise_config(&state.data_root, &config)?;
+    Ok(Json(serde_json::json!({ "revoked": true })))
+}
+
+async fn request_collector_collection(
+    State(state): State<AppState>,
+    AxumPath(collector_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let mut config = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?;
+    let collector = config
+        .collectors
+        .iter_mut()
+        .find(|item| item.collector_id == collector_id)
+        .ok_or_else(ApiError::invalid_query)?;
+    if collector.revoked_at.is_some() || !collector.enabled {
+        return Err(ApiError::invalid_query());
+    }
+    let request_id = Uuid::new_v4().to_string();
+    collector.manual_collection_request_id = Some(request_id.clone());
+    collector.config_revision = collector.config_revision.saturating_add(1);
+    persist_enterprise_config(&state.data_root, &config)?;
+    Ok(Json(
+        serde_json::json!({ "queued": true, "requestId": request_id }),
+    ))
+}
+
 async fn open_collector_directory(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1730,31 +2408,6 @@ async fn open_collector_directory(
         let _ = directory;
         Err(ApiError::invalid_query())
     }
-}
-
-fn collector_signing_payload(
-    config: &EnterpriseConfig,
-    upload_url: &str,
-    upload_token: &str,
-) -> String {
-    format!(
-        "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
-        config.organization_id,
-        config.organization_name,
-        config.collection_notice,
-        config.key_id,
-        config.public_key_hex,
-        "aes-256-gcm+rsa-oaep-sha256",
-        upload_url,
-        upload_token,
-        config.include_files,
-        config.include_images,
-        config.data_redaction,
-        config.offline_export_enabled,
-        config.collector_schedule.mode.as_str(),
-        config.collector_schedule.interval_minutes,
-        config.collector_schedule.daily_time
-    )
 }
 
 fn find_collector_template() -> Option<PathBuf> {
@@ -2757,17 +3410,38 @@ async fn create_export_job(
         .as_deref()
         .map(parse_message_type)
         .transpose()?;
-    let conversation_id = match request.scope {
-        ExportScope::CurrentConversation | ExportScope::CurrentFilter => Some(
+    let conversation_ids = match request.scope {
+        ExportScope::CurrentConversation | ExportScope::CurrentFilter => vec![
             request
                 .conversation_id
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(ApiError::invalid_query)?,
-        ),
-        ExportScope::EntireArchive => None,
+        ],
+        ExportScope::SelectedConversations => {
+            let ids = request
+                .conversation_ids
+                .into_iter()
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>();
+            if ids.is_empty() {
+                return Err(ApiError::invalid_query());
+            }
+            ids
+        }
+        ExportScope::DateRange | ExportScope::EntireArchive => Vec::new(),
     };
-    let query = MessageQuery {
-        conversation_id,
+    let starts_at = parse_export_date(request.start_date.as_deref(), false)?;
+    let ends_at = parse_export_date(request.end_date.as_deref(), true)?;
+    if request.scope == ExportScope::DateRange && starts_at.is_none() && ends_at.is_none() {
+        return Err(ApiError::invalid_query());
+    }
+    if let (Some(start), Some(end)) = (starts_at, ends_at) {
+        if start >= end {
+            return Err(ApiError::invalid_query());
+        }
+    }
+    let base_query = MessageQuery {
+        conversation_id: None,
         participant_id: if request.scope == ExportScope::CurrentFilter {
             request.participant_id
         } else {
@@ -2778,8 +3452,8 @@ async fn create_export_job(
         } else {
             None
         },
-        starts_at: None,
-        ends_at: None,
+        starts_at,
+        ends_at: ends_at.map(|value| value - TimeDelta::nanoseconds(1)),
         message_type: if request.scope == ExportScope::CurrentFilter {
             message_type
         } else {
@@ -2798,7 +3472,25 @@ async fn create_export_job(
     let scope = request.scope;
     let result = tokio::task::spawn_blocking(move || {
         let store = ArchiveStore::open_read_only(&archive_path).map_err(ApiError::from_store)?;
-        let mut messages = query_all_messages(&store, query).map_err(ApiError::from_store)?;
+        let mut messages = if conversation_ids.is_empty() {
+            query_all_messages(&store, base_query).map_err(ApiError::from_store)?
+        } else {
+            let mut combined = Vec::new();
+            for conversation_id in conversation_ids {
+                let mut query = base_query.clone();
+                query.conversation_id = Some(conversation_id);
+                combined.extend(query_all_messages(&store, query).map_err(ApiError::from_store)?);
+            }
+            combined.sort_by(|left, right| {
+                left.sent_at
+                    .cmp(&right.sent_at)
+                    .then_with(|| left.stable_message_id.cmp(&right.stable_message_id))
+            });
+            if !base_query.sort_ascending {
+                combined.reverse();
+            }
+            combined
+        };
         if request.data_redaction {
             redact_sensitive_messages(&mut messages);
         }
@@ -2862,7 +3554,6 @@ async fn create_export_job(
                 missing_reason: item.missing_reason.clone(),
             })
             .collect::<Vec<_>>();
-        let export_id = Uuid::new_v4();
         let export_root = data_root.join("exports");
         std::fs::create_dir_all(&export_root).map_err(|_| ApiError::store())?;
         let extension = match format {
@@ -2871,13 +3562,6 @@ async fn create_export_job(
             ExportFormat::Html => "html",
             ExportFormat::Md => "md",
         };
-        let file_name = format!(
-            "archive-export-{}-{}.{}",
-            Utc::now().format("%Y%m%d-%H%M%S"),
-            export_id.simple(),
-            extension
-        );
-        let target = export_root.join(&file_name);
         let package = ExportPackage {
             archive_id: "default".into(),
             scope,
@@ -2892,6 +3576,8 @@ async fn create_export_job(
             conversation_order_ascending: request.conversation_order.is_ascending(),
             message_order_ascending: request.message_order.is_ascending(),
         };
+        let _export_file_lock = EXPORT_FILE_LOCK.lock().map_err(|_| ApiError::store())?;
+        let (file_name, target) = next_export_file(&export_root, extension);
         let result = export_package(&package, &target, &AtomicBool::new(false))
             .map_err(ApiError::from_export)?;
         Ok::<_, ApiError>((file_name, result))
@@ -2954,13 +3640,8 @@ async fn create_local_export(
             ExportFormat::Html => "html",
             ExportFormat::Md => "md",
         };
-        let file_name = format!(
-            "local-export-{}-{}.{}",
-            Utc::now().format("%Y%m%d-%H%M%S"),
-            export_id.simple(),
-            extension
-        );
-        let target = export_root.join(&file_name);
+        let _export_file_lock = EXPORT_FILE_LOCK.lock().map_err(|_| ApiError::store())?;
+        let (file_name, target) = next_export_file(&export_root, extension);
         if format == ExportFormat::Json && !request.simplify {
             sort_export_for_output(
                 &mut export,
@@ -3261,9 +3942,15 @@ fn authorize_enterprise_upload(
             constant_time_equal(
                 actual_hex.as_bytes(),
                 collector.upload_token_sha256.as_bytes(),
-            )
+            ) && collector.revoked_at.is_none()
         })
-        .map(|collector| Some(collector.collector_id.clone()))
+        .map(|collector| {
+            if !collector.enabled {
+                return Err(ApiError::unauthorized());
+            }
+            Ok(Some(collector.collector_id.clone()))
+        })
+        .transpose()?
         .ok_or_else(ApiError::unauthorized)
 }
 
@@ -3528,6 +4215,38 @@ mod tests {
 
     const TEST_TOKEN: &str = "0123456789abcdefghijklmnop";
 
+    #[test]
+    fn private_collector_url_selects_listener_address() {
+        assert_eq!(
+            configured_private_listen_address("http://10.10.1.202:9812"),
+            Some("10.10.1.202:9812".parse().unwrap())
+        );
+        assert_eq!(
+            configured_private_listen_address("http://192.168.1.20:9812/api/v1/imports/enterprise"),
+            Some("192.168.1.20:9812".parse().unwrap())
+        );
+        assert_eq!(
+            configured_private_listen_address("http://[fd12:3456::20]:9812/api"),
+            Some("[fd12:3456::20]:9812".parse().unwrap())
+        );
+        assert_eq!(
+            configured_private_listen_address("http://127.0.0.1:9812"),
+            None
+        );
+        assert_eq!(
+            configured_private_listen_address("http://8.8.8.8:9812"),
+            None
+        );
+        assert_eq!(
+            configured_private_listen_address("http://archive.example:9812"),
+            None
+        );
+        assert_eq!(
+            configured_private_listen_address("http://10.10.1.202"),
+            None
+        );
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -3556,6 +4275,7 @@ mod tests {
             local_collection_progress: Arc::new(Mutex::new(LocalCollectionProgress::default())),
             local_collection_running: Arc::new(AtomicBool::new(false)),
             archive_update: watch::channel(0).0,
+            network_mode: "loopback_only",
         }
     }
 
@@ -3614,6 +4334,9 @@ mod tests {
                 scope: ExportScope::EntireArchive,
                 format: ExportFormat::Json,
                 conversation_id: None,
+                conversation_ids: Vec::new(),
+                start_date: None,
+                end_date: None,
                 participant_id: None,
                 text: None,
                 message_type: None,
@@ -4285,6 +5008,9 @@ mod tests {
                 scope: ExportScope::EntireArchive,
                 format: ExportFormat::Json,
                 conversation_id: None,
+                conversation_ids: Vec::new(),
+                start_date: None,
+                end_date: None,
                 participant_id: None,
                 text: None,
                 message_type: None,
@@ -4456,5 +5182,278 @@ mod tests {
             Some("账号 admin 密码 [敏感数据已脱敏]")
         );
         assert!(!serde_json::to_string(&messages).unwrap().contains("secret"));
+    }
+
+    fn device_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn generated_collector_heartbeat_update_and_revoke_flow() {
+        let directory = TestDirectory::new();
+        let template = directory.0.join("collector-template.exe");
+        std::fs::write(&template, b"collector").unwrap();
+        let mut app_state = state(&directory);
+        app_state.collector_template = Some(Arc::new(template));
+        {
+            let mut config = app_state.enterprise_config.lock().unwrap();
+            config.organization_name = "测试组织".into();
+            config.upload_url = "http://127.0.0.1:9812".into();
+            config.collector_schedule = CollectionSchedule {
+                mode: CollectionScheduleMode::Interval,
+                interval_minutes: 30,
+                daily_time: "02:00".into(),
+            };
+        }
+
+        let generated = generate_collector(State(app_state.clone()), authorized_headers())
+            .await
+            .unwrap()
+            .0;
+        let enrollment: serde_json::Value = serde_json::from_str(&generated.artifact).unwrap();
+        let collector_id = enrollment["collectorId"].as_str().unwrap().to_owned();
+        let device_token = enrollment["uploadToken"].as_str().unwrap().to_owned();
+        assert_eq!(enrollment["configRevision"], 1);
+        let before_connection = collection_target_response(
+            &app_state.enterprise_config.lock().unwrap(),
+            &directory.0,
+            Local::now(),
+        );
+        assert_eq!(before_connection.targets.len(), 1);
+
+        let signature = decode_hex(enrollment["signatureHex"].as_str().unwrap()).unwrap();
+        let signing_public = decode_hex(
+            &app_state
+                .enterprise_config
+                .lock()
+                .unwrap()
+                .signing_public_key_hex,
+        )
+        .unwrap();
+        let record = app_state
+            .enterprise_config
+            .lock()
+            .unwrap()
+            .collectors
+            .iter()
+            .find(|collector| collector.collector_id == collector_id)
+            .unwrap()
+            .clone();
+        let desired =
+            collector_desired_config(&app_state.enterprise_config.lock().unwrap(), &record);
+        let signed_payload = serde_json::to_vec(&json!({
+            "schemaVersion": "collector-control.v1",
+            "configRevision": enrollment["configRevision"],
+            "expiresAt": enrollment["configExpiresAt"],
+            "config": desired,
+        }))
+        .unwrap();
+        enterprise_crypto::verify(&signing_public, &signed_payload, &signature).unwrap();
+
+        let heartbeat = collector_heartbeat(
+            State(app_state.clone()),
+            AxumPath(collector_id.clone()),
+            ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42310))),
+            device_headers(&device_token),
+            Json(CollectorHeartbeatRequest {
+                client_version: Some("1.2.4".into()),
+                current_config_revision: Some(0),
+                last_applied_revision: Some(0),
+                last_run_at: Some("2026-09-23T01:00:00Z".into()),
+                last_success_at: Some("2026-09-23T01:01:00Z".into()),
+                last_error: None,
+                last_manual_collection_request_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(heartbeat.status, "ok");
+        assert_eq!(heartbeat.control.unwrap().config_revision, 1);
+        let after_connection = collection_target_response(
+            &app_state.enterprise_config.lock().unwrap(),
+            &directory.0,
+            Local::now(),
+        );
+        assert_eq!(after_connection.targets.len(), 2);
+        assert_eq!(
+            after_connection.targets[1].client_ip.as_deref(),
+            Some("192.0.2.10")
+        );
+
+        let update = update_collector(
+            State(app_state.clone()),
+            AxumPath(collector_id.clone()),
+            authorized_headers(),
+            Json(CollectorUpdateRequest {
+                display_name: "已停用采集端".into(),
+                enabled: false,
+                include_media: true,
+                data_redaction: true,
+                offline_export_enabled: true,
+                collection_notice: "测试告知".into(),
+                schedule: CollectionSchedule {
+                    mode: CollectionScheduleMode::Daily,
+                    interval_minutes: 60,
+                    daily_time: "03:30".into(),
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(update["config"]["configRevision"], 2);
+        assert_eq!(update["config"]["enabled"], false);
+
+        let disabled_heartbeat = collector_heartbeat(
+            State(app_state.clone()),
+            AxumPath(collector_id.clone()),
+            ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42311))),
+            device_headers(&device_token),
+            Json(CollectorHeartbeatRequest {
+                client_version: Some("1.2.4".into()),
+                current_config_revision: Some(1),
+                last_applied_revision: Some(1),
+                last_run_at: None,
+                last_success_at: None,
+                last_error: Some("test_error".into()),
+                last_manual_collection_request_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(disabled_heartbeat.status, "disabled");
+        assert_eq!(disabled_heartbeat.control.unwrap().config_revision, 2);
+        assert!(
+            authorize_enterprise_upload(
+                &device_headers(&device_token),
+                &app_state.token_sha256,
+                &app_state.enterprise_config,
+            )
+            .is_err()
+        );
+
+        let reenabled = update_collector(
+            State(app_state.clone()),
+            AxumPath(collector_id.clone()),
+            authorized_headers(),
+            Json(CollectorUpdateRequest {
+                display_name: "重新启用采集端".into(),
+                enabled: true,
+                include_media: false,
+                data_redaction: true,
+                offline_export_enabled: false,
+                collection_notice: "测试告知".into(),
+                schedule: CollectionSchedule {
+                    mode: CollectionScheduleMode::Interval,
+                    interval_minutes: 15,
+                    daily_time: "03:30".into(),
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(reenabled["config"]["configRevision"], 3);
+        assert!(
+            authorize_enterprise_upload(
+                &device_headers(&device_token),
+                &app_state.token_sha256,
+                &app_state.enterprise_config,
+            )
+            .is_ok()
+        );
+
+        let queued = request_collector_collection(
+            State(app_state.clone()),
+            AxumPath(collector_id.clone()),
+            authorized_headers(),
+        )
+        .await
+        .unwrap()
+        .0;
+        let request_id = queued["requestId"].as_str().unwrap().to_owned();
+        assert_eq!(queued["queued"], true);
+        let requested = collector_heartbeat(
+            State(app_state.clone()),
+            AxumPath(collector_id.clone()),
+            ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42312))),
+            device_headers(&device_token),
+            Json(CollectorHeartbeatRequest {
+                client_version: Some("0.0.5".into()),
+                current_config_revision: Some(3),
+                last_applied_revision: Some(3),
+                last_run_at: None,
+                last_success_at: None,
+                last_error: None,
+                last_manual_collection_request_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            requested
+                .control
+                .unwrap()
+                .config
+                .manual_collection_request_id,
+            Some(request_id.clone())
+        );
+        let completed = collector_heartbeat(
+            State(app_state.clone()),
+            AxumPath(collector_id.clone()),
+            ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42313))),
+            device_headers(&device_token),
+            Json(CollectorHeartbeatRequest {
+                client_version: Some("0.0.5".into()),
+                current_config_revision: Some(4),
+                last_applied_revision: Some(4),
+                last_run_at: None,
+                last_success_at: None,
+                last_error: None,
+                last_manual_collection_request_id: Some(request_id),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            completed
+                .control
+                .unwrap()
+                .config
+                .manual_collection_request_id,
+            None
+        );
+
+        let _ = revoke_collector(
+            State(app_state.clone()),
+            AxumPath(collector_id.clone()),
+            authorized_headers(),
+        )
+        .await
+        .unwrap();
+        let revoked = collector_heartbeat(
+            State(app_state),
+            AxumPath(collector_id),
+            ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42314))),
+            device_headers(&device_token),
+            Json(CollectorHeartbeatRequest {
+                client_version: None,
+                current_config_revision: Some(3),
+                last_applied_revision: Some(3),
+                last_run_at: None,
+                last_success_at: None,
+                last_error: None,
+                last_manual_collection_request_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(revoked.status, StatusCode::UNAUTHORIZED);
     }
 }

@@ -9,6 +9,7 @@ it("allows replacing the entire interval value and accepts one-minute steps", ()
   expect(screen.getByLabelText("按间隔")).toBeChecked();
   expect(screen.getByLabelText("每日定时")).not.toBeChecked();
   const input = screen.getByLabelText("间隔（分钟）");
+  expect(input.parentElement).toHaveTextContent("分钟");
   expect(input).toHaveAttribute("step", "1");
   expect(input).toHaveAttribute("min", "1");
 

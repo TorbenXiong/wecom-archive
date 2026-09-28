@@ -10,6 +10,15 @@ fn main() {
         std::process::exit(wecom_archive_desktop::run_key_probe());
     }
     if is_collector() {
+        #[cfg(windows)]
+        let _instance_guard = match collector_instance::acquire() {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                collector_instance::show_already_running();
+                return;
+            }
+            Err(_) => exit_with_error("无法确认采集端是否已启动。"),
+        };
         wecom_archive_desktop::run();
         return;
     }
@@ -33,8 +42,8 @@ fn main() {
                 tauri::WebviewUrl::External(page_url.clone()),
             )
             .title("企业微信记录归档")
-            .inner_size(1380.0, 820.0)
-            .min_inner_size(980.0, 640.0)
+            .inner_size(1480.0, 900.0)
+            .min_inner_size(1120.0, 700.0)
             .resizable(true)
             .center()
             .build()?;
@@ -95,6 +104,91 @@ fn show_error(message: &str) {
     }
     unsafe {
         MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10);
+    }
+}
+
+#[cfg(windows)]
+mod collector_instance {
+    use std::ffi::{OsStr, c_void};
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateMutexW(
+            attributes: *const c_void,
+            initial_owner: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn GetLastError() -> u32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    pub struct Guard(*mut c_void);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    pub fn acquire() -> Result<Option<Guard>, ()> {
+        let executable = std::env::current_exe().map_err(|_| ())?;
+        let bytes =
+            archive_transfer::read_enterprise_collector_config(&executable).map_err(|_| ())?;
+        let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
+        let id = config
+            .get("collectorId")
+            .and_then(|value| value.as_str())
+            .ok_or(())?;
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(());
+        }
+        let name: Vec<u16> = OsStr::new(&format!("Local\\WeComArchiveCollector-{id}"))
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(());
+        }
+        if unsafe { GetLastError() } == 183 {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Ok(None);
+        }
+        Ok(Some(Guard(handle)))
+    }
+
+    pub fn show_already_running() {
+        super::show_notice("采集已启动，请从系统托盘打开采集端。")
+    }
+}
+
+#[cfg(windows)]
+fn show_notice(message: &str) {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    let text: Vec<u16> = std::ffi::OsStr::new(message)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let title: Vec<u16> = std::ffi::OsStr::new("企业微信采集端")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(hwnd: *mut c_void, text: *const u16, title: *const u16, kind: u32) -> i32;
+    }
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x40);
     }
 }
 

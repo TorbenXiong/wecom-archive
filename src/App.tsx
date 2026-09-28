@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { LoaderCircle, ShieldCheck } from "lucide-react";
 import { ConversationList } from "./components/ConversationList";
-import { CollectionSchedulePage } from "./components/CollectionSchedulePage";
 import { DetailPanel } from "./components/DetailPanel";
 import { LocalExportPage } from "./components/LocalExportPage";
 import { MessageTimeline } from "./components/MessageTimeline";
 import { Navigation } from "./components/Navigation";
-import { ExportDialog, LocalCollectionDialog, LocalCollectionSetupDialog, ServerAccessGate, Toast } from "./components/Overlays";
+import { ExportDialog, LocalCollectionDialog, LocalCollectionSetupDialog, ServerAccessGate, Toast, type ExportSelection } from "./components/Overlays";
 import { SettingsPage } from "./components/SettingsPage";
 import { ServerConfigPage } from "./components/ServerConfigPage";
 import type { ConversationSummary, ExportFormat, ExportScope, MessageItem, ParticipantItem } from "./domain/types";
@@ -37,7 +36,7 @@ import {
 } from "./lib/server-api";
 import "./styles.css";
 
-type Section = "conversations" | "local-export" | "server-config" | "collection-schedules" | "settings";
+type Section = "conversations" | "local-export" | "server-config" | "settings";
 
 const emptySummary: ServerArchiveSummary = { conversation_count: 0, message_count: 0, media_count: 0, revision: 0, local_collection_available: false };
 const DEFAULT_MESSAGE_PAGE_SIZE = 200;
@@ -211,6 +210,11 @@ export default function App() {
     setShowLocalCollectionSetup(true);
   };
 
+  const openLocalCollectionFromConversation = () => {
+    setSection("server-config");
+    openLocalCollectionSetup();
+  };
+
   useEffect(() => {
     if (!token || !collectingLocal) return;
     const controller = new AbortController();
@@ -316,7 +320,7 @@ export default function App() {
   }, [refreshVersion, selectedId, superAdminEnabled, token]);
 
   const selectedConversation = conversations.find((item) => item.id === selectedId) ?? emptyConversation;
-  const isFullPageSection = section === "server-config" || section === "collection-schedules" || section === "settings" || section === "local-export";
+  const isFullPageSection = section === "server-config" || section === "settings" || section === "local-export";
   const openSearchResult = (result: GlobalSearchResult) => {
     if (!conversations.some((conversation) => conversation.id === result.conversation_id)) {
       const conversation = mapSearchConversation(result);
@@ -343,14 +347,14 @@ export default function App() {
   return <div className="app-shell">
     <div className={section === "local-export" ? "workspace-grid local-export-mode" : isFullPageSection ? "workspace-grid settings-mode" : !superAdminEnabled || !selectedConversation.isGroup ? "workspace-grid no-detail" : detailCollapsed ? "workspace-grid detail-collapsed" : "workspace-grid"}>
       <Navigation active={section} onSelect={setSection} />
-      {section === "server-config" ? <ServerConfigPage token={token} onTokenChanged={setToken} /> : section === "collection-schedules" ? <CollectionSchedulePage token={token} /> : section === "settings" ? <SettingsPage token={token} superAdminEnabled={superAdminEnabled} onSuperAdminChange={setSuperAdminEnabled} /> : section === "local-export" ? <LocalExportPage token={token} onCompleted={(result) => showExportCompleted(result, "本机导出完成")} onFailed={(error) => setToast({ message: error instanceof Error ? error.message : "本机导出失败。", tone: "error" })} /> : <>
-        <ConversationList token={token} conversations={conversations} selectedId={selectedId} messageSortAscending={messageSortAscending} superAdminEnabled={superAdminEnabled} collectedUsers={collectedUsers} onSelect={(id) => { selectedConversationOverride.current = undefined; setTargetMessageId(undefined); setSelectedId(id); }} onOpenSearchResult={openSearchResult} onExport={() => setShowExport(true)} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal} onOpenLocalCollection={openLocalCollectionSetup} importing={importing} onImport={(file) => void importPackage(file)} />
+      {section === "server-config" ? <ServerConfigPage token={token} onTokenChanged={setToken} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal} onOpenLocalCollection={openLocalCollectionSetup} /> : section === "settings" ? <SettingsPage token={token} superAdminEnabled={superAdminEnabled} onSuperAdminChange={setSuperAdminEnabled} /> : section === "local-export" ? <LocalExportPage token={token} onCompleted={(result) => showExportCompleted(result, "本机导出完成")} onFailed={(error) => setToast({ message: error instanceof Error ? error.message : "本机导出失败。", tone: "error" })} /> : <>
+        <ConversationList token={token} conversations={conversations} selectedId={selectedId} messageSortAscending={messageSortAscending} superAdminEnabled={superAdminEnabled} collectedUsers={collectedUsers} onSelect={(id) => { selectedConversationOverride.current = undefined; setTargetMessageId(undefined); setSelectedId(id); }} onOpenSearchResult={openSearchResult} onExport={() => setShowExport(true)} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal} onOpenLocalCollection={openLocalCollectionFromConversation} importing={importing} onImport={(file) => void importPackage(file)} />
         {superAdminEnabled ? <MessageTimeline token={token} conversation={selectedConversation} messages={messages} participants={participants} sortAscending={messageSortAscending} onSortChange={(ascending) => { setMessageSortAscending(ascending); setMessagePage(0); }} status={messageStatus} targetMessageId={targetMessageId} onTargetLocated={() => setTargetMessageId(undefined)} pageIndex={messagePage} pageSize={messagePageSize} totalMessages={messageTotal} totalPages={Math.max(1, Math.ceil(messageTotal / messagePageSize))} onPageSizeChange={(size) => setMessagePageSize(size)} onPageChange={(page) => setMessagePage(page)} onPreviousPage={() => setMessagePage((current) => Math.max(0, current - 1))} onNextPage={() => setMessagePage((current) => current + 1)} /> : <main className="content-gate"><ShieldCheck size={28} /><h2>会话内容已隐藏</h2></main>}
         {superAdminEnabled && selectedConversation.isGroup && <DetailPanel conversation={selectedConversation} participants={participants} messages={messages} collapsed={detailCollapsed} onToggleCollapsed={() => setDetailCollapsed((current) => !current)} />}
       </>}
     </div>
     <footer className="status-bar"><span>已归档 {summary.message_count.toLocaleString("zh-CN")} 条消息 · {summary.media_count.toLocaleString("zh-CN")} 项媒体 · {summary.conversation_count.toLocaleString("zh-CN")} 个会话</span><span><i />受控访问 · 审计已启用</span></footer>
-     {showExport && superAdminEnabled && <ExportDialog token={token} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" ? summary.message_count : scope === "current_filter" ? messages.length : selectedConversation.messageCount} mediaCount={scope === "entire_archive" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async () => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
+     {showExport && superAdminEnabled && <ExportDialog token={token} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} conversations={conversations} selectedConversationId={selectedId} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" || scope === "date_range" ? summary.message_count : scope === "current_filter" ? messages.length : scope === "selected_conversations" ? 0 : selectedConversation.messageCount} mediaCount={scope === "entire_archive" || scope === "date_range" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async (selection: ExportSelection) => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, conversationIds: selection.conversationIds, startDate: selection.startDate, endDate: selection.endDate, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
     {showLocalCollectionSetup && !collectingLocal && <LocalCollectionSetupDialog onClose={() => setShowLocalCollectionSetup(false)} onCollect={(includeMedia) => { setShowLocalCollectionSetup(false); void collectLocal(includeMedia); }} />}
     {collectingLocal && <LocalCollectionDialog progress={collectionProgress} />}
     {toast && <Toast tone={toast.tone} actionLabel={toast.actionLabel} onAction={toast.onAction} onClose={() => setToast(undefined)}>{toast.message}</Toast>}

@@ -8,6 +8,12 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     clearScreen: false,
+    // The collector is loaded through Tauri's embedded asset protocol rather
+    // than a normal HTTP origin. Absolute `/assets/...` URLs can therefore
+    // resolve outside the bundled frontend and leave the native window blank.
+    // Keep the workspace's normal root-relative URLs while making the
+    // standalone collector self-contained.
+    base: target === "client" ? "./" : "/",
     define: {
       "import.meta.env.VITE_APP_TARGET": JSON.stringify(target),
     },

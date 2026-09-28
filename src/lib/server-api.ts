@@ -1,4 +1,4 @@
-import type { MessageDirection, MessageType } from "../domain/types";
+import type { ExportScope, MessageDirection, MessageType } from "../domain/types";
 
 export interface ServerArchiveSummary {
   conversation_count: number;
@@ -105,7 +105,6 @@ export interface EnterpriseConfig {
   configured: boolean;
   organizationId: string;
   organizationName: string;
-  collectionNotice: string;
   uploadUrl: string;
   keyId: string;
   includeMedia: boolean;
@@ -127,6 +126,69 @@ export interface CollectionSchedule {
 export interface CollectionSchedules {
   localPlans: LocalCollectionPlan[];
   collectorPlans: CollectorPlan[];
+}
+
+export type CollectionTargetKind = "server" | "collector";
+export type CollectionTargetStatus = "online" | "offline" | "disabled" | "revoked";
+
+export interface CollectionPlan {
+  id: string;
+  name: string;
+  includeMedia: boolean;
+  schedule: CollectionSchedule;
+  createdAt: string;
+  updatedAt: string;
+  lastRunAt?: string;
+  lastUploadAt?: string;
+  lastStatus?: "success" | "error";
+  lastDetail?: string;
+  nextRunAt?: string;
+}
+
+export interface CollectionTarget {
+  targetId: string;
+  kind: CollectionTargetKind;
+  displayName: string;
+  status: CollectionTargetStatus;
+  lastSeenAt?: string;
+  clientIp?: string;
+  clientVersion?: string;
+  configRevision?: number;
+  lastAppliedRevision?: number;
+  lastError?: string;
+  includeMedia?: boolean;
+  dataRedaction?: boolean;
+  offlineExportEnabled?: boolean;
+  plans: CollectionPlan[];
+}
+
+export interface CollectionTargetsResponse {
+  targets: CollectionTarget[];
+}
+
+export interface CollectorDesiredConfig {
+  collectorId: string;
+  displayName: string;
+  enabled: boolean;
+  configRevision: number;
+  organizationId: string;
+  organizationName: string;
+  uploadUrl: string;
+  keyId: string;
+  publicKeyHex: string;
+  includeMedia: boolean;
+  dataRedaction: boolean;
+  offlineExportEnabled: boolean;
+  schedule: CollectionSchedule;
+  manualCollectionRequestId?: string;
+}
+
+export interface CollectorControlResponse {
+  schemaVersion: "collector-control.v1";
+  configRevision: number;
+  expiresAt: string;
+  config: CollectorDesiredConfig;
+  signatureHex: string;
 }
 
 export interface LocalCollectionPlan {
@@ -153,6 +215,7 @@ export interface CollectorPlan {
   schedule: CollectionSchedule;
   createdAt: string;
   lastUploadAt?: string;
+  lastRunAt?: string;
   nextRunAt?: string;
   executableAvailable: boolean;
 }
@@ -167,9 +230,12 @@ export interface CollectorResult {
 }
 
 export interface ServerExportRequest {
-  scope: "current_conversation" | "current_filter" | "entire_archive";
+  scope: ExportScope;
   format: "json" | "csv" | "html" | "md";
   conversationId?: string;
+  conversationIds?: string[];
+  startDate?: string;
+  endDate?: string;
   participantId?: string;
   text?: string;
   messageType?: MessageType;
@@ -324,8 +390,35 @@ export function updateSuperAdmin(token: string, enabled: boolean): Promise<{ sup
   });
 }
 
-export function getCollectionSchedules(token: string): Promise<CollectionSchedules> {
-  return request<CollectionSchedules>("/api/v1/collection-schedules", token);
+export function getCollectionTargets(token: string): Promise<CollectionTargetsResponse> {
+  return request<CollectionTargetsResponse>("/api/v1/collection-targets", token);
+}
+
+export function getCollector(token: string, collectorId: string): Promise<{ collector: CollectorPlan; status: CollectionTargetStatus; config: CollectorDesiredConfig }> {
+  return request<{ collector: CollectorPlan; status: CollectionTargetStatus; config: CollectorDesiredConfig }>(`/api/v1/collectors/${encodeURIComponent(collectorId)}`, token);
+}
+
+export function updateCollector(token: string, collectorId: string, input: {
+  displayName: string;
+  enabled: boolean;
+  includeMedia: boolean;
+  dataRedaction: boolean;
+  offlineExportEnabled: boolean;
+  schedule: CollectionSchedule;
+}): Promise<{ config: CollectorDesiredConfig; status: string }> {
+  return request<{ config: CollectorDesiredConfig; status: string }>(`/api/v1/collectors/${encodeURIComponent(collectorId)}`, token, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+}
+
+export function revokeCollector(token: string, collectorId: string): Promise<{ revoked: boolean }> {
+  return request<{ revoked: boolean }>(`/api/v1/collectors/${encodeURIComponent(collectorId)}/revoke`, token, { method: "POST" });
+}
+
+export function requestCollectorCollection(token: string, collectorId: string): Promise<{ queued: boolean; requestId: string }> {
+  return request<{ queued: boolean; requestId: string }>(`/api/v1/collectors/${encodeURIComponent(collectorId)}/collect`, token, { method: "POST" });
 }
 
 export function createLocalCollectionPlan(token: string, input: { name: string; includeMedia: boolean; schedule: CollectionSchedule }): Promise<CollectionSchedules> {
@@ -368,7 +461,6 @@ export function regenerateServerAccessToken(currentToken: string): Promise<{ acc
 
 export function updateEnterpriseConfig(token: string, config: {
   organizationName: string;
-  collectionNotice: string;
   uploadUrl: string;
   keyId?: string;
   includeMedia?: boolean;

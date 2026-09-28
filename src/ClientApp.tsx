@@ -1,5 +1,6 @@
 import { CheckCircle2, Download, LoaderCircle, RefreshCw, Upload } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { InfoDialog } from "./components/Overlays";
 import type { CollectionSchedule } from "./domain/types";
 import { backend, formatBackendError, type CollectionSummary, type CollectorScheduleStatus } from "./lib/backend";
@@ -21,10 +22,11 @@ export default function ClientApp() {
   const [uploading, setUploading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [info, setInfo] = useState<ClientInfo>();
-  const [organizationName, setOrganizationName] = useState<string>();
+  const [displayName, setDisplayName] = useState("采集端");
   const [offlineExportEnabled, setOfflineExportEnabled] = useState(false);
   const [scheduleDescription, setScheduleDescription] = useState("后台计划未启用");
   const [scheduleStatus, setScheduleStatus] = useState<CollectorScheduleStatus>({ running: false });
+  const [offlineExportPrompt, setOfflineExportPrompt] = useState(false);
 
   const prepare = useCallback(async () => {
     setState("preparing");
@@ -32,7 +34,7 @@ export default function ClientApp() {
     setStatus("正在准备…");
     try {
       const bootstrap = await backend.bootstrap();
-      setOrganizationName(bootstrap.organizationName);
+      setDisplayName(bootstrap.displayName || `${bootstrap.organizationName || "组织"}采集端`);
       setOfflineExportEnabled(bootstrap.offlineExportEnabled ?? false);
       setScheduleDescription(describeSchedule(bootstrap.collectorSchedule));
       const sources = await backend.discoverSources();
@@ -43,18 +45,19 @@ export default function ClientApp() {
       if (bootstrap.collectorSchedule && bootstrap.collectorSchedule.mode !== "disabled") {
         try {
           await backend.uploadLatest();
-          setStatus(`${bootstrap.organizationName || "组织"}采集端已完成首次自动采集并上传，之后将按计划自动采集并上传，无需手动操作。${bootstrap.collectionNotice || ""}`);
+          setStatus("采集端已完成首次自动采集并上传，之后将按计划自动采集并上传，无需手动操作。");
         } catch (reason) {
           setStatus(`采集已准备，但首次自动上传失败：${formatBackendError(reason, "请检查服务端连接，后台计划会继续重试。")}`);
         } finally {
           await backend.hideCollectorWindow();
         }
       } else {
-        setStatus(`${bootstrap.organizationName || "组织"}专属采集已准备完成。${bootstrap.collectionNotice || ""}`);
+        setStatus("本机数据已采集，可手动上传或导出。");
       }
       setState("ready");
     } catch (reason) {
-      setStatus(formatBackendError(reason, "自动解析未完成，请保持企业微信运行后重试。"));
+      const message = formatBackendError(reason, "自动解析未完成，请保持企业微信运行后重试。");
+      setStatus(message);
       setState("failed");
     }
   }, []);
@@ -80,6 +83,18 @@ export default function ClientApp() {
     const timer = window.setInterval(() => void refresh(), 5000);
     return () => { active = false; window.clearInterval(timer); };
   }, []);
+  useEffect(() => {
+    if (!backend.isNative()) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void listen("collector:open-offline-export", () => {
+      if (active && offlineExportEnabled) setOfflineExportPrompt(true);
+    }).then((dispose) => {
+      if (active) unlisten = dispose;
+      else dispose();
+    });
+    return () => { active = false; unlisten?.(); };
+  }, [offlineExportEnabled]);
 
   const uploadCollection = async () => {
     if (state !== "ready" || uploading || exporting) return;
@@ -93,6 +108,7 @@ export default function ClientApp() {
   };
 
   const exportCollection = async () => {
+    setOfflineExportPrompt(false);
     if (state !== "ready" || uploading || exporting || !offlineExportEnabled) return;
     setExporting(true);
     try {
@@ -106,11 +122,12 @@ export default function ClientApp() {
   return <div className="collector-shell">
     <main className="collector-main"><section className={`collector-card ${state}`}>
       <span className="collector-state-icon">{state === "preparing" && <LoaderCircle className="spin" />}{state === "ready" && <CheckCircle2 />}{state === "failed" && <RefreshCw />}</span>
-      <h1>{state === "preparing" ? "正在准备" : state === "ready" ? `${organizationName || "组织"}采集端` : "自动解析未完成"}</h1>
-      <p>{status}</p><small className="collector-schedule-status">{scheduleDescription}；确认后收起到托盘继续运行；右键托盘图标可退出。{scheduleStatus.running ? "后台计划正在执行。" : scheduleStatus.lastError ? `最近执行失败：${scheduleStatus.lastError}` : scheduleStatus.lastSuccessAt ? `最近成功：${new Date(scheduleStatus.lastSuccessAt).toLocaleString("zh-CN", { hour12: false })}` : ""}</small>
+      <h1>{state === "preparing" ? "正在采集本机数据" : state === "ready" ? displayName : "采集未完成"}</h1>
+      <p>{status}</p><small className="collector-schedule-status">{scheduleDescription}。关闭窗口后仍在托盘运行；左键托盘图标可打开{offlineExportEnabled ? "离线导出" : "采集端"}，右键可退出。{scheduleStatus.running ? "后台采集正在执行。" : scheduleStatus.lastError ? `最近执行失败：${scheduleStatus.lastError}` : scheduleStatus.lastSuccessAt ? `最近成功：${new Date(scheduleStatus.lastSuccessAt).toLocaleString("zh-CN", { hour12: false })}` : ""}</small>
       {state === "ready" && <div className="collector-result"><strong>{summary?.messageCount.toLocaleString("zh-CN")}</strong><span>条消息</span><i /><span>{summary?.mediaCount.toLocaleString("zh-CN")} 项媒体引用</span></div>}
       {state === "failed" ? <button className="primary-button collector-main-button" type="button" onClick={() => void prepare()}><RefreshCw size={17} />重试</button> : <div className={offlineExportEnabled ? "collector-action-grid" : "collector-action-grid single"}><button className="primary-button collector-main-button" disabled={state !== "ready" || uploading || exporting} type="button" onClick={uploadCollection}>{uploading ? <><LoaderCircle className="spin" size={17} />正在上传…</> : <><Upload size={17} />上传到归档工作台</>}</button>{offlineExportEnabled && <button className="secondary-button collector-main-button" disabled={state !== "ready" || uploading || exporting} type="button" onClick={() => void exportCollection()}>{exporting ? <><LoaderCircle className="spin" size={17} />正在导出…</> : <><Download size={17} />导出加密文件</>}</button>}</div>}
     </section></main>
     {info && <InfoDialog title={info.title} tone={info.tone} actionLabel={info.openDirectory ? "打开目录" : undefined} onAction={info.openDirectory ? () => void backend.openOfflineExportDirectory() : undefined} onConfirm={() => setInfo(undefined)}>{info.message}</InfoDialog>}
+    {offlineExportPrompt && <div className="modal-backdrop" role="presentation"><section className="modal-card collector-offline-export-dialog" role="dialog" aria-modal="true" aria-labelledby="collector-offline-export-title"><span className="modal-icon"><Download /></span><h2 id="collector-offline-export-title">离线导出</h2><p>将当前已采集数据导出为加密文件，供管理员稍后导入归档工作台。</p><div className="modal-actions"><button className="secondary-button" type="button" onClick={() => setOfflineExportPrompt(false)}>取消</button><button className="primary-button" type="button" onClick={() => void exportCollection()} disabled={state !== "ready" || uploading || exporting}>{exporting ? "正在导出…" : "开始导出"}</button></div></section></div>}
   </div>;
 }

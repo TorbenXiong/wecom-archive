@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use source_windows::WindowsSourceAdapter;
 use tauri::menu::{MenuBuilder, MenuItem};
-use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, State};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager, State};
 use zeroize::{Zeroize, Zeroizing};
 
 mod sqlite3mc;
@@ -29,16 +29,30 @@ mod sqlite3mc;
 const LOCAL_NOTICE_VERSION: &str = "client-notice.v1";
 const LOCAL_NOTICE_TEXT: &str = "加密传输本机企业微信聊天记录到服务端";
 
+static OFFLINE_EXPORT_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+fn next_offline_export_file(directory: &Path) -> (String, PathBuf) {
+    loop {
+        let file_name = format!("wecom-{}.wca", Local::now().format("%Y%m%d-%H%M%S"));
+        let target = directory.join(&file_name);
+        if !target.exists() {
+            return (file_name, target);
+        }
+        // A repeated export in the same second must never replace the first file.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BootstrapResponse {
     organization_name: Option<String>,
-    collection_notice: Option<String>,
+    display_name: Option<String>,
     offline_export_enabled: bool,
     collector_schedule: CollectionSchedule,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EnterpriseCollectorConfig {
     schema_version: String,
@@ -52,6 +66,16 @@ struct EnterpriseCollectorConfig {
     upload_url: String,
     upload_token: String,
     #[serde(default)]
+    collector_id: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    config_revision: u64,
+    #[serde(default)]
+    config_expires_at: Option<String>,
+    #[serde(default = "default_collector_enabled")]
+    enabled: bool,
+    #[serde(default)]
     include_files: bool,
     #[serde(default)]
     include_images: bool,
@@ -59,6 +83,8 @@ struct EnterpriseCollectorConfig {
     data_redaction: bool,
     #[serde(default)]
     offline_export_enabled: bool,
+    #[serde(default)]
+    manual_collection_request_id: Option<String>,
     #[serde(default)]
     collector_schedule: CollectionSchedule,
 }
@@ -93,6 +119,10 @@ fn default_data_redaction() -> bool {
 
 fn default_schedule_daily_time() -> String {
     "02:00".into()
+}
+
+fn default_collector_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -376,6 +406,11 @@ struct CollectorScheduleStatus {
     last_media_count: Option<u64>,
     uploaded_count: u64,
     next_run_at: Option<String>,
+    #[serde(skip)]
+    manual_collection_attempted_id: Option<String>,
+    #[serde(skip)]
+    server_authorization_denied: bool,
+    last_manual_collection_request_id: Option<String>,
 }
 
 fn message_fingerprints(export: &ClientExportV1) -> BTreeMap<String, String> {
@@ -417,10 +452,11 @@ fn record_upload_success(state: &AppState, export: &ClientExportV1) {
 
 #[tauri::command]
 fn bootstrap() -> Result<BootstrapResponse, CommandError> {
+    let _ = sync_collector_config_with_status(None);
     let config = load_enterprise_collector_config()?;
     Ok(BootstrapResponse {
         organization_name: Some(config.organization_name),
-        collection_notice: Some(config.collection_notice),
+        display_name: (!config.display_name.is_empty()).then_some(config.display_name),
         offline_export_enabled: config.offline_export_enabled,
         collector_schedule: config.collector_schedule,
     })
@@ -505,6 +541,7 @@ async fn collect_source(
     // 否则 Tauri 主线程会被拖住，窗口表现为“未响应”或只显示空白页。
     let result = tauri::async_runtime::spawn_blocking(move || {
         let config = load_enterprise_collector_config()?;
+        ensure_collector_config_fresh(&config)?;
         let media_options = MediaCollectionOptions {
             include_files: config.include_files,
             include_images: config.include_images,
@@ -642,6 +679,7 @@ async fn upload_latest_enterprise(
     let result: Result<UploadResult, CommandError> =
         tauri::async_runtime::spawn_blocking(move || {
             let config = load_enterprise_collector_config()?;
+            ensure_collector_config_fresh(&config)?;
             let export = state
                 .latest_export
                 .lock()
@@ -710,12 +748,10 @@ fn export_latest_enterprise(
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .ok_or_else(internal_error)?;
-    let file_name = format!(
-        "WeComArchive-{}-{}.wca",
-        Local::now().format("%Y%m%d-%H%M%S"),
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    );
-    let target = directory.join(&file_name);
+    let _export_file_lock = OFFLINE_EXPORT_FILE_LOCK
+        .lock()
+        .map_err(|_| internal_error())?;
+    let (file_name, target) = next_offline_export_file(&directory);
     let partial = directory.join(format!(".{file_name}.partial"));
     let result = (|| -> Result<(), std::io::Error> {
         let mut output = std::fs::OpenOptions::new()
@@ -843,15 +879,46 @@ fn post_enterprise_package(
         })
 }
 
+fn collector_control_payload(
+    config: &EnterpriseCollectorConfig,
+    expires_at: &str,
+) -> Result<Vec<u8>, CommandError> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": "collector-control.v1",
+        "configRevision": config.config_revision,
+        "expiresAt": expires_at,
+        "config": {
+            "collectorId": config.collector_id,
+            "displayName": config.display_name,
+            "enabled": config.enabled,
+            "configRevision": config.config_revision,
+            "organizationId": config.organization_id,
+            "organizationName": config.organization_name,
+            "collectionNotice": config.collection_notice,
+            "uploadUrl": config.upload_url,
+            "keyId": config.key_id,
+            "publicKeyHex": config.public_key_hex,
+            "includeMedia": config.include_files || config.include_images,
+            "dataRedaction": config.data_redaction,
+            "offlineExportEnabled": config.offline_export_enabled,
+            "manualCollectionRequestId": config.manual_collection_request_id,
+            "schedule": config.collector_schedule,
+        },
+    }))
+    .map_err(|_| internal_error())
+}
+
 fn load_enterprise_collector_config() -> Result<EnterpriseCollectorConfig, CommandError> {
     let executable = std::env::current_exe().map_err(|_| internal_error())?;
-    let bytes = archive_transfer::read_enterprise_collector_config(&executable).map_err(|_| {
-        CommandError {
+    let bytes = source_windows::dpapi::load_current_user(&collector_runtime_config_path())
+        .map(|bytes| bytes.to_vec())
+        .map_err(|error| error.to_string())
+        .or_else(|_| archive_transfer::read_enterprise_collector_config(&executable))
+        .map_err(|_| CommandError {
             code: "ENTERPRISE_CONFIG_MISSING",
             message: "采集端内未找到企业配置。".into(),
             recoverable: false,
-        }
-    })?;
+        })?;
     let config: EnterpriseCollectorConfig =
         serde_json::from_slice(&bytes).map_err(|_| CommandError {
             code: "ENTERPRISE_CONFIG_INVALID",
@@ -874,16 +941,30 @@ fn load_enterprise_collector_config() -> Result<EnterpriseCollectorConfig, Comma
         message: "企业采集配置中的签名无效。".into(),
         recoverable: false,
     })?;
-    let signing_payload = collector_signing_payload(&config);
-    let signature_valid = source_windows::enterprise_crypto::verify(
-        &signing_public_key,
-        signing_payload.as_bytes(),
-        &signature,
-    )
-    .is_ok()
-        || verify_legacy_collector_signature(&config, &signing_public_key, &signature, true)
-        || (!config.offline_export_enabled
-            && verify_legacy_collector_signature(&config, &signing_public_key, &signature, false));
+    let signature_valid = if let Some(expires_at) = config.config_expires_at.as_deref() {
+        collector_control_payload(&config, expires_at)
+            .ok()
+            .is_some_and(|payload| {
+                source_windows::enterprise_crypto::verify(&signing_public_key, &payload, &signature)
+                    .is_ok()
+            })
+    } else {
+        let signing_payload = collector_signing_payload(&config);
+        source_windows::enterprise_crypto::verify(
+            &signing_public_key,
+            signing_payload.as_bytes(),
+            &signature,
+        )
+        .is_ok()
+            || verify_legacy_collector_signature(&config, &signing_public_key, &signature, true)
+            || (!config.offline_export_enabled
+                && verify_legacy_collector_signature(
+                    &config,
+                    &signing_public_key,
+                    &signature,
+                    false,
+                ))
+    };
     if !signature_valid {
         return Err(CommandError {
             code: "ENTERPRISE_CONFIG_SIGNATURE_INVALID",
@@ -907,6 +988,254 @@ fn load_enterprise_collector_config() -> Result<EnterpriseCollectorConfig, Comma
         });
     }
     Ok(config)
+}
+
+fn ensure_collector_config_fresh(config: &EnterpriseCollectorConfig) -> Result<(), CommandError> {
+    if config
+        .config_expires_at
+        .as_deref()
+        .is_some_and(|expires_at| {
+            chrono::DateTime::parse_from_rfc3339(expires_at)
+                .ok()
+                .is_none_or(|value| value.with_timezone(&Utc) <= Utc::now())
+        })
+    {
+        return Err(CommandError {
+            code: "ENTERPRISE_CONFIG_EXPIRED",
+            message: "企业采集配置已过期，请等待服务端同步。".into(),
+            recoverable: true,
+        });
+    }
+    Ok(())
+}
+
+fn collector_runtime_config_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("collector-config.dpapi")
+}
+
+#[tauri::command]
+fn verify_collector_control_envelope(
+    control: &serde_json::Value,
+    signing_public_key_hex: &str,
+    current_revision: u64,
+) -> Result<(), CommandError> {
+    if control
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_str)
+        != Some("collector-control.v1")
+    {
+        return Err(CommandError {
+            code: "COLLECTOR_CONFIG_INVALID",
+            message: "服务端控制配置版本无效。".into(),
+            recoverable: true,
+        });
+    }
+    let revision = control
+        .get("configRevision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CommandError {
+            code: "COLLECTOR_CONFIG_INVALID",
+            message: "服务端控制配置修订号无效。".into(),
+            recoverable: true,
+        })?;
+    if revision < current_revision {
+        return Err(CommandError {
+            code: "COLLECTOR_CONFIG_ROLLBACK",
+            message: "服务端返回了较旧的采集配置，已拒绝应用。".into(),
+            recoverable: true,
+        });
+    }
+    let expires_at = control
+        .get("expiresAt")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CommandError {
+            code: "COLLECTOR_CONFIG_INVALID",
+            message: "服务端控制配置缺少有效期。".into(),
+            recoverable: true,
+        })?;
+    if chrono::DateTime::parse_from_rfc3339(expires_at)
+        .ok()
+        .is_none_or(|value| value.with_timezone(&Utc) <= Utc::now())
+    {
+        return Err(CommandError {
+            code: "COLLECTOR_CONFIG_EXPIRED",
+            message: "服务端控制配置已过期。".into(),
+            recoverable: true,
+        });
+    }
+    let signature = control
+        .get("signatureHex")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| CommandError {
+            code: "COLLECTOR_CONFIG_INVALID",
+            message: "服务端控制配置缺少签名。".into(),
+            recoverable: true,
+        })?;
+    let payload = serde_json::json!({
+        "schemaVersion": "collector-control.v1",
+        "configRevision": revision,
+        "expiresAt": expires_at,
+        "config": control.get("config").ok_or_else(internal_error)?,
+    });
+    let public_key = hex::decode(signing_public_key_hex).map_err(|_| CommandError {
+        code: "COLLECTOR_CONFIG_INVALID",
+        message: "服务端签名公钥无效。".into(),
+        recoverable: true,
+    })?;
+    let signature = hex::decode(signature).map_err(|_| CommandError {
+        code: "COLLECTOR_CONFIG_INVALID",
+        message: "服务端控制配置签名无效。".into(),
+        recoverable: true,
+    })?;
+    let bytes = serde_json::to_vec(&payload).map_err(|_| internal_error())?;
+    source_windows::enterprise_crypto::verify(&public_key, &bytes, &signature).map_err(|_| {
+        CommandError {
+            code: "COLLECTOR_CONFIG_SIGNATURE_INVALID",
+            message: "服务端控制配置签名校验失败。".into(),
+            recoverable: true,
+        }
+    })
+}
+
+fn server_base_url(upload_url: &str) -> &str {
+    upload_url
+        .trim_end_matches('/')
+        .strip_suffix("/api/v1/imports/enterprise")
+        .unwrap_or(upload_url.trim_end_matches('/'))
+}
+
+fn sync_collector_config_with_status(
+    status_state: Option<&Arc<Mutex<CollectorScheduleStatus>>>,
+) -> Result<(), CommandError> {
+    let current = load_enterprise_collector_config()?;
+    if current.collector_id.is_empty() {
+        return Ok(());
+    }
+    let endpoint = format!(
+        "{}/api/v1/collectors/{}/heartbeat",
+        server_base_url(&current.upload_url),
+        current.collector_id
+    );
+    let status = status_state.and_then(|state| state.lock().ok().map(|value| value.clone()));
+    let current_revision = if ensure_collector_config_fresh(&current).is_ok() {
+        current.config_revision
+    } else {
+        0
+    };
+    let body = serde_json::to_vec(&serde_json::json!({ "clientVersion": env!("CARGO_PKG_VERSION"), "currentConfigRevision": current_revision, "lastAppliedRevision": current.config_revision, "lastRunAt": status.as_ref().and_then(|value| value.last_attempt_at.clone()), "lastSuccessAt": status.as_ref().and_then(|value| value.last_success_at.clone()), "lastError": status.as_ref().and_then(|value| value.last_error.clone()), "lastManualCollectionRequestId": status.as_ref().and_then(|value| value.last_manual_collection_request_id.clone()) })).map_err(|_| internal_error())?;
+    let mut child = Command::new("curl.exe")
+        .args([
+            "--fail-with-body",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            "-X",
+            "POST",
+            "-H",
+            &format!("Authorization: Bearer {}", current.upload_token),
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+            &endpoint,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .map_err(|_| internal_error())?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(&body).map_err(|_| internal_error())?;
+    }
+    let output = child.wait_with_output().map_err(|_| internal_error())?;
+    if !output.status.success() {
+        if serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .and_then(|body| {
+                body.get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some("UNAUTHORIZED")
+            && let Some(state) = status_state
+            && let Ok(mut status) = state.lock()
+        {
+            status.server_authorization_denied = true;
+            status.last_error = Some("采集端授权已失效，后台采集已停止。".into());
+        }
+        return Ok(());
+    }
+    if let Some(state) = status_state
+        && let Ok(mut status) = state.lock()
+    {
+        status.server_authorization_denied = false;
+    }
+    let response: serde_json::Value =
+        serde_json::from_slice(&output.stdout).map_err(|_| internal_error())?;
+    let Some(control) = response.get("control") else {
+        return Ok(());
+    };
+    verify_collector_control_envelope(
+        control,
+        &current.signing_public_key_hex,
+        current.config_revision,
+    )?;
+    let config = control.get("config").ok_or_else(internal_error)?;
+    let mut artifact = serde_json::to_value(&current).map_err(|_| internal_error())?;
+    let object = artifact.as_object_mut().ok_or_else(internal_error)?;
+    for (from, to) in [
+        ("displayName", "displayName"),
+        ("organizationName", "organizationName"),
+        ("collectionNotice", "collectionNotice"),
+        ("uploadUrl", "uploadUrl"),
+        ("keyId", "keyId"),
+        ("publicKeyHex", "publicKeyHex"),
+        ("dataRedaction", "dataRedaction"),
+        ("offlineExportEnabled", "offlineExportEnabled"),
+        ("manualCollectionRequestId", "manualCollectionRequestId"),
+        ("schedule", "collectorSchedule"),
+        ("configRevision", "configRevision"),
+    ] {
+        if let Some(value) = config.get(from) {
+            object.insert(to.into(), value.clone());
+        }
+    }
+    if let Some(include_media) = config.get("includeMedia") {
+        object.insert("includeFiles".into(), include_media.clone());
+        object.insert("includeImages".into(), include_media.clone());
+    }
+    if let Some(value) = control.get("expiresAt") {
+        object.insert("configExpiresAt".into(), value.clone());
+    }
+    if let Some(value) = config.get("displayName") {
+        object.insert("displayName".into(), value.clone());
+    }
+    if let Some(value) = control.get("signatureHex") {
+        object.insert("signatureHex".into(), value.clone());
+    }
+    if let Some(enabled) = config.get("enabled").and_then(|value| value.as_bool()) {
+        object.insert("enabled".into(), enabled.into());
+    }
+    let path = collector_runtime_config_path();
+    source_windows::dpapi::store_current_user(
+        &path,
+        &serde_json::to_vec_pretty(&artifact).map_err(|_| internal_error())?,
+    )
+    .map_err(|_| internal_error())
+}
+
+#[tauri::command]
+fn sync_collector_config(state: State<'_, AppState>) -> Result<(), CommandError> {
+    sync_collector_config_with_status(Some(&state.schedule_status))
 }
 
 fn collector_signing_payload(config: &EnterpriseCollectorConfig) -> String {
@@ -2912,19 +3241,44 @@ pub fn run() {
             .center()
             .icon(collector_tray_icon())?
             .build()?;
+            let open = MenuItem::with_id(app, "open", "打开采集端", true, None::<&str>)?;
+            let export = MenuItem::with_id(app, "export", "离线导出…", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出采集端", true, None::<&str>)?;
-            let menu = MenuBuilder::new(app).items(&[&quit]).build()?;
-            let schedule_tip = load_enterprise_collector_config()
-                .ok()
+            let collector_config = load_enterprise_collector_config().ok();
+            let offline_export_enabled = collector_config
+                .as_ref()
+                .is_some_and(|config| config.offline_export_enabled);
+            let menu = if offline_export_enabled {
+                MenuBuilder::new(app)
+                    .items(&[&open, &export, &quit])
+                    .build()?
+            } else {
+                MenuBuilder::new(app).items(&[&open, &quit]).build()?
+            };
+            let schedule_tip = collector_config
                 .map(|config| describe_collector_schedule(&config.collector_schedule))
                 .unwrap_or_else(|| "采集计划加载中".into());
             let mut tray = TrayIconBuilder::with_id("collector-tray")
                 .menu(&menu)
                 .tooltip(schedule_tip.clone())
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id().as_ref() {
+                .on_menu_event(move |app, event| match event.id().as_ref() {
+                    "open" => open_collector_window(app, false),
+                    "export" if offline_export_enabled => open_collector_window(app, true),
                     "quit" => app.exit(0),
                     _ => {}
+                })
+                .on_tray_icon_event(move |tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        open_collector_window(tray.app_handle(), offline_export_enabled);
+                    }
                 });
             tray = tray.icon(collector_tray_icon());
             tray.build(app)?;
@@ -2966,6 +3320,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap,
+            sync_collector_config,
             get_collector_schedule_status,
             hide_collector_window,
             discover_sources,
@@ -2989,21 +3344,85 @@ pub fn run() {
         .expect("desktop runtime failed");
 }
 
+fn open_collector_window(app: &tauri::AppHandle, request_export: bool) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_skip_taskbar(false);
+        let _ = window.show();
+        let _ = window.set_focus();
+        if request_export {
+            let _ = window.emit("collector:open-offline-export", ());
+        }
+    }
+}
+
 fn collector_scheduler(state: AppState) {
     let config = match load_enterprise_collector_config() {
         Ok(config) => config,
         Err(_) => return,
     };
-    let schedule = config.collector_schedule.clone();
+    let mut schedule = config.collector_schedule.clone();
     let mut next_run = next_schedule_at(&schedule, Local::now());
     set_next_run(&state, next_run);
     loop {
         std::thread::sleep(Duration::from_secs(15));
+        let _ = sync_collector_config_with_status(Some(&state.schedule_status));
         if state.scheduler_shutdown.load(Ordering::Acquire) {
             return;
         }
+        let latest = match load_enterprise_collector_config() {
+            Ok(config) => config,
+            Err(_) => continue,
+        };
+        if state
+            .schedule_status
+            .lock()
+            .is_ok_and(|status| status.server_authorization_denied)
+        {
+            set_next_run(&state, None);
+            continue;
+        }
+        if !latest.enabled {
+            set_next_run(&state, None);
+            continue;
+        }
+        if let Some(request_id) = latest.manual_collection_request_id.clone() {
+            let should_run = state
+                .schedule_status
+                .lock()
+                .map(|status| {
+                    status.last_manual_collection_request_id.as_deref() != Some(request_id.as_str())
+                        && status.manual_collection_attempted_id.as_deref()
+                            != Some(request_id.as_str())
+                })
+                .unwrap_or(false);
+            if should_run {
+                if let Ok(mut status) = state.schedule_status.lock() {
+                    status.manual_collection_attempted_id = Some(request_id.clone());
+                }
+                if let Some(result) = run_collection_and_record(&state, &latest) {
+                    if result.is_ok()
+                        && let Ok(mut status) = state.schedule_status.lock()
+                    {
+                        status.last_manual_collection_request_id = Some(request_id);
+                    } else if let Ok(mut status) = state.schedule_status.lock() {
+                        status.manual_collection_attempted_id = None;
+                    }
+                    schedule = latest.collector_schedule.clone();
+                    next_run = next_schedule_at(&schedule, Local::now());
+                    set_next_run(&state, next_run);
+                    continue;
+                } else if let Ok(mut status) = state.schedule_status.lock() {
+                    status.manual_collection_attempted_id = None;
+                }
+            }
+        }
+        if latest.collector_schedule != schedule {
+            schedule = latest.collector_schedule.clone();
+            next_run = next_schedule_at(&schedule, Local::now());
+            set_next_run(&state, next_run);
+        }
         let Some(due_at) = next_run else {
-            return;
+            continue;
         };
         if schedule.mode == CollectionScheduleMode::Interval
             && let Ok(status) = state.schedule_status.lock()
@@ -3018,33 +3437,7 @@ fn collector_scheduler(state: AppState) {
         if Local::now() < due_at {
             continue;
         }
-        if state
-            .collection_running
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            let guard = CollectionRunGuard(Arc::clone(&state.collection_running));
-            if let Ok(mut status) = state.schedule_status.lock() {
-                status.running = true;
-                status.last_attempt_at = Some(Utc::now().to_rfc3339());
-                status.last_error = None;
-            }
-            let result = scheduled_collect_and_upload(&state, &config);
-            if let Ok(mut status) = state.schedule_status.lock() {
-                status.running = false;
-                match result {
-                    Ok(outcome) => {
-                        status.last_message_count = Some(outcome.summary.message_count);
-                        status.last_media_count = Some(outcome.summary.media_count);
-                        if let Some(completed_at) = outcome.completed_at {
-                            status.last_success_at = Some(completed_at);
-                        }
-                    }
-                    Err(error) => status.last_error = Some(error.message),
-                }
-            }
-            drop(guard);
-        }
+        let _ = run_collection_and_record(&state, &latest);
         if state.scheduler_shutdown.load(Ordering::Acquire) {
             return;
         }
@@ -3055,6 +3448,40 @@ fn collector_scheduler(state: AppState) {
         };
         set_next_run(&state, next_run);
     }
+}
+
+fn run_collection_and_record(
+    state: &AppState,
+    config: &EnterpriseCollectorConfig,
+) -> Option<Result<ScheduledCollectionOutcome, CommandError>> {
+    if state
+        .collection_running
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return None;
+    }
+    let _guard = CollectionRunGuard(Arc::clone(&state.collection_running));
+    if let Ok(mut status) = state.schedule_status.lock() {
+        status.running = true;
+        status.last_attempt_at = Some(Utc::now().to_rfc3339());
+        status.last_error = None;
+    }
+    let result = scheduled_collect_and_upload(state, config);
+    if let Ok(mut status) = state.schedule_status.lock() {
+        status.running = false;
+        match &result {
+            Ok(outcome) => {
+                status.last_message_count = Some(outcome.summary.message_count);
+                status.last_media_count = Some(outcome.summary.media_count);
+                if let Some(completed_at) = outcome.completed_at.as_ref() {
+                    status.last_success_at = Some(completed_at.clone());
+                }
+            }
+            Err(error) => status.last_error = Some(error.message.clone()),
+        }
+    }
+    Some(result)
 }
 
 fn set_next_run(state: &AppState, next: Option<chrono::DateTime<Local>>) {
@@ -3989,6 +4416,73 @@ mod tests {
             export.media_count,
             streamed_files.load(std::sync::atomic::Ordering::Relaxed),
             export.missing_media_count
+        );
+    }
+
+    #[test]
+    fn collector_control_envelope_rejects_rollback_expiry_and_bad_signature() {
+        let (public_key, private_key) =
+            source_windows::enterprise_crypto::generate_rsa_key_pair().unwrap();
+        let expires_at = (Utc::now() + TimeDelta::minutes(5)).to_rfc3339();
+        let control_config = serde_json::json!({
+            "collectorId": "collector-test",
+            "displayName": "测试采集端",
+            "enabled": true,
+            "configRevision": 3,
+            "organizationId": "org-test",
+            "organizationName": "测试组织",
+            "collectionNotice": "测试告知",
+            "uploadUrl": "http://127.0.0.1:9812/api/v1/imports/enterprise",
+            "keyId": "key-test",
+            "publicKeyHex": "aa",
+            "includeMedia": false,
+            "dataRedaction": true,
+            "offlineExportEnabled": false,
+            "schedule": { "mode": "interval", "intervalMinutes": 15, "dailyTime": "02:00" }
+        });
+        let payload = serde_json::json!({
+            "schemaVersion": "collector-control.v1",
+            "configRevision": 3,
+            "expiresAt": expires_at,
+            "config": control_config,
+        });
+        let signature = source_windows::enterprise_crypto::sign(
+            &private_key,
+            &serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+        let control = serde_json::json!({
+            "schemaVersion": "collector-control.v1",
+            "configRevision": 3,
+            "expiresAt": payload["expiresAt"],
+            "config": payload["config"],
+            "signatureHex": hex::encode(signature),
+        });
+        let public_hex = hex::encode(public_key);
+        verify_collector_control_envelope(&control, &public_hex, 2).unwrap();
+        assert_eq!(
+            verify_collector_control_envelope(&control, &public_hex, 4)
+                .unwrap_err()
+                .code,
+            "COLLECTOR_CONFIG_ROLLBACK"
+        );
+
+        let mut expired = control.clone();
+        expired["expiresAt"] = (Utc::now() - TimeDelta::minutes(1)).to_rfc3339().into();
+        assert_eq!(
+            verify_collector_control_envelope(&expired, &public_hex, 0)
+                .unwrap_err()
+                .code,
+            "COLLECTOR_CONFIG_EXPIRED"
+        );
+
+        let mut invalid = control;
+        invalid["signatureHex"] = "00".into();
+        assert_eq!(
+            verify_collector_control_envelope(&invalid, &public_hex, 0)
+                .unwrap_err()
+                .code,
+            "COLLECTOR_CONFIG_SIGNATURE_INVALID"
         );
     }
 }

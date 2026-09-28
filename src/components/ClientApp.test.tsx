@@ -7,7 +7,7 @@ afterEach(() => vi.restoreAllMocks());
 
 describe("collector", () => {
   it("performs the first automatic upload immediately when a continuous plan is enabled", async () => {
-    vi.spyOn(backend, "bootstrap").mockResolvedValue({ organizationName: "计划企业", collectionNotice: "测试告知", offlineExportEnabled: false, collectorSchedule: { mode: "interval", intervalMinutes: 15, dailyTime: "02:00" } });
+    vi.spyOn(backend, "bootstrap").mockResolvedValue({ organizationName: "计划企业", offlineExportEnabled: false, collectorSchedule: { mode: "interval", intervalMinutes: 15, dailyTime: "02:00" } });
     const uploadLatest = vi.spyOn(backend, "uploadLatest").mockResolvedValue({ messageCount: 238 });
     const hide = vi.spyOn(backend, "hideCollectorWindow").mockResolvedValue();
     render(<ClientApp />);
@@ -21,8 +21,8 @@ describe("collector", () => {
     const uploadLatest = vi.spyOn(backend, "uploadLatest");
     render(<ClientApp />);
 
-    expect(screen.getByRole("heading", { name: "正在准备" })).toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: "示例组织采集端" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "正在采集本机数据" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "示例采集端" })).toBeInTheDocument();
     expect(screen.queryByText("导出格式")).not.toBeInTheDocument();
     expect(screen.queryByText("选择目录")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "导出加密文件" })).toBeInTheDocument();
@@ -37,11 +37,11 @@ describe("collector", () => {
     const exportLatest = vi.spyOn(backend, "exportLatestEncrypted");
     const openDirectory = vi.spyOn(backend, "openOfflineExportDirectory");
     render(<ClientApp />);
-    await screen.findByRole("heading", { name: "示例组织采集端" });
+    await screen.findByRole("heading", { name: "示例采集端" });
 
     fireEvent.click(screen.getByRole("button", { name: "导出加密文件" }));
     expect(await screen.findByRole("heading", { name: "导出完成" })).toBeInTheDocument();
-    expect(screen.getByText(/WeComArchive-preview\.wca/)).toBeInTheDocument();
+    expect(screen.getByText(/wecom-20260924-182016\.wca/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "打开目录" }));
     expect(exportLatest).toHaveBeenCalledOnce();
     expect(openDirectory).toHaveBeenCalledOnce();
@@ -51,7 +51,7 @@ describe("collector", () => {
     let rejectUpload!: (reason: Error) => void;
     vi.spyOn(backend, "uploadLatest").mockImplementation(() => new Promise((_, reject) => { rejectUpload = reject; }));
     render(<ClientApp />);
-    await screen.findByRole("heading", { name: "示例组织采集端" });
+    await screen.findByRole("heading", { name: "示例采集端" });
 
     fireEvent.click(screen.getByRole("button", { name: "上传到归档工作台" }));
     await waitFor(() => expect(backend.uploadLatest).toHaveBeenCalledOnce());

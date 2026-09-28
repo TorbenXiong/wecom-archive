@@ -4,59 +4,69 @@ import { CollectionSchedulePage } from "./CollectionSchedulePage";
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
-it("adds and independently updates local plans while listing generated collector plans", async () => {
+it("renders server and remote collectors in one list and edits local plans", async () => {
   const requests: Array<{ method: string; url: string; body?: Record<string, unknown> }> = [];
-  let schedules = {
-    localPlans: [{ id: "plan-1", name: "早班采集", includeMedia: false, schedule: { mode: "interval", intervalMinutes: 30, dailyTime: "02:00" }, createdAt: "2026-09-21T01:00:00Z", updatedAt: "2026-09-21T01:00:00Z", nextRunAt: "2026-09-21T01:30:00Z" }],
-    collectorPlans: [{ collectorId: "collector-1", fileName: "collector-1.exe", organizationName: "测试企业", uploadUrl: "http://127.0.0.1:9812/api/v1/imports/enterprise", includeMedia: true, dataRedaction: false, offlineExportEnabled: false, schedule: { mode: "daily", intervalMinutes: 60, dailyTime: "03:00" }, createdAt: "2026-09-21T01:00:00Z", nextRunAt: "2026-09-22T03:00:00Z", executableAvailable: true }],
+  let targets = {
+    targets: [
+      { targetId: "server", kind: "server", displayName: "测试服务端", status: "online", plans: [{ id: "plan-1", name: "早班采集", includeMedia: false, schedule: { mode: "interval", intervalMinutes: 30, dailyTime: "02:00" }, createdAt: "2026-09-21T01:00:00Z", updatedAt: "2026-09-21T01:00:00Z", nextRunAt: "2026-09-21T01:30:00Z" }] },
+      { targetId: "collector-1", kind: "collector", displayName: "采集端 abc12345", clientIp: "10.0.0.2", status: "offline", clientVersion: "0.1.0", includeMedia: true, dataRedaction: true, offlineExportEnabled: false, lastSeenAt: "2026-09-21T02:00:00Z", plans: [{ id: "collector-1", name: "销售电脑", includeMedia: true, schedule: { mode: "daily", intervalMinutes: 60, dailyTime: "03:00" }, createdAt: "2026-09-21T01:00:00Z", updatedAt: "2026-09-21T01:00:00Z", nextRunAt: "2026-09-22T03:00:00Z" }] },
+    ],
   };
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = String(input); const method = init?.method || "GET"; const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
-    requests.push({ method, url, body });
-    if (method === "POST") schedules = { ...schedules, localPlans: [...schedules.localPlans, { id: "plan-2", name: String(body?.name), includeMedia: Boolean(body?.includeMedia), schedule: body?.schedule as typeof schedules.localPlans[0]["schedule"], createdAt: "2026-09-21T02:00:00Z", updatedAt: "2026-09-21T02:00:00Z", nextRunAt: "2026-09-21T02:30:00Z" }] };
-    if (method === "PUT") schedules = { ...schedules, localPlans: schedules.localPlans.map((plan) => url.endsWith(plan.id) ? { ...plan, name: String(body?.name), includeMedia: Boolean(body?.includeMedia), schedule: body?.schedule as typeof plan.schedule } : plan) };
-    return Response.json(schedules);
+    const url = String(input); const method = init?.method || "GET"; const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined; requests.push({ method, url, body });
+    if (url.endsWith("/api/v1/enterprise/config")) return Response.json({ organizationName: "测试服务端", uploadUrl: "http://127.0.0.1:9812", keyId: "test-key", includeMedia: false, dataRedaction: true, offlineExportEnabled: false });
+    if (method === "PUT") targets = { ...targets, targets: targets.targets.map((target) => target.kind === "server" ? { ...target, plans: [{ ...target.plans[0], name: String(body?.name), includeMedia: Boolean(body?.includeMedia), schedule: body?.schedule as typeof target.plans[0]["schedule"] }] } : target) };
+    return Response.json(targets);
   }));
-
   render(<CollectionSchedulePage token="test-token" />);
-  expect(await screen.findByText("collector-1.exe")).toBeInTheDocument();
-  expect(screen.getByText(/预计下次：/)).toBeInTheDocument();
-  expect(screen.getByRole("tab", { name: "采集端" })).toHaveAttribute("aria-selected", "true");
-  expect(screen.queryByDisplayValue("早班采集")).not.toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: "添加本机计划" })).not.toBeInTheDocument();
-  expect(screen.queryByRole("heading", { name: "采集计划" })).not.toBeInTheDocument();
-  expect(screen.queryByText("维护多条本机采集计划，并查看已生成采集端携带的持续采集计划。")).not.toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: /保存/ })).not.toBeInTheDocument();
+  expect((await screen.findAllByText("10.0.0.2")).length).toBeGreaterThan(0);
+  expect(screen.getByText(/IP：10\.0\.0\.2/)).toBeInTheDocument();
+  expect(screen.getByText(/全内容.*脱敏.*不支持离线导出/)).toBeInTheDocument();
+  expect(screen.getByText(/采集计划：每日 03:00 执行/)).toBeInTheDocument();
+  expect(screen.queryByText(/配置 \d+\/\d+/)).not.toBeInTheDocument();
+  expect(screen.getByText("本机", { selector: "strong" })).toBeInTheDocument();
+  expect(screen.queryByText("不含图片和文件")).not.toBeInTheDocument();
+  expect(screen.queryByText("已启用脱敏")).not.toBeInTheDocument();
+  expect(screen.queryByText("不支持离线导出")).not.toBeInTheDocument();
+  expect(screen.queryByRole("tab", { name: "采集端" })).not.toBeInTheDocument();
+  expect(screen.getByRole("switch", { name: "编辑模式" })).not.toBeChecked();
+  fireEvent.click(screen.getByRole("switch", { name: "编辑模式" }));
+  expect(screen.queryAllByRole("button", { name: "编辑" })).toHaveLength(0);
+  expect(screen.getByText("本机", { selector: "strong" })).toBeInTheDocument();
+  expect(screen.getAllByText("采集计划", { selector: ".collector-inline-plan > span" })).toHaveLength(2);
+  expect(screen.getByRole("checkbox", { name: "含文件和图片：本机" })).toBeInTheDocument();
+  expect(screen.getByRole("checkbox", { name: "数据脱敏：本机" })).toBeInTheDocument();
+  expect(screen.getByRole("checkbox", { name: "支持离线导出：本机" })).toBeInTheDocument();
+  expect(screen.queryByText("启用采集")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "添加采集计划" })).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("间隔（分钟）"), { target: { value: "45" } });
+  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  await waitFor(() => expect(requests).toContainEqual(expect.objectContaining({ method: "PUT", url: expect.stringContaining("/plan-1") })));
+  expect(requests.find((request) => request.url.endsWith("/plan-1"))?.body?.schedule).toMatchObject({ intervalMinutes: 45 });
+});
 
-  fireEvent.click(screen.getByRole("tab", { name: "本机" }));
-  expect(await screen.findByDisplayValue("早班采集")).toBeInTheDocument();
-  expect(screen.getByText(/预计下次：/)).toBeInTheDocument();
-  expect(screen.queryByText("collector-1.exe")).not.toBeInTheDocument();
-  expect(screen.getByRole("tab", { name: "本机" })).toHaveAttribute("aria-selected", "true");
+it("keeps the collector node visible when it has no plans", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ targets: [{ targetId: "server", kind: "server", displayName: "测试服务端", status: "online", plans: [] }] })));
+  render(<CollectionSchedulePage token="test-token" />);
+  expect(await screen.findByText("本机")).toBeInTheDocument();
+  expect(screen.queryByText("暂无采集计划")).not.toBeInTheDocument();
+  expect(screen.queryByRole("article")).not.toBeInTheDocument();
+});
 
-  fireEvent.click(screen.getByRole("button", { name: "添加本机计划" }));
-  const addDialog = screen.getByRole("dialog", { name: "添加本机" });
-  expect(addDialog.querySelector(".schedule-add-heading")).toContainElement(screen.getByRole("heading", { name: "添加本机" }));
-  expect(screen.queryByRole("button", { name: "取消" })).not.toBeInTheDocument();
-  expect(screen.queryByText("触发方式")).not.toBeInTheDocument();
-  const newPlanInterval = addDialog.querySelector<HTMLInputElement>("#new-local-plan-mode-interval");
-  expect(newPlanInterval).not.toBeNull();
-  fireEvent.click(newPlanInterval!);
-  expect(newPlanInterval).toBeChecked();
-  fireEvent.change(screen.getByLabelText("计划名称"), { target: { value: "晚班采集" } });
-  fireEvent.click(screen.getByRole("button", { name: "添加计划" }));
-  await waitFor(() => expect(requests).toContainEqual(expect.objectContaining({ method: "POST", body: expect.objectContaining({ name: "晚班采集" }) })));
-  expect(await screen.findByDisplayValue("晚班采集")).toBeInTheDocument();
-
-  const firstPlanName = screen.getByDisplayValue("早班采集");
-  fireEvent.change(firstPlanName, { target: { value: "晨班采集" } });
-  fireEvent.blur(firstPlanName);
-  await waitFor(() => expect(requests).toContainEqual(expect.objectContaining({ method: "PUT", url: expect.stringContaining("/plan-1"), body: expect.objectContaining({ name: "晨班采集" }) })));
-
-  fireEvent.click(screen.getByLabelText("每日定时", { selector: "#local-plan-plan-1-mode-daily" }));
-  await waitFor(() => expect(requests).toContainEqual(expect.objectContaining({ method: "PUT", url: expect.stringContaining("/plan-1"), body: expect.objectContaining({ schedule: expect.objectContaining({ mode: "daily" }) }) })));
-
-  fireEvent.click(screen.getByRole("tab", { name: "采集端" }));
-  expect(screen.getByText("collector-1.exe")).toBeInTheDocument();
-  expect(screen.queryByDisplayValue("晨班采集")).not.toBeInTheDocument();
+it("shows the remote plan on three rows and aligns both editors with shared controls", async () => {
+  vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+    if (String(input).endsWith("/api/v1/collectors/collector-1")) return Response.json({ config: { displayName: "10.0.0.2", enabled: true, includeMedia: true, dataRedaction: true, offlineExportEnabled: false, schedule: { mode: "interval", intervalMinutes: 20, dailyTime: "02:00" } } });
+    return Response.json({ targets: [{ targetId: "collector-1", kind: "collector", displayName: "10.0.0.2", clientIp: "10.0.0.2", status: "online", configRevision: 1, lastAppliedRevision: 1, plans: [{ id: "collector-1", name: "远程计划", includeMedia: true, schedule: { mode: "interval", intervalMinutes: 20, dailyTime: "02:00" }, lastRunAt: "2026-09-24T10:00:00Z", nextRunAt: "2026-09-24T10:20:00Z" }] }] });
+  }));
+  const { container } = render(<CollectionSchedulePage token="test-token" />);
+  expect(await screen.findByText("采集计划：每 20 分钟执行")).toBeInTheDocument();
+  const summary = container.querySelector(".collector-plan-summary");
+  expect(summary?.children).toHaveLength(3);
+  expect(summary?.children[1]).toHaveTextContent("最近执行：");
+  expect(summary?.children[2]).toHaveTextContent("下次执行：");
+  expect(screen.queryByText(/配置 1\/1/)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("switch", { name: "编辑模式" }));
+  expect(screen.queryByRole("dialog", { name: "编辑采集端" })).not.toBeInTheDocument();
+  expect(screen.getByText("采集计划", { selector: ".collector-inline-plan > span" })).toBeInTheDocument();
+  expect(screen.getByLabelText("间隔（分钟）").parentElement).toHaveTextContent("分钟");
 });
