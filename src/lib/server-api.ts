@@ -110,6 +110,7 @@ export interface EnterpriseConfig {
   includeMedia: boolean;
   dataRedaction: boolean;
   offlineExportEnabled: boolean;
+  hiddenModeEnabled: boolean;
   superAdminEnabled: boolean;
   serverSchedule: CollectionSchedule;
   collectorSchedule: CollectionSchedule;
@@ -159,6 +160,7 @@ export interface CollectionTarget {
   includeMedia?: boolean;
   dataRedaction?: boolean;
   offlineExportEnabled?: boolean;
+  hiddenModeEnabled?: boolean;
   plans: CollectionPlan[];
 }
 
@@ -179,6 +181,7 @@ export interface CollectorDesiredConfig {
   includeMedia: boolean;
   dataRedaction: boolean;
   offlineExportEnabled: boolean;
+  hiddenModeEnabled: boolean;
   schedule: CollectionSchedule;
   manualCollectionRequestId?: string;
 }
@@ -212,6 +215,7 @@ export interface CollectorPlan {
   includeMedia: boolean;
   dataRedaction: boolean;
   offlineExportEnabled: boolean;
+  hiddenModeEnabled: boolean;
   schedule: CollectionSchedule;
   createdAt: string;
   lastUploadAt?: string;
@@ -404,6 +408,7 @@ export function updateCollector(token: string, collectorId: string, input: {
   includeMedia: boolean;
   dataRedaction: boolean;
   offlineExportEnabled: boolean;
+  hiddenModeEnabled?: boolean;
   schedule: CollectionSchedule;
 }): Promise<{ config: CollectorDesiredConfig; status: string }> {
   return request<{ config: CollectorDesiredConfig; status: string }>(`/api/v1/collectors/${encodeURIComponent(collectorId)}`, token, {
@@ -466,6 +471,7 @@ export function updateEnterpriseConfig(token: string, config: {
   includeMedia?: boolean;
   dataRedaction?: boolean;
   offlineExportEnabled?: boolean;
+  hiddenModeEnabled?: boolean;
   superAdminEnabled?: boolean;
   serverSchedule?: CollectionSchedule;
   collectorSchedule?: CollectionSchedule;

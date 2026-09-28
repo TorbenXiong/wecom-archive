@@ -82,6 +82,7 @@ const browserBootstrap: BootstrapState = {
   organizationName: "示例组织",
   displayName: "示例采集端",
   offlineExportEnabled: true,
+  hiddenModeEnabled: false,
   collectorSchedule: { mode: "disabled", intervalMinutes: 60, dailyTime: "02:00" },
 };
 

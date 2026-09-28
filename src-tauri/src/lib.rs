@@ -49,6 +49,7 @@ struct BootstrapResponse {
     organization_name: Option<String>,
     display_name: Option<String>,
     offline_export_enabled: bool,
+    hidden_mode_enabled: bool,
     collector_schedule: CollectionSchedule,
 }
 
@@ -83,6 +84,8 @@ struct EnterpriseCollectorConfig {
     data_redaction: bool,
     #[serde(default)]
     offline_export_enabled: bool,
+    #[serde(default)]
+    hidden_mode_enabled: bool,
     #[serde(default)]
     manual_collection_request_id: Option<String>,
     #[serde(default)]
@@ -393,6 +396,7 @@ struct AppState {
     scheduler_shutdown: Arc<AtomicBool>,
     schedule_status: Arc<Mutex<CollectorScheduleStatus>>,
     uploaded_messages: Arc<Mutex<BTreeMap<String, String>>>,
+    tray_app: Arc<Mutex<Option<tauri::AppHandle>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -452,12 +456,13 @@ fn record_upload_success(state: &AppState, export: &ClientExportV1) {
 
 #[tauri::command]
 fn bootstrap() -> Result<BootstrapResponse, CommandError> {
-    let _ = sync_collector_config_with_status(None);
+    let _ = sync_collector_config_with_status(None, None);
     let config = load_enterprise_collector_config()?;
     Ok(BootstrapResponse {
         organization_name: Some(config.organization_name),
         display_name: (!config.display_name.is_empty()).then_some(config.display_name),
         offline_export_enabled: config.offline_export_enabled,
+        hidden_mode_enabled: config.hidden_mode_enabled,
         collector_schedule: config.collector_schedule,
     })
 }
@@ -901,6 +906,7 @@ fn collector_control_payload(
             "includeMedia": config.include_files || config.include_images,
             "dataRedaction": config.data_redaction,
             "offlineExportEnabled": config.offline_export_enabled,
+            "hiddenModeEnabled": config.hidden_mode_enabled,
             "manualCollectionRequestId": config.manual_collection_request_id,
             "schedule": config.collector_schedule,
         },
@@ -1110,6 +1116,7 @@ fn server_base_url(upload_url: &str) -> &str {
 
 fn sync_collector_config_with_status(
     status_state: Option<&Arc<Mutex<CollectorScheduleStatus>>>,
+    app_state: Option<&AppState>,
 ) -> Result<(), CommandError> {
     let current = load_enterprise_collector_config()?;
     if current.collector_id.is_empty() {
@@ -1172,6 +1179,12 @@ fn sync_collector_config_with_status(
             status.server_authorization_denied = true;
             status.last_error = Some("采集端授权已失效，后台采集已停止。".into());
         }
+        if let Some(state) = app_state {
+            state.scheduler_shutdown.store(true, Ordering::Release);
+            if let Ok(Some(app)) = state.tray_app.lock().map(|handle| handle.clone()) {
+                app.exit(0);
+            }
+        }
         return Ok(());
     }
     if let Some(state) = status_state
@@ -1201,6 +1214,7 @@ fn sync_collector_config_with_status(
         ("publicKeyHex", "publicKeyHex"),
         ("dataRedaction", "dataRedaction"),
         ("offlineExportEnabled", "offlineExportEnabled"),
+        ("hiddenModeEnabled", "hiddenModeEnabled"),
         ("manualCollectionRequestId", "manualCollectionRequestId"),
         ("schedule", "collectorSchedule"),
         ("configRevision", "configRevision"),
@@ -1230,17 +1244,24 @@ fn sync_collector_config_with_status(
         &path,
         &serde_json::to_vec_pretty(&artifact).map_err(|_| internal_error())?,
     )
-    .map_err(|_| internal_error())
+    .map_err(|_| internal_error())?;
+    if let Some(app_state) = app_state
+        && let Ok(Some(app)) = app_state.tray_app.lock().map(|handle| handle.clone())
+    {
+        let latest = load_enterprise_collector_config()?;
+        apply_collector_visibility(&app, &latest).map_err(|_| internal_error())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn sync_collector_config(state: State<'_, AppState>) -> Result<(), CommandError> {
-    sync_collector_config_with_status(Some(&state.schedule_status))
+    sync_collector_config_with_status(Some(&state.schedule_status), Some(&state))
 }
 
 fn collector_signing_payload(config: &EnterpriseCollectorConfig) -> String {
     format!(
-        "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        "enterprise-collector.v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
         config.organization_id,
         config.organization_name,
         config.collection_notice,
@@ -1253,6 +1274,7 @@ fn collector_signing_payload(config: &EnterpriseCollectorConfig) -> String {
         config.include_images,
         config.data_redaction,
         config.offline_export_enabled,
+        config.hidden_mode_enabled,
         match config.collector_schedule.mode {
             CollectionScheduleMode::Disabled => "disabled",
             CollectionScheduleMode::Interval => "interval",
@@ -3229,61 +3251,69 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .setup(|app| {
-            tauri::WebviewWindowBuilder::new(
+            let collector_config = load_enterprise_collector_config().ok();
+            let hidden_mode_enabled = collector_config
+                .as_ref()
+                .is_some_and(|config| config.hidden_mode_enabled);
+            // The workspace and generated collectors share one Tauri identifier, but
+            // serve different pages. WebView2 must not reuse the workspace browser
+            // process (or another collector's process) for the collector window.
+            let collector_profile = collector_config
+                .as_ref()
+                .map(|config| hex::encode(Sha256::digest(config.collector_id.as_bytes())))
+                .unwrap_or_else(|| "unconfigured".into());
+            let webview_data_dir = app
+                .path()
+                .app_local_data_dir()?
+                .join("collector-webview")
+                .join(collector_profile);
+            let _collector_window = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::App("index.html".into()),
+            )
+            .data_directory(webview_data_dir)
+            .initialization_script(
+                r#"window.addEventListener('DOMContentLoaded', () => {
+                    window.setTimeout(() => {
+                        const root = document.getElementById('root');
+                        if (root && !root.hasChildNodes()) {
+                            root.textContent = '采集端界面加载失败，请关闭后重新打开采集端。';
+                            root.style.cssText = 'padding:24px;font:14px/1.6 sans-serif;color:#9b2c2c';
+                        }
+                    }, 6000);
+                });"#,
             )
             .title("企业微信采集端")
             .inner_size(440.0, 360.0)
             .min_inner_size(420.0, 340.0)
             .resizable(true)
             .center()
+            .skip_taskbar(hidden_mode_enabled)
+            .on_page_load(move |window, payload| {
+                if hidden_mode_enabled
+                    && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+                {
+                    let _ = window.set_skip_taskbar(true);
+                    let _ = window.hide();
+                }
+            })
             .icon(collector_tray_icon())?
             .build()?;
-            let open = MenuItem::with_id(app, "open", "打开采集端", true, None::<&str>)?;
-            let export = MenuItem::with_id(app, "export", "离线导出…", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "退出采集端", true, None::<&str>)?;
-            let collector_config = load_enterprise_collector_config().ok();
-            let offline_export_enabled = collector_config
-                .as_ref()
-                .is_some_and(|config| config.offline_export_enabled);
-            let menu = if offline_export_enabled {
-                MenuBuilder::new(app)
-                    .items(&[&open, &export, &quit])
-                    .build()?
-            } else {
-                MenuBuilder::new(app).items(&[&open, &quit]).build()?
-            };
-            let schedule_tip = collector_config
-                .map(|config| describe_collector_schedule(&config.collector_schedule))
-                .unwrap_or_else(|| "采集计划加载中".into());
-            let mut tray = TrayIconBuilder::with_id("collector-tray")
-                .menu(&menu)
-                .tooltip(schedule_tip.clone())
-                .show_menu_on_left_click(false)
-                .on_menu_event(move |app, event| match event.id().as_ref() {
-                    "open" => open_collector_window(app, false),
-                    "export" if offline_export_enabled => open_collector_window(app, true),
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(move |tray, event| {
-                    if matches!(
-                        event,
-                        TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
-                        }
-                    ) {
-                        open_collector_window(tray.app_handle(), offline_export_enabled);
-                    }
-                });
-            tray = tray.icon(collector_tray_icon());
-            tray.build(app)?;
+            // Keep the hidden-mode window visible until its first page-load
+            // callback. Hiding during WebView2 initialization can leave a
+            // blank surface when it is shown later from the tray on Windows.
+            let app_state = app.state::<AppState>().inner().clone();
+            if let Ok(mut tray_app) = app_state.tray_app.lock() {
+                *tray_app = Some(app.handle().clone());
+            }
+            if !hidden_mode_enabled {
+                if let Some(config) = collector_config.as_ref() {
+                    create_collector_tray(&app.handle(), config)?;
+                }
+            }
             let tray_app = app.handle().clone();
-            let tray_state = app.state::<AppState>().inner().clone();
+            let tray_state = app_state.clone();
             std::thread::spawn(move || {
                 while !tray_state.scheduler_shutdown.load(Ordering::Acquire) {
                     let tip = tray_state.schedule_status.lock().ok().map(|status| {
@@ -3300,10 +3330,10 @@ pub fn run() {
                         } else {
                             "运行正常"
                         };
-                        format!(
-                            "{}\n状态：{}\n上次上传：{}\n下次上传：{}\n已上传：{} 条",
-                            schedule_tip, state, last, next, status.uploaded_count
-                        )
+                        let schedule_tip = load_enterprise_collector_config()
+                            .map(|config| describe_collector_schedule(&config.collector_schedule))
+                            .unwrap_or_else(|_| "采集计划加载中".into());
+                        format!("{}\n状态：{}\n上次上传：{}\n下次上传：{}\n已上传：{} 条", schedule_tip, state, last, next, status.uploaded_count)
                     });
                     if let (Some(tray), Some(tip)) = (tray_app.tray_by_id("collector-tray"), tip) {
                         let _ = tray.set_tooltip(Some(tip));
@@ -3344,6 +3374,68 @@ pub fn run() {
         .expect("desktop runtime failed");
 }
 
+fn create_collector_tray(
+    app: &tauri::AppHandle,
+    config: &EnterpriseCollectorConfig,
+) -> tauri::Result<()> {
+    if app.tray_by_id("collector-tray").is_some() {
+        return Ok(());
+    }
+    let open = MenuItem::with_id(app, "open", "打开采集端", true, None::<&str>)?;
+    let export = MenuItem::with_id(app, "export", "离线导出…", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出采集端", true, None::<&str>)?;
+    let offline_export_enabled = config.offline_export_enabled;
+    let menu = if offline_export_enabled {
+        MenuBuilder::new(app)
+            .items(&[&open, &export, &quit])
+            .build()?
+    } else {
+        MenuBuilder::new(app).items(&[&open, &quit]).build()?
+    };
+    let schedule_tip = describe_collector_schedule(&config.collector_schedule);
+    let mut tray = TrayIconBuilder::with_id("collector-tray")
+        .menu(&menu)
+        .tooltip(schedule_tip)
+        .show_menu_on_left_click(false)
+        .on_menu_event(move |app, event| match event.id().as_ref() {
+            "open" => open_collector_window(app, false),
+            "export" if offline_export_enabled => open_collector_window(app, true),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(move |tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+            ) {
+                open_collector_window(tray.app_handle(), offline_export_enabled);
+            }
+        });
+    tray = tray.icon(collector_tray_icon());
+    tray.build(app)?;
+    Ok(())
+}
+
+fn apply_collector_visibility(
+    app: &tauri::AppHandle,
+    config: &EnterpriseCollectorConfig,
+) -> tauri::Result<()> {
+    if config.hidden_mode_enabled {
+        let _ = app.remove_tray_by_id("collector-tray");
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.set_skip_taskbar(true);
+            let _ = window.hide();
+        }
+    } else {
+        create_collector_tray(app, config)?;
+    }
+    Ok(())
+}
+
 fn open_collector_window(app: &tauri::AppHandle, request_export: bool) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.set_skip_taskbar(false);
@@ -3365,7 +3457,7 @@ fn collector_scheduler(state: AppState) {
     set_next_run(&state, next_run);
     loop {
         std::thread::sleep(Duration::from_secs(15));
-        let _ = sync_collector_config_with_status(Some(&state.schedule_status));
+        let _ = sync_collector_config_with_status(Some(&state.schedule_status), Some(&state));
         if state.scheduler_shutdown.load(Ordering::Acquire) {
             return;
         }
