@@ -74,6 +74,7 @@ export interface BootstrapState {
   organizationName?: string;
   displayName?: string;
   offlineExportEnabled?: boolean;
+  hiddenModeEnabled?: boolean;
   collectorSchedule?: CollectionSchedule;
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "wecom-archive",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "private": true,
   "description": "Windows WeCom archive workspace and collector",
   "license": "MIT",
@@ -17,7 +17,7 @@
     "dev:client": "vite --mode client",
     "build": "pnpm build:client && pnpm build:server",
     "build:server": "tsc -b && vite build --mode server",
-    "build:client": "tsc -b && vite build --mode client",
+    "build:client": "tsc -b && vite build --mode client && node scripts/prepare-client-assets.mjs",
     "preview": "vite preview --outDir dist/server",
     "test": "vitest run",
     "test:watch": "vitest",

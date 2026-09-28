@@ -233,6 +233,8 @@ struct EnterpriseConfig {
     data_redaction: bool,
     #[serde(default)]
     offline_export_enabled: bool,
+    #[serde(default)]
+    hidden_mode_enabled: bool,
     #[serde(default = "default_super_admin_enabled")]
     super_admin_enabled: bool,
     #[serde(default)]
@@ -360,6 +362,8 @@ struct EnterpriseCollectorRecord {
     #[serde(default)]
     offline_export_enabled: bool,
     #[serde(default)]
+    hidden_mode_enabled: bool,
+    #[serde(default)]
     schedule: CollectionSchedule,
     #[serde(default)]
     last_upload_at: Option<String>,
@@ -448,6 +452,8 @@ struct EnterpriseConfigRequest {
     #[serde(default)]
     offline_export_enabled: bool,
     #[serde(default)]
+    hidden_mode_enabled: bool,
+    #[serde(default)]
     super_admin_enabled: Option<bool>,
     #[serde(default)]
     server_schedule: Option<CollectionSchedule>,
@@ -467,6 +473,8 @@ struct EnterpriseConfigResponse {
     include_media: bool,
     data_redaction: bool,
     offline_export_enabled: bool,
+    #[serde(default)]
+    hidden_mode_enabled: bool,
     super_admin_enabled: bool,
     server_schedule: CollectionSchedule,
     collector_schedule: CollectionSchedule,
@@ -534,6 +542,8 @@ struct CollectionTargetResponse {
     include_media: Option<bool>,
     data_redaction: Option<bool>,
     offline_export_enabled: Option<bool>,
+    #[serde(default)]
+    hidden_mode_enabled: Option<bool>,
     plans: Vec<CollectionPlanResponse>,
 }
 
@@ -569,6 +579,7 @@ struct CollectorDesiredConfigResponse {
     include_media: bool,
     data_redaction: bool,
     offline_export_enabled: bool,
+    hidden_mode_enabled: bool,
     schedule: CollectionSchedule,
     manual_collection_request_id: Option<String>,
 }
@@ -612,6 +623,8 @@ struct CollectorUpdateRequest {
     data_redaction: bool,
     offline_export_enabled: bool,
     #[serde(default)]
+    hidden_mode_enabled: bool,
+    #[serde(default)]
     collection_notice: String,
     schedule: CollectionSchedule,
 }
@@ -626,6 +639,7 @@ struct CollectorPlanResponse {
     include_media: bool,
     data_redaction: bool,
     offline_export_enabled: bool,
+    hidden_mode_enabled: bool,
     schedule: CollectionSchedule,
     created_at: String,
     last_upload_at: Option<String>,
@@ -1374,6 +1388,7 @@ fn new_enterprise_config() -> EnterpriseConfig {
         include_images: false,
         data_redaction: true,
         offline_export_enabled: false,
+        hidden_mode_enabled: false,
         super_admin_enabled: default_super_admin_enabled(),
         local_collection_plans: Vec::new(),
         server_include_media: false,
@@ -1400,6 +1415,7 @@ fn enterprise_config_response(config: &EnterpriseConfig) -> EnterpriseConfigResp
         include_media: config.include_files || config.include_images,
         data_redaction: config.data_redaction,
         offline_export_enabled: config.offline_export_enabled,
+        hidden_mode_enabled: config.hidden_mode_enabled,
         super_admin_enabled: config.super_admin_enabled,
         server_schedule: config.server_schedule.clone(),
         collector_schedule: config.collector_schedule.clone(),
@@ -1475,6 +1491,7 @@ fn collector_plan_responses(
             include_media: collector.include_media,
             data_redaction: collector.data_redaction,
             offline_export_enabled: collector.offline_export_enabled,
+            hidden_mode_enabled: collector.hidden_mode_enabled,
             schedule: collector.schedule.clone(),
             created_at: collector.created_at.clone(),
             last_upload_at: collector.last_upload_at.clone(),
@@ -1555,6 +1572,7 @@ fn collector_desired_config(
         include_media: collector.include_media,
         data_redaction: collector.data_redaction,
         offline_export_enabled: collector.offline_export_enabled,
+        hidden_mode_enabled: collector.hidden_mode_enabled,
         schedule: collector.schedule.clone(),
         manual_collection_request_id: collector.manual_collection_request_id.clone(),
     }
@@ -1641,6 +1659,7 @@ fn collection_target_response(
         include_media: Some(config.include_files || config.include_images),
         data_redaction: Some(config.data_redaction),
         offline_export_enabled: Some(config.offline_export_enabled),
+        hidden_mode_enabled: Some(config.hidden_mode_enabled),
         plans: server_plans,
     }];
     for collector in config
@@ -1693,6 +1712,7 @@ fn collection_target_response(
             include_media: Some(collector.include_media),
             data_redaction: Some(collector.data_redaction),
             offline_export_enabled: Some(collector.offline_export_enabled),
+            hidden_mode_enabled: Some(collector.hidden_mode_enabled),
             plans: vec![plan],
         });
     }
@@ -1992,6 +2012,7 @@ async fn update_enterprise_config(
     config.include_images = request.include_media;
     config.data_redaction = request.data_redaction;
     config.offline_export_enabled = request.offline_export_enabled;
+    config.hidden_mode_enabled = request.hidden_mode_enabled;
     if let Some(enabled) = request.super_admin_enabled {
         config.super_admin_enabled = enabled;
     }
@@ -2059,6 +2080,7 @@ async fn generate_collector(
         include_media: config.include_files || config.include_images,
         data_redaction: config.data_redaction,
         offline_export_enabled: config.offline_export_enabled,
+        hidden_mode_enabled: config.hidden_mode_enabled,
         schedule: config.collector_schedule.clone(),
         last_upload_at: None,
         last_run_at: None,
@@ -2102,6 +2124,7 @@ async fn generate_collector(
         "includeMedia": config.include_files || config.include_images,
         "dataRedaction": config.data_redaction,
         "offlineExportEnabled": config.offline_export_enabled,
+        "hiddenModeEnabled": config.hidden_mode_enabled,
         "enabled": desired.enabled,
         "manualCollectionRequestId": desired.manual_collection_request_id,
         "collectorSchedule": &config.collector_schedule,
@@ -2226,14 +2249,46 @@ async fn collector_heartbeat(
     headers: HeaderMap,
     Json(request): Json<CollectorHeartbeatRequest>,
 ) -> Result<Json<CollectorHeartbeatResponse>, ApiError> {
+    let client_ip = remote_addr.ip().to_string();
     let mut config = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    // A newly enrolled collector on the same device replaces a previous
+    // collector instance. Keep the same collector id intact so restarting or
+    // upgrading that instance does not remove its registration.
+    let replaced_files = {
+        collector_by_device_token(&mut config, &collector_id, &headers)?;
+        let now = Utc::now();
+        let replaced_ids = config
+            .collectors
+            .iter()
+            .filter(|collector| {
+                collector.collector_id != collector_id
+                    && collector.last_client_ip.as_deref() == Some(client_ip.as_str())
+                    && collector_status(collector, now) == "online"
+            })
+            .map(|collector| (collector.collector_id.clone(), collector.file_name.clone()))
+            .collect::<Vec<_>>();
+        if replaced_ids.is_empty() {
+            Vec::new()
+        } else {
+            config.collectors.retain(|collector| {
+                !replaced_ids
+                    .iter()
+                    .any(|(replaced_id, _)| replaced_id == &collector.collector_id)
+            });
+            replaced_ids
+                .into_iter()
+                .map(|(_, file_name)| file_name)
+                .filter(|file_name| !file_name.is_empty())
+                .collect::<Vec<_>>()
+        }
+    };
     let snapshot = {
         let collector = collector_by_device_token(&mut config, &collector_id, &headers)?;
         collector.last_seen_at = Some(Utc::now().to_rfc3339());
-        collector.last_client_ip = Some(remote_addr.ip().to_string());
+        collector.last_client_ip = Some(client_ip);
         collector.client_version = request.client_version;
         collector.last_applied_revision = request
             .last_applied_revision
@@ -2255,6 +2310,9 @@ async fn collector_heartbeat(
         collector.clone()
     };
     persist_enterprise_config(&state.data_root, &config)?;
+    for file_name in replaced_files {
+        let _ = std::fs::remove_file(state.data_root.join("collectors").join(file_name));
+    }
     let should_send = request.current_config_revision.unwrap_or(0) < snapshot.config_revision;
     let control = if should_send {
         Some(signed_collector_control(
@@ -2320,6 +2378,7 @@ async fn update_collector(
     collector.include_media = request.include_media;
     collector.data_redaction = request.data_redaction;
     collector.offline_export_enabled = request.offline_export_enabled;
+    collector.hidden_mode_enabled = request.hidden_mode_enabled;
     if !request.collection_notice.trim().is_empty() {
         collector.collection_notice = request.collection_notice.trim().to_owned();
     }
@@ -4498,6 +4557,7 @@ mod tests {
                 include_media: true,
                 data_redaction: false,
                 offline_export_enabled: false,
+                hidden_mode_enabled: false,
                 super_admin_enabled: None,
                 server_schedule: None,
                 collector_schedule: None,
@@ -4832,6 +4892,7 @@ mod tests {
                 include_media: false,
                 data_redaction: false,
                 offline_export_enabled: false,
+                hidden_mode_enabled: false,
                 super_admin_enabled: None,
                 server_schedule: None,
                 collector_schedule: None,
@@ -5293,6 +5354,7 @@ mod tests {
                 include_media: true,
                 data_redaction: true,
                 offline_export_enabled: true,
+                hidden_mode_enabled: false,
                 collection_notice: "测试告知".into(),
                 schedule: CollectionSchedule {
                     mode: CollectionScheduleMode::Daily,
@@ -5346,6 +5408,7 @@ mod tests {
                 include_media: false,
                 data_redaction: true,
                 offline_export_enabled: false,
+                hidden_mode_enabled: false,
                 collection_notice: "测试告知".into(),
                 schedule: CollectionSchedule {
                     mode: CollectionScheduleMode::Interval,
@@ -5455,5 +5518,109 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(revoked.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn new_collector_replaces_online_collector_on_same_device() {
+        let directory = TestDirectory::new();
+        let template = directory.0.join("collector-template.exe");
+        std::fs::write(&template, b"collector").unwrap();
+        let mut app_state = state(&directory);
+        app_state.collector_template = Some(Arc::new(template));
+        {
+            let mut config = app_state.enterprise_config.lock().unwrap();
+            config.organization_name = "测试组织".into();
+            config.upload_url = "http://127.0.0.1:9812".into();
+        }
+
+        let first = generate_collector(State(app_state.clone()), authorized_headers())
+            .await
+            .unwrap()
+            .0;
+        let first_artifact: serde_json::Value = serde_json::from_str(&first.artifact).unwrap();
+        let first_id = first.collector_id.clone();
+        let first_token = first_artifact["uploadToken"].as_str().unwrap().to_owned();
+        let first_path = directory.0.join("collectors").join(&first.file_name);
+
+        let _ = collector_heartbeat(
+            State(app_state.clone()),
+            AxumPath(first_id.clone()),
+            ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42310))),
+            device_headers(&first_token),
+            Json(CollectorHeartbeatRequest {
+                client_version: Some("1.2.4".into()),
+                current_config_revision: Some(0),
+                last_applied_revision: Some(0),
+                last_run_at: None,
+                last_success_at: None,
+                last_error: None,
+                last_manual_collection_request_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(first_path.is_file());
+
+        // Restarting the same collector keeps its registration and executable.
+        let _ = collector_heartbeat(
+            State(app_state.clone()),
+            AxumPath(first_id.clone()),
+            ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42311))),
+            device_headers(&first_token),
+            Json(CollectorHeartbeatRequest {
+                client_version: Some("1.2.4".into()),
+                current_config_revision: Some(1),
+                last_applied_revision: Some(1),
+                last_run_at: None,
+                last_success_at: None,
+                last_error: None,
+                last_manual_collection_request_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(first_path.is_file());
+
+        let second = generate_collector(State(app_state.clone()), authorized_headers())
+            .await
+            .unwrap()
+            .0;
+        let second_artifact: serde_json::Value = serde_json::from_str(&second.artifact).unwrap();
+        let second_id = second.collector_id.clone();
+        let second_token = second_artifact["uploadToken"].as_str().unwrap().to_owned();
+        let replaced = collector_heartbeat(
+            State(app_state.clone()),
+            AxumPath(second_id.clone()),
+            ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42312))),
+            device_headers(&second_token),
+            Json(CollectorHeartbeatRequest {
+                client_version: Some("1.2.4".into()),
+                current_config_revision: Some(1),
+                last_applied_revision: Some(0),
+                last_run_at: None,
+                last_success_at: None,
+                last_error: None,
+                last_manual_collection_request_id: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(replaced.status, "ok");
+
+        let config = app_state.enterprise_config.lock().unwrap();
+        assert!(
+            !config
+                .collectors
+                .iter()
+                .any(|collector| collector.collector_id == first_id)
+        );
+        assert!(
+            config
+                .collectors
+                .iter()
+                .any(|collector| collector.collector_id == second_id)
+        );
+        assert!(!first_path.exists());
     }
 }
