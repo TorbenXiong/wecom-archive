@@ -80,7 +80,7 @@ function parseBackendError(reason: unknown): BackendCommandError {
 
 const browserBootstrap: BootstrapState = {
   organizationName: "示例组织",
-  collectionNotice: "仅采集您有权归档的企业微信记录。",
+  displayName: "示例采集端",
   offlineExportEnabled: true,
   collectorSchedule: { mode: "disabled", intervalMinutes: 60, dailyTime: "02:00" },
 };
@@ -157,7 +157,7 @@ export const backend = {
   },
 
   async exportLatestEncrypted(): Promise<OfflineExportResult> {
-    if (!this.isNative()) return { fileName: "WeComArchive-preview.wca", directory: "…\\采集端目录", messageCount: 238 };
+    if (!this.isNative()) return { fileName: "wecom-20260924-182016.wca", directory: "…\\采集端目录", messageCount: 238 };
     return invoke<OfflineExportResult>("export_latest_enterprise");
   },
 

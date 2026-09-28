@@ -40,12 +40,30 @@ function installApiMock() {
         raw_type: "text",
       }]);
     }
-    if (url.includes("/collection-schedules")) {
-      return Response.json({ localPlans: [], collectorPlans: [] });
+    if (url.includes("/collection-targets")) {
+      return Response.json({ targets: [
+        {
+          targetId: "server",
+          kind: "server",
+          displayName: "本机服务端",
+          status: "online",
+          plans: [{ id: "local-plan-1", name: "本机默认计划", includeMedia: false, schedule: { mode: "daily", intervalMinutes: 60, dailyTime: "02:00" }, createdAt: "2026-09-21T01:00:00Z", updatedAt: "2026-09-21T01:00:00Z" }],
+        },
+        {
+          targetId: "collector-1",
+          kind: "collector",
+          displayName: "销售电脑",
+          status: "offline",
+          clientVersion: "0.0.4",
+          configRevision: 2,
+          lastAppliedRevision: 1,
+          plans: [{ id: "collector-1", name: "销售电脑", includeMedia: true, schedule: { mode: "interval", intervalMinutes: 60, dailyTime: "02:00" }, createdAt: "2026-09-21T01:00:00Z", updatedAt: "2026-09-21T01:00:00Z" }],
+        },
+      ] });
     }
     if (url.includes("/enterprise/config")) {
       const body = init?.body ? JSON.parse(String(init.body)) as { keyId?: string } : undefined;
-      return Response.json({ configured: false, organizationId: "org-1", organizationName: "", collectionNotice: "加密传输本机企业微信聊天记录到服务端", uploadUrl: "http://127.0.0.1:9812", keyId: body?.keyId || "key-1", includeMedia: false, dataRedaction: false, offlineExportEnabled: false });
+      return Response.json({ configured: false, organizationId: "org-1", organizationName: "", uploadUrl: "http://127.0.0.1:9812", keyId: body?.keyId || "key-1", includeMedia: false, dataRedaction: false, offlineExportEnabled: false, collectorSchedule: { mode: "disabled", intervalMinutes: 60, dailyTime: "02:00" } });
     }
     if (url.includes("/enterprise/collectors")) {
       if (!init?.method || init.method === "GET") {
@@ -260,33 +278,36 @@ describe("archive workspace", () => {
     render(<App />);
     await connect();
     fireEvent.click(screen.getByRole("button", { name: "采集端" }));
-    expect(await screen.findByLabelText("员工告知内容")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("加密传输本机企业微信聊天记录到服务端")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "采集端管理" })).toHaveClass("active");
+    expect(screen.getByRole("button", { name: "生成默认配置" })).toBeInTheDocument();
+    expect(await screen.findByText("本机", { selector: "strong" })).toBeInTheDocument();
+    expect(screen.getAllByText("销售电脑").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/配置 \d+\/\d+/, { exact: false })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "生成采集端" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("检索采集端")).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "编辑模式" })).not.toBeChecked();
+    expect(screen.getAllByRole("button", { name: "采集" })).toHaveLength(2);
+    fireEvent.click(screen.getByRole("switch", { name: "编辑模式" }));
+    expect(screen.queryAllByRole("button", { name: "编辑" })).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "还原" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "生成默认配置" }));
+    expect(screen.queryByLabelText("员工告知内容")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("加密传输本机企业微信聊天记录到服务端")).not.toBeInTheDocument();
     expect(screen.queryByText("采集前向员工展示，请清晰说明用途和范围。")).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "采集端配置" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "生成采集端" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "采集端列表" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "采集端列表" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "采集端目录" })).toBeInTheDocument();
     const collectorActions = screen.getByRole("button", { name: "生成采集端" }).closest("footer");
-    expect([...(collectorActions?.querySelectorAll("button") ?? [])].map((button) => button.textContent)).toEqual(["采集端目录", "采集端列表", "生成采集端"]);
-    fireEvent.click(screen.getByRole("button", { name: "采集端列表" }));
-    const collectorList = await screen.findByRole("dialog", { name: "已生成采集端" });
-    expect(collectorList).toHaveTextContent("key-1-collector.exe");
-    expect(collectorList).toHaveTextContent("每 60 分钟");
-    expect(collectorList).toHaveTextContent("包含图片和文件 · 文件可用");
-    fireEvent.click(screen.getByRole("button", { name: "关闭采集端列表" }));
+    expect([...(collectorActions?.querySelectorAll("button") ?? [])].map((button) => button.textContent)).toEqual(["采集端目录", "生成采集端"]);
     expect(screen.getByLabelText("加密密钥：")).toHaveValue("key-1");
     expect(screen.getByLabelText("访问令牌：")).toHaveValue(accessToken);
     expect(screen.getByRole("button", { name: "重新生成加密密钥" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重新生成服务端访问令牌" })).toBeInTheDocument();
     expect(screen.getByLabelText("支持离线导出")).toBeInTheDocument();
     expect(screen.getByText("采集计划", { selector: ".collector-continuous-row strong" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /保存计划/ })).not.toBeInTheDocument();
-    expect(screen.queryByText("触发方式")).not.toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText("按间隔"));
-    fireEvent.click(screen.getByLabelText("按间隔"));
-    expect(screen.getByLabelText("按间隔")).not.toBeChecked();
-    fireEvent.click(screen.getByLabelText("按间隔"));
+    fireEvent.click(screen.getByRole("radio", { name: "按间隔" }));
     expect(vi.mocked(fetch).mock.calls.some(([url, init]) => String(url).includes("/enterprise/config") && init?.method === "PUT")).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "生成采集端" }));
     await waitFor(() => {
@@ -339,7 +360,7 @@ describe("archive workspace", () => {
     render(<App />);
     await connect();
     const navigation = screen.getByRole("navigation", { name: "主导航" });
-    expect([...navigation.querySelectorAll("button")].map((button) => button.textContent)).toEqual(["本机", "采集端", "会话", "采集计划", "设置"]);
+    expect([...navigation.querySelectorAll("button")].map((button) => button.textContent)).toEqual(["本机", "会话", "采集端", "设置"]);
     expect(screen.queryByText("离线运行")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "本机" }));
     expect(await screen.findByRole("heading", { name: "快速导出本机记录", level: 2 })).toBeInTheDocument();
@@ -464,6 +485,7 @@ describe("archive workspace", () => {
     render(<App />);
     await connect();
     fireEvent.click(screen.getByRole("button", { name: "采集端" }));
+    fireEvent.click(screen.getByRole("button", { name: "生成默认配置" }));
     const customKey = "custom-enterprise-key-20260914";
     fireEvent.change(screen.getByLabelText("加密密钥："), { target: { value: customKey } });
     fireEvent.click(screen.getByRole("button", { name: "保存加密密钥" }));

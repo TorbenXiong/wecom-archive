@@ -1,37 +1,31 @@
-import {
-  Download,
-  FolderOpen,
-  MonitorUp,
-  RefreshCw,
-  RotateCcw,
-  Save,
-} from "lucide-react";
+import { Download, FolderOpen, ListTree, RefreshCw, RotateCcw, Save, SlidersHorizontal } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
   generateEnterpriseCollector,
   getEnterpriseConfig,
-  listEnterpriseCollectors,
   openEnterpriseCollectorDirectory,
   regenerateServerAccessToken,
   rotateEnterpriseKey,
   updateEnterpriseConfig,
   updateServerAccessToken,
 } from "../lib/server-api";
-import type { CollectionSchedule, CollectorPlan } from "../lib/server-api";
+import type { CollectionSchedule } from "../lib/server-api";
 import { CollectionScheduleFields, DEFAULT_COLLECTION_SCHEDULE } from "./CollectionScheduleFields";
+import { CollectionSchedulePage } from "./CollectionSchedulePage";
 import { Toast } from "./Overlays";
 
 const DEFAULT_ORGANIZATION_NAME = "本企业";
-const DEFAULT_COLLECTION_NOTICE = "加密传输本机企业微信聊天记录到服务端";
-
 interface ServerConfigPageProps {
   token: string;
   onTokenChanged: (token: string) => void;
+  localCollectionAvailable?: boolean;
+  collectingLocal?: boolean;
+  onOpenLocalCollection?: () => void;
 }
 
-export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProps) {
+export function ServerConfigPage({ token, onTokenChanged, localCollectionAvailable = false, collectingLocal = false, onOpenLocalCollection }: ServerConfigPageProps) {
+  const [activeTab, setActiveTab] = useState<"collectors" | "defaults">("collectors");
   const [organizationName, setOrganizationName] = useState(DEFAULT_ORGANIZATION_NAME);
-  const [collectionNotice, setCollectionNotice] = useState(DEFAULT_COLLECTION_NOTICE);
   const [uploadUrl, setUploadUrl] = useState("http://127.0.0.1:9812");
   const [keyId, setKeyId] = useState("");
   const [keyDraft, setKeyDraft] = useState("");
@@ -45,8 +39,6 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
   const [statusTone, setStatusTone] = useState<"success" | "error">("success");
   const [busy, setBusy] = useState(false);
   const [collectorDirectoryReady, setCollectorDirectoryReady] = useState(false);
-  const [showCollectorList, setShowCollectorList] = useState(false);
-  const [collectors, setCollectors] = useState<CollectorPlan[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -54,7 +46,6 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
       .then((config) => {
         if (cancelled) return;
         setOrganizationName(config.organizationName || DEFAULT_ORGANIZATION_NAME);
-        setCollectionNotice(config.collectionNotice);
         setUploadUrl(config.uploadUrl || "http://127.0.0.1:9812");
         setKeyId(config.keyId);
         setKeyDraft(config.keyId);
@@ -66,7 +57,6 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
           const draft = JSON.parse(sessionStorage.getItem(`collector-config-draft:${token}`) || "null");
           if (draft && typeof draft === "object") {
             if (typeof draft.organizationName === "string") setOrganizationName(draft.organizationName);
-            if (typeof draft.collectionNotice === "string") setCollectionNotice(draft.collectionNotice);
             if (typeof draft.uploadUrl === "string") setUploadUrl(draft.uploadUrl);
             if (typeof draft.includeMedia === "boolean") setIncludeMedia(draft.includeMedia);
             if (typeof draft.dataRedaction === "boolean") setDataRedaction(draft.dataRedaction);
@@ -83,9 +73,9 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
   useEffect(() => {
     if (loadedToken !== token) return;
     try {
-      sessionStorage.setItem(`collector-config-draft:${token}`, JSON.stringify({ organizationName, collectionNotice, uploadUrl, includeMedia, dataRedaction, offlineExportEnabled, collectorSchedule }));
+      sessionStorage.setItem(`collector-config-draft:${token}`, JSON.stringify({ organizationName, uploadUrl, includeMedia, dataRedaction, offlineExportEnabled, collectorSchedule }));
     } catch { /* Draft persistence is best effort. */ }
-  }, [loadedToken, token, organizationName, collectionNotice, uploadUrl, includeMedia, dataRedaction, offlineExportEnabled, collectorSchedule]);
+  }, [loadedToken, token, organizationName, uploadUrl, includeMedia, dataRedaction, offlineExportEnabled, collectorSchedule]);
 
   useEffect(() => {
     setTokenDraft(token);
@@ -114,12 +104,12 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
     if (nextKeyId.length < 24) return;
     const config = await updateEnterpriseConfig(token, {
       organizationName: organizationName || DEFAULT_ORGANIZATION_NAME,
-      collectionNotice,
       uploadUrl,
       keyId: nextKeyId,
       includeMedia,
       dataRedaction,
       offlineExportEnabled,
+      collectorSchedule,
     });
     setKeyId(config.keyId);
     setKeyDraft(config.keyId);
@@ -129,7 +119,6 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
   const generateCollector = () => run(async () => {
     const config = await updateEnterpriseConfig(token, {
       organizationName: organizationName || DEFAULT_ORGANIZATION_NAME,
-      collectionNotice,
       uploadUrl,
       keyId: keyId || undefined,
       includeMedia,
@@ -141,9 +130,7 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
     setKeyDraft(config.keyId);
     const result = await generateEnterpriseCollector(token);
     setCollectorDirectoryReady(result.executableGenerated);
-    showStatus(result.executableGenerated
-      ? `采集端已生成：${result.fileName}`
-      : "密钥已保存，但未能生成采集端文件。");
+    showStatus(result.executableGenerated ? `采集端已生成：${result.fileName}` : "密钥已保存，但未能生成采集端文件。");
   });
 
   const openCollectorDirectory = () => run(async () => {
@@ -157,12 +144,6 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
       throw error;
     }
     showStatus("已打开采集端目录。");
-  });
-
-  const openCollectorList = () => run(async () => {
-    const result = await listEnterpriseCollectors(token);
-    setCollectors(result.collectors);
-    setShowCollectorList(true);
   });
 
   const saveAccessToken = () => run(async () => {
@@ -194,8 +175,12 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
   return (
     <main className="settings-page collector-settings-page">
       {status && <Toast tone={statusTone} duration={statusTone === "error" ? 6000 : 6000} actionLabel={collectorDirectoryReady ? "打开目录" : undefined} onAction={collectorDirectoryReady ? () => void openCollectorDirectory() : undefined} onClose={() => { setStatus(undefined); setCollectorDirectoryReady(false); }}>{status}</Toast>}
+      <nav className="collector-config-tabs" aria-label="采集端内容">
+        <button className={activeTab === "collectors" ? "active" : ""} type="button" onClick={() => setActiveTab("collectors")}><ListTree size={17} />采集端管理</button>
+        <button className={activeTab === "defaults" ? "active" : ""} type="button" onClick={() => setActiveTab("defaults")}><SlidersHorizontal size={17} />生成默认配置</button>
+      </nav>
 
-      <div className="server-config-layout collector-layout">
+      {activeTab === "collectors" ? <CollectionSchedulePage token={token} localCollectionAvailable={localCollectionAvailable} collectingLocal={collectingLocal} onOpenLocalCollection={onOpenLocalCollection} /> : <div className="server-config-layout collector-layout">
         <section className="settings-section collection-settings collector-settings-card">
           <div className="collector-top-config">
             <div className="collector-config-field">
@@ -203,7 +188,7 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
               <div className="config-value-row url-config-row">
                 <input id="upload-url" value={uploadUrl} onChange={(event) => setUploadUrl(event.target.value)} placeholder="https://archive.example.com" autoComplete="url" />
                 <label className="offline-export-option" title="采集端可将加密数据导出为 .wca 文件，供管理员离线导入。"><input type="checkbox" checked={offlineExportEnabled} onChange={(event) => setOfflineExportEnabled(event.target.checked)} />支持离线导出</label>
-                <button className="config-icon-button primary config-save-button" type="button" aria-label="保存服务端 URL" title="保存服务端 URL" onClick={() => void run(async () => { await updateEnterpriseConfig(token, { organizationName: organizationName || DEFAULT_ORGANIZATION_NAME, collectionNotice, uploadUrl, keyId: keyId || undefined, includeMedia, dataRedaction, offlineExportEnabled }); showStatus("服务端 URL 已保存。" ); })} disabled={busy || !uploadUrl.trim()}><Save size={16} /></button>
+                <button className="config-icon-button primary config-save-button" type="button" aria-label="保存服务端 URL" title="保存服务端 URL" onClick={() => void run(async () => { await updateEnterpriseConfig(token, { organizationName: organizationName || DEFAULT_ORGANIZATION_NAME, uploadUrl, keyId: keyId || undefined, includeMedia, dataRedaction, offlineExportEnabled, collectorSchedule }); showStatus("服务端 URL 已保存。" ); })} disabled={busy || !uploadUrl.trim()}><Save size={16} /></button>
               </div>
             </div>
             <div className="collector-config-field">
@@ -231,32 +216,18 @@ export function ServerConfigPage({ token, onTokenChanged }: ServerConfigPageProp
             </div>
           </div>
 
-          <div className="collector-notice-panel">
-            <div className="collector-section-heading">
-              <h3><label htmlFor="collection-notice" title="采集开始前会展示给员工，用于说明采集范围和用途。">员工告知内容</label></h3>
-            </div>
-            <div className="settings-field">
-              <textarea id="collection-notice" value={collectionNotice} onChange={(event) => setCollectionNotice(event.target.value)} rows={8} />
-            </div>
-          </div>
-
           <div className="collector-media-options">
             <label className="collector-media-label"><input type="checkbox" checked={includeMedia} onChange={(event) => setIncludeMedia(event.target.checked)} />含文件和图片</label>
             <label className="collector-media-label" title="上传前脱敏账号、密码、令牌、联系方式及疑似凭据片段；文件名和图片名保持原样。"><input type="checkbox" checked={dataRedaction} onChange={(event) => setDataRedaction(event.target.checked)} />数据脱敏</label>
           </div>
-          <div className="collector-continuous-row">
-            <div><strong>采集计划</strong><small>生成采集端后，按此计划在后台采集并上传。</small></div>
-            <CollectionScheduleFields idPrefix="collector-schedule" schedule={collectorSchedule} onChange={setCollectorSchedule} disabled={busy} />
-          </div>
+          <div className="collector-continuous-row"><strong>采集计划</strong><CollectionScheduleFields idPrefix="collector-default-schedule" schedule={collectorSchedule} onChange={setCollectorSchedule} disabled={busy} /></div>
 
           <footer className="collector-generate-row">
             <button className="secondary-button collector-directory-button" type="button" onClick={openCollectorDirectory} disabled={busy}><FolderOpen size={16} />采集端目录</button>
-            <button className="secondary-button collector-list-button" type="button" onClick={() => void openCollectorList()} disabled={busy}><MonitorUp size={16} />采集端列表</button>
-            <button className="primary-button collector-generate-button" type="button" onClick={generateCollector} disabled={busy || !collectionNotice.trim()}><Download size={16} />生成采集端</button>
+            <button className="primary-button collector-generate-button" type="button" onClick={generateCollector} disabled={busy}><Download size={16} />生成采集端</button>
           </footer>
         </section>
-      </div>
-      {showCollectorList && <div className="modal-backdrop" role="presentation" onMouseDown={() => setShowCollectorList(false)}><section className="modal-card collector-list-dialog" role="dialog" aria-modal="true" aria-labelledby="collector-list-title" onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" type="button" aria-label="关闭采集端列表" onClick={() => setShowCollectorList(false)}>×</button><h2 id="collector-list-title">已生成采集端</h2><p>每个启用持续采集的采集端都会在“采集计划”中显示对应计划。</p><div className="collector-list-items">{collectors.length === 0 ? <div className="schedule-empty">暂无已生成采集端。</div> : collectors.map((collector) => <article className="collector-list-item" key={collector.collectorId}><strong>{collector.fileName || collector.collectorId}</strong><small>{collector.schedule.mode === "daily" ? `每天 ${collector.schedule.dailyTime}` : collector.schedule.mode === "interval" ? `每 ${collector.schedule.intervalMinutes} 分钟` : "持续采集未启用"}</small><small>{collector.includeMedia ? "包含图片和文件" : "仅文本"} · {collector.executableAvailable ? "文件可用" : "文件缺失"}</small><small>最近上传：{collector.lastUploadAt ? new Date(collector.lastUploadAt).toLocaleString("zh-CN", { hour12: false }) : "尚未上传"}</small></article>)}</div><div className="modal-actions"><button className="secondary-button" type="button" onClick={() => setShowCollectorList(false)}>关闭</button></div></section></div>}
+      </div>}
     </main>
   );
 }

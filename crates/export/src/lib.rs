@@ -25,6 +25,8 @@ pub enum ExportFormat {
 pub enum ExportScope {
     CurrentConversation,
     CurrentFilter,
+    SelectedConversations,
+    DateRange,
     EntireArchive,
 }
 

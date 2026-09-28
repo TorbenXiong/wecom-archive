@@ -72,7 +72,7 @@ export interface SourceCandidate {
 
 export interface BootstrapState {
   organizationName?: string;
-  collectionNotice?: string;
+  displayName?: string;
   offlineExportEnabled?: boolean;
   collectorSchedule?: CollectionSchedule;
 }
@@ -93,5 +93,5 @@ export interface FilterState {
   mediaOnly: boolean;
 }
 
-export type ExportScope = "current_conversation" | "current_filter" | "entire_archive";
+export type ExportScope = "current_conversation" | "current_filter" | "selected_conversations" | "date_range" | "entire_archive";
 export type ExportFormat = "json" | "csv" | "html" | "md";
