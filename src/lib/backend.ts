@@ -60,6 +60,14 @@ export function formatBackendError(reason: unknown, fallback: string): string {
   return parsed.message ?? `操作失败（错误码：${parsed.code}）`;
 }
 
+/**
+ * Only the logged-in account keeps its key in process memory, so an account whose
+ * key cannot be verified is not a fatal error — the caller can try the next one.
+ */
+export function isMissingSourceKeyError(reason: unknown): boolean {
+  return parseBackendError(reason).code === "SOURCE_KEY_NOT_FOUND";
+}
+
 function parseBackendError(reason: unknown): BackendCommandError {
   if (reason && typeof reason === "object") {
     const candidate = reason as BackendCommandError;

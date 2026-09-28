@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { InfoDialog } from "./components/Overlays";
 import type { CollectionSchedule } from "./domain/types";
-import { backend, formatBackendError, type CollectionSummary, type CollectorScheduleStatus } from "./lib/backend";
+import { backend, formatBackendError, isMissingSourceKeyError, type CollectionSummary, type CollectorScheduleStatus } from "./lib/backend";
 import "./styles.css";
 
 type PrepareState = "preparing" | "ready" | "failed";
@@ -38,9 +38,19 @@ export default function ClientApp() {
       setOfflineExportEnabled(bootstrap.offlineExportEnabled ?? false);
       setScheduleDescription(describeSchedule(bootstrap.collectorSchedule));
       const sources = await backend.discoverSources();
-      const source = sources[0];
-      if (!source) throw new Error("未发现可支持的本机企业微信数据，请确认客户端已登录。");
-      const result = await backend.collectSourceAutomatically(source.sourceId);
+      if (sources.length === 0) throw new Error("未发现可支持的本机企业微信数据，请确认客户端已登录。");
+      let result: CollectionSummary | undefined;
+      let keyError: unknown;
+      for (const source of sources) {
+        try {
+          result = await backend.collectSourceAutomatically(source.sourceId);
+          break;
+        } catch (reason) {
+          if (!isMissingSourceKeyError(reason)) throw reason;
+          keyError = reason;
+        }
+      }
+      if (!result) throw keyError;
       setSummary(result);
       if (bootstrap.collectorSchedule && bootstrap.collectorSchedule.mode !== "disabled") {
         try {
