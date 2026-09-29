@@ -592,11 +592,13 @@ impl Drop for CollectionRunGuard {
 pub fn collect_local_export(
     include_media: bool,
     data_redaction: bool,
+    source_root: Option<String>,
 ) -> Result<ClientExportV1, String> {
     collect_local_export_internal(
         include_media,
         data_redaction,
         None,
+        source_root,
         std::sync::Arc::new(|_, _, _| {}),
         None,
     )
@@ -606,6 +608,7 @@ pub fn collect_local_export_with_progress(
     include_media: bool,
     data_redaction: bool,
     since_unix_ms: Option<i64>,
+    source_root: Option<String>,
     progress: wecom_archive_server::LocalCollectionProgressReporter,
     media_sink: wecom_archive_server::LocalCollectionMediaSink,
 ) -> Result<ClientExportV1, String> {
@@ -613,6 +616,7 @@ pub fn collect_local_export_with_progress(
         include_media,
         data_redaction,
         since_unix_ms,
+        source_root,
         progress,
         Some(&media_sink),
     )
@@ -622,13 +626,34 @@ fn collect_local_export_internal(
     include_media: bool,
     data_redaction: bool,
     since_unix_ms: Option<i64>,
+    source_root: Option<String>,
     progress: wecom_archive_server::LocalCollectionProgressReporter,
     media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
 ) -> Result<ClientExportV1, String> {
     progress(6, "发现数据源", "正在查找当前登录的企业微信数据。");
-    let candidates = WindowsSourceAdapter
-        .discover(None)
-        .map_err(|_| "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned())?;
+    let pasted_root = source_root.as_deref().and_then(normalize_source_root);
+    let remembered = load_remembered_source_roots(&source_roots_config_path());
+    let roots = collection_roots(
+        source_root.as_deref(),
+        &remembered,
+        &source_windows::default_roots(),
+    );
+    let candidates = source_windows::discover_roots(&roots);
+    if candidates.is_empty() {
+        return Err(if pasted_root.is_some() {
+            "这个文件夹里没找到企业微信数据库，请填企业微信实际存放聊天记录的那一层目录。"
+                .to_owned()
+        } else {
+            "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned()
+        });
+    }
+    // Only remember a directory that actually contained a data source, so a
+    // mistyped path cannot occupy a slot until the user retries.
+    let pasted_root_found = pasted_root.as_ref().is_some_and(|root| {
+        candidates
+            .iter()
+            .any(|candidate| candidate.root_path.starts_with(root))
+    });
     progress(15, "读取授权", "已发现数据源，正在准备只读访问。");
     let temporary_root =
         std::env::temp_dir().join(format!("wecom-archive-local-{}", uuid::Uuid::new_v4()));
@@ -664,7 +689,13 @@ fn collect_local_export_internal(
         })
     })();
     let _ = fs::remove_dir_all(&temporary_root);
-    result.map_err(|error| error.message)
+    let export = result.map_err(|error| error.message)?;
+    if pasted_root_found {
+        if let Some(root) = pasted_root.as_ref() {
+            let _ = remember_source_root(&source_roots_config_path(), root);
+        }
+    }
+    Ok(export)
 }
 
 #[tauri::command]
@@ -1019,6 +1050,109 @@ fn collector_runtime_config_path() -> PathBuf {
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("collector-config.dpapi")
+}
+
+const REMEMBERED_SOURCE_ROOTS_SCHEMA: u32 = 1;
+const MAX_REMEMBERED_SOURCE_ROOTS: usize = 3;
+
+#[derive(Deserialize, Serialize)]
+struct RememberedSourceRoots {
+    schema_version: u32,
+    roots: Vec<PathBuf>,
+}
+
+fn source_roots_config_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("source-roots.dpapi")
+}
+
+/// Directories a user confirmed by hand on this machine.
+///
+/// A missing, undecryptable or unrecognized file means "nothing remembered"
+/// rather than an error, so a damaged file can never break a collection the
+/// automatic scan would have handled.
+fn load_remembered_source_roots(path: &Path) -> Vec<PathBuf> {
+    let Ok(plaintext) = source_windows::dpapi::load_current_user(path) else {
+        return Vec::new();
+    };
+    let Ok(stored) =
+        serde_json::from_str::<RememberedSourceRoots>(&String::from_utf8_lossy(&plaintext))
+    else {
+        return Vec::new();
+    };
+    if stored.schema_version != REMEMBERED_SOURCE_ROOTS_SCHEMA {
+        return Vec::new();
+    }
+    stored
+        .roots
+        .into_iter()
+        .filter(|root| root.is_dir())
+        .take(MAX_REMEMBERED_SOURCE_ROOTS)
+        .collect()
+}
+
+fn remember_source_root(path: &Path, root: &Path) -> Result<(), String> {
+    let mut roots = vec![root.to_path_buf()];
+    roots.extend(
+        load_remembered_source_roots(path)
+            .into_iter()
+            .filter(|existing| existing != root),
+    );
+    roots.truncate(MAX_REMEMBERED_SOURCE_ROOTS);
+    let payload = serde_json::to_vec(&RememberedSourceRoots {
+        schema_version: REMEMBERED_SOURCE_ROOTS_SCHEMA,
+        roots,
+    })
+    .map_err(|_| "无法保存企业微信数据目录。".to_owned())?;
+    source_windows::dpapi::store_current_user(path, &payload)
+        .map_err(|_| "无法保存企业微信数据目录。".to_owned())
+}
+
+/// Accepts what a user pastes out of Explorer: surrounding quotes, stray
+/// whitespace, forward slashes and a trailing separator.
+///
+/// A bare drive root is rejected on purpose: discovery walks six levels, so
+/// `D:\` would mean crawling an entire volume while the user waits.
+fn normalize_source_root(raw: &str) -> Option<PathBuf> {
+    let mut cleaned = raw.trim().trim_matches('"').trim().replace('/', "\\");
+    while cleaned.ends_with('\\') && cleaned.len() > 3 {
+        cleaned.truncate(cleaned.len() - 1);
+    }
+    if cleaned.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(cleaned);
+    path.is_absolute()
+        .then_some(path)
+        .filter(|path| path.parent().is_some())
+}
+
+/// A pasted directory is the user's explicit statement of where the data is,
+/// so it is scanned before anything remembered or auto-detected.
+fn collection_roots(
+    pasted_root: Option<&str>,
+    remembered: &[PathBuf],
+    detected: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(raw) = pasted_root {
+        if let Some(root) = normalize_source_root(raw) {
+            push_unique_root(&mut roots, root);
+        }
+    }
+    for root in remembered.iter().chain(detected) {
+        push_unique_root(&mut roots, root.clone());
+    }
+    roots
+}
+
+fn push_unique_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    if !roots.contains(&root) {
+        roots.push(root);
+    }
 }
 
 #[tauri::command]
@@ -4510,9 +4644,78 @@ mod tests {
     }
 
     #[test]
+    fn pasted_and_remembered_directories_are_scanned_before_detected_ones() {
+        let roots = collection_roots(
+            Some("D:/WXWork/"),
+            &[PathBuf::from(r"E:\WXWork"), PathBuf::from(r"D:\WXWork")],
+            &[
+                PathBuf::from(r"C:\Users\mia\Documents\WXWork"),
+                PathBuf::from(r"D:\WXWork"),
+            ],
+        );
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from(r"D:\WXWork"),
+                PathBuf::from(r"E:\WXWork"),
+                PathBuf::from(r"C:\Users\mia\Documents\WXWork"),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_an_absolute_directory_can_be_pasted() {
+        assert_eq!(normalize_source_root("   "), None);
+        assert_eq!(normalize_source_root("WXWork"), None);
+        assert_eq!(
+            normalize_source_root("\"D:\\WXWork\""),
+            Some(PathBuf::from(r"D:\WXWork"))
+        );
+        assert_eq!(
+            normalize_source_root("D:\\"),
+            None,
+            "只填到盘符根会递归整块硬盘，必须拒绝"
+        );
+    }
+
+    #[test]
+    fn remembered_roots_round_trip_and_a_damaged_file_falls_back_to_automatic_scan() {
+        let directory =
+            std::env::temp_dir().join(format!("wecom-archive-roots-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let stored = directory.join("source-roots.dpapi");
+        assert!(
+            load_remembered_source_roots(&stored).is_empty(),
+            "一个都没有记住过时应当退回自动扫描"
+        );
+
+        let older = directory.join("older");
+        let newer = directory.join("newer");
+        fs::create_dir_all(&older).unwrap();
+        fs::create_dir_all(&newer).unwrap();
+        remember_source_root(&stored, &older).unwrap();
+        remember_source_root(&stored, &newer).unwrap();
+        assert_eq!(
+            load_remembered_source_roots(&stored),
+            vec![newer.clone(), older.clone()]
+        );
+
+        fs::create_dir_all(&newer.join("deleted")).unwrap();
+        fs::remove_dir_all(&newer).unwrap();
+        assert_eq!(load_remembered_source_roots(&stored), vec![older]);
+
+        fs::write(&stored, b"this is not a dpapi blob").unwrap();
+        assert!(
+            load_remembered_source_roots(&stored).is_empty(),
+            "记住的目录文件坏了也不能挡住采集"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     #[ignore = "requires the user's explicit authorization and a running trusted WXWork.exe"]
     fn authorized_real_collection_includes_group_metadata_without_exposing_content() {
-        let export = collect_local_export(false, false).unwrap();
+        let export = collect_local_export(false, false, None).unwrap();
         let message_count = export
             .batches
             .iter()
@@ -4547,6 +4750,7 @@ mod tests {
         let export = collect_local_export_internal(
             true,
             false,
+            None,
             None,
             std::sync::Arc::new(|_, _, _| {}),
             Some(&media_sink),

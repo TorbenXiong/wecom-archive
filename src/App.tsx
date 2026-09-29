@@ -5,7 +5,7 @@ import { DetailPanel } from "./components/DetailPanel";
 import { LocalExportPage } from "./components/LocalExportPage";
 import { MessageTimeline } from "./components/MessageTimeline";
 import { Navigation } from "./components/Navigation";
-import { ExportDialog, LocalCollectionDialog, LocalCollectionSetupDialog, ServerAccessGate, Toast, type ExportSelection } from "./components/Overlays";
+import { CustomSourceRootDialog, ExportDialog, LocalCollectionDialog, LocalCollectionSetupDialog, ServerAccessGate, Toast, type ExportSelection } from "./components/Overlays";
 import { SettingsPage } from "./components/SettingsPage";
 import { ServerConfigPage } from "./components/ServerConfigPage";
 import type { ConversationSummary, ExportFormat, ExportScope, MessageItem, ParticipantItem } from "./domain/types";
@@ -186,12 +186,15 @@ export default function App() {
     }
   };
 
-  const collectLocal = async (includeMedia: boolean) => {
+  const [customRootIssue, setCustomRootIssue] = useState<{ includeMedia: boolean; message: string; attemptedRoot?: string } | null>(null);
+
+  const collectLocal = async (includeMedia: boolean, sourceRoot?: string) => {
     if (!token || collectingLocal || !summary.local_collection_available) return;
     setCollectingLocal(true);
     setCollectionProgress({ running: true, percent: 2, stage: "准备采集", detail: includeMedia ? "正在准备采集文本、图片和文件。" : "正在准备仅采集文本消息。" });
     try {
-      const result = await collectLocalArchive(token, includeMedia);
+      const result = await collectLocalArchive(token, includeMedia, sourceRoot);
+      setCustomRootIssue(null);
       await loadDirectory(token);
       setRefreshVersion((current) => current + 1);
       setToast({
@@ -199,7 +202,9 @@ export default function App() {
         tone: "success",
       });
     } catch (error) {
-      setToast({ message: error instanceof Error ? error.message : "本机采集未完成。", tone: "error" });
+      const message = error instanceof Error ? error.message : "本机采集未完成。";
+      setToast({ message, tone: "error" });
+      setCustomRootIssue({ includeMedia, message, attemptedRoot: sourceRoot });
     } finally {
       setCollectingLocal(false);
     }
@@ -356,6 +361,7 @@ export default function App() {
     <footer className="status-bar"><span>已归档 {summary.message_count.toLocaleString("zh-CN")} 条消息 · {summary.media_count.toLocaleString("zh-CN")} 项媒体 · {summary.conversation_count.toLocaleString("zh-CN")} 个会话</span><span><i />受控访问 · 审计已启用</span></footer>
      {showExport && superAdminEnabled && <ExportDialog token={token} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} conversations={conversations} selectedConversationId={selectedId} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" || scope === "date_range" ? summary.message_count : scope === "current_filter" ? messages.length : scope === "selected_conversations" ? 0 : selectedConversation.messageCount} mediaCount={scope === "entire_archive" || scope === "date_range" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async (selection: ExportSelection) => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, conversationIds: selection.conversationIds, startDate: selection.startDate, endDate: selection.endDate, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
     {showLocalCollectionSetup && !collectingLocal && <LocalCollectionSetupDialog onClose={() => setShowLocalCollectionSetup(false)} onCollect={(includeMedia) => { setShowLocalCollectionSetup(false); void collectLocal(includeMedia); }} />}
+    {customRootIssue && !collectingLocal && <CustomSourceRootDialog message={customRootIssue.message} initialRoot={customRootIssue.attemptedRoot ?? ""} onClose={() => setCustomRootIssue(null)} onRetry={(root) => { void collectLocal(customRootIssue.includeMedia, root); }} />}
     {collectingLocal && <LocalCollectionDialog progress={collectionProgress} />}
     {toast && <Toast tone={toast.tone} actionLabel={toast.actionLabel} onAction={toast.onAction} onClose={() => setToast(undefined)}>{toast.message}</Toast>}
   </div>;

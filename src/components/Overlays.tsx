@@ -49,6 +49,12 @@ export function LocalCollectionSetupDialog({ onClose, onCollect }: { onClose: ()
   return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><section className="modal-card local-collection-setup" role="dialog" aria-modal="true" aria-labelledby="local-collection-setup-title" onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" type="button" aria-label="关闭本机采集配置" onClick={onClose}><X size={18} /></button><span className="modal-icon"><Database /></span><h2 id="local-collection-setup-title">本机采集</h2><p>选择本次采集范围。持续采集请前往“采集端管理”维护。</p><div className="local-collection-choices"><button className="secondary-button" type="button" onClick={() => onCollect(false)}>仅采集文本</button><button className="primary-button" type="button" onClick={() => onCollect(true)}>包含全内容</button></div></section></div>;
 }
 
+export function CustomSourceRootDialog({ message, initialRoot, onClose, onRetry }: { message: string; initialRoot: string; onClose: () => void; onRetry: (sourceRoot: string) => void }) {
+  const [sourceRoot, setSourceRoot] = useState(initialRoot);
+  const trimmed = sourceRoot.trim();
+  return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><section className="modal-card local-collection-setup" role="dialog" aria-modal="true" aria-labelledby="custom-source-root-title" onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" type="button" aria-label="关闭自定义数据目录" onClick={onClose}><X size={18} /></button><span className="modal-icon warning"><AlertTriangle /></span><h2 id="custom-source-root-title">没有找到企业微信数据</h2><div className="inline-error"><AlertTriangle size={15} />{message}</div><p>如果这台电脑的企业微信把聊天记录存放在别的盘，或"文档"被 OneDrive 接管，请把那个文件夹填进来重试。可以在企业微信「设置 → 文件管理 → 存储位置」看到它。成功后这台电脑会记住，下次不用再填。</p><label className="access-token"><span>企业微信数据目录</span><div><input aria-label="企业微信数据目录" type="text" autoComplete="off" spellCheck={false} value={sourceRoot} onChange={(event) => setSourceRoot(event.target.value)} placeholder="例如 D:\WXWork" autoFocus /></div></label><div className="modal-actions"><button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="primary-button" type="button" disabled={trimmed.length === 0} onClick={() => onRetry(trimmed)}>用这个目录重试</button></div></section></div>;
+}
+
 export function ServerAccessGate({ onConnect }: { onConnect: (token: string) => Promise<void> }) {
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);

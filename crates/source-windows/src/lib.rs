@@ -1,4 +1,5 @@
 pub mod enterprise_crypto;
+mod roots;
 mod snapshot;
 
 #[cfg(windows)]
@@ -19,6 +20,7 @@ use archive_domain::{
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+pub use roots::default_roots;
 pub use snapshot::{SnapshotOptions, create_consistent_snapshot};
 
 pub const ADAPTER_ID: &str = "windows-local-v1";
@@ -42,13 +44,9 @@ impl SourceAdapter for WindowsSourceAdapter {
     ) -> Result<Vec<SourceCandidate>, DomainError> {
         let roots = match selected_root {
             Some(root) => vec![root],
-            None => default_roots(),
+            None => roots::default_roots(),
         };
-        Ok(roots
-            .into_iter()
-            .filter(|root| root.is_dir())
-            .flat_map(|root| discover_under(&root))
-            .collect())
+        Ok(discover_roots(&roots))
     }
 
     fn snapshot(
@@ -58,6 +56,24 @@ impl SourceAdapter for WindowsSourceAdapter {
     ) -> Result<SnapshotReceipt, DomainError> {
         create_consistent_snapshot(candidate, &work_root, SnapshotOptions::default())
     }
+}
+
+/// Discovers under every root the caller trusts, so remembered and
+/// auto-detected locations share one ordering rule.
+pub fn discover_roots(roots: &[PathBuf]) -> Vec<SourceCandidate> {
+    let mut seen = BTreeSet::new();
+    let mut candidates: Vec<SourceCandidate> = roots
+        .iter()
+        .filter(|root| root.is_dir())
+        .flat_map(|root| discover_under(root))
+        .filter(|candidate| seen.insert(candidate.source_id.clone()))
+        .collect();
+    candidates.sort_by(|left, right| {
+        message_database_size(right)
+            .cmp(&message_database_size(left))
+            .then_with(|| left.source_id.cmp(&right.source_id))
+    });
+    candidates
 }
 
 fn discover_under(root: &Path) -> Vec<SourceCandidate> {
@@ -223,19 +239,6 @@ fn path_fingerprint(path: &Path) -> String {
     format!("src-{}", &hex::encode(digest)[..20])
 }
 
-fn default_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(app_data) = std::env::var_os("APPDATA") {
-        roots.push(PathBuf::from(app_data).join("Tencent").join("WXWork"));
-    }
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
-        roots.push(PathBuf::from(profile).join("Documents").join("WXWork"));
-    }
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +269,53 @@ mod tests {
                 .iter()
                 .any(|database| database.wal_path.is_some())
         );
+    }
+
+    fn write_account_databases(root: &Path, message_bytes: usize) {
+        fs::create_dir_all(root).unwrap();
+        for (name, size) in [
+            ("message.db", message_bytes),
+            ("session.db", 48),
+            ("user.db", 48),
+        ] {
+            let mut bytes = vec![0_u8; size];
+            bytes[..16].copy_from_slice(b"SQLite format 3\0");
+            bytes[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+            fs::write(root.join(name), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn orders_candidates_across_roots_by_message_database_size() {
+        let directory = tempdir().unwrap();
+        let small = directory.path().join("appdata").join("WXWork").join("1");
+        let large = directory.path().join("d-drive").join("WXWork").join("2");
+        write_account_databases(&small, 64);
+        write_account_databases(&large, 4_096);
+
+        let candidates = discover_roots(&[
+            directory.path().join("appdata").join("WXWork"),
+            directory.path().join("d-drive").join("WXWork"),
+        ]);
+
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates[0]
+                .root_path
+                .ends_with(directory.path().join("d-drive").join("WXWork").join("2")),
+            "expected the larger account first, got {:?}",
+            candidates[0].root_path
+        );
+    }
+
+    #[test]
+    fn overlapping_roots_discover_a_source_once() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("WXWork");
+        write_account_databases(&root.join("1"), 64);
+
+        let candidates = discover_roots(&[root.clone(), root]);
+        assert_eq!(candidates.len(), 1);
     }
 
     #[test]
