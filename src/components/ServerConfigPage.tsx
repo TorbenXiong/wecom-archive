@@ -35,6 +35,7 @@ export function ServerConfigPage({ token, onTokenChanged, localCollectionAvailab
   const [loadedToken, setLoadedToken] = useState<string>();
   const [offlineExportEnabled, setOfflineExportEnabled] = useState(false);
   const [hiddenModeEnabled, setHiddenModeEnabled] = useState(false);
+  const [collectorLoggingEnabled, setCollectorLoggingEnabled] = useState(false);
   const [collectorSchedule, setCollectorSchedule] = useState<CollectionSchedule>(DEFAULT_COLLECTION_SCHEDULE);
   const [status, setStatus] = useState<string>();
   const [statusTone, setStatusTone] = useState<"success" | "error">("success");
@@ -54,6 +55,7 @@ export function ServerConfigPage({ token, onTokenChanged, localCollectionAvailab
         setDataRedaction(config.dataRedaction ?? true);
         setOfflineExportEnabled(config.offlineExportEnabled ?? false);
         setHiddenModeEnabled(config.hiddenModeEnabled ?? false);
+        setCollectorLoggingEnabled(config.collectorLogLevel != null && config.collectorLogLevel !== "off");
         setCollectorSchedule(config.collectorSchedule ?? DEFAULT_COLLECTION_SCHEDULE);
         try {
           const draft = JSON.parse(sessionStorage.getItem(`collector-config-draft:${token}`) || "null");
@@ -64,6 +66,7 @@ export function ServerConfigPage({ token, onTokenChanged, localCollectionAvailab
             if (typeof draft.dataRedaction === "boolean") setDataRedaction(draft.dataRedaction);
             if (typeof draft.offlineExportEnabled === "boolean") setOfflineExportEnabled(draft.offlineExportEnabled);
             if (typeof draft.hiddenModeEnabled === "boolean") setHiddenModeEnabled(draft.hiddenModeEnabled);
+            if (["off", "normal", "verbose"].includes(draft.collectorLogLevel)) setCollectorLoggingEnabled(draft.collectorLogLevel !== "off");
             if (draft.collectorSchedule) setCollectorSchedule(draft.collectorSchedule);
           }
         } catch { /* Ignore an invalid navigation draft and use the server config. */ }
@@ -76,9 +79,9 @@ export function ServerConfigPage({ token, onTokenChanged, localCollectionAvailab
   useEffect(() => {
     if (loadedToken !== token) return;
     try {
-      sessionStorage.setItem(`collector-config-draft:${token}`, JSON.stringify({ organizationName, uploadUrl, includeMedia, dataRedaction, offlineExportEnabled, hiddenModeEnabled, collectorSchedule }));
+      sessionStorage.setItem(`collector-config-draft:${token}`, JSON.stringify({ organizationName, uploadUrl, includeMedia, dataRedaction, offlineExportEnabled, hiddenModeEnabled, collectorLogLevel: collectorLoggingEnabled ? "normal" : "off", collectorSchedule }));
     } catch { /* Draft persistence is best effort. */ }
-  }, [loadedToken, token, organizationName, uploadUrl, includeMedia, dataRedaction, offlineExportEnabled, hiddenModeEnabled, collectorSchedule]);
+  }, [loadedToken, token, organizationName, uploadUrl, includeMedia, dataRedaction, offlineExportEnabled, hiddenModeEnabled, collectorLoggingEnabled, collectorSchedule]);
 
   useEffect(() => {
     setTokenDraft(token);
@@ -113,6 +116,7 @@ export function ServerConfigPage({ token, onTokenChanged, localCollectionAvailab
       dataRedaction,
       offlineExportEnabled,
       hiddenModeEnabled,
+      collectorLogLevel: collectorLoggingEnabled ? "normal" : "off",
       collectorSchedule,
     });
     setKeyId(config.keyId);
@@ -129,6 +133,7 @@ export function ServerConfigPage({ token, onTokenChanged, localCollectionAvailab
       dataRedaction,
       offlineExportEnabled,
       hiddenModeEnabled,
+      collectorLogLevel: collectorLoggingEnabled ? "normal" : "off",
       collectorSchedule,
     });
     setKeyId(config.keyId);
@@ -193,7 +198,7 @@ export function ServerConfigPage({ token, onTokenChanged, localCollectionAvailab
               <div className="config-value-row url-config-row">
                 <input id="upload-url" value={uploadUrl} onChange={(event) => setUploadUrl(event.target.value)} placeholder="https://archive.example.com" autoComplete="url" />
                 <label className="offline-export-option" title="采集端可将加密数据导出为 .wca 文件，供管理员离线导入。"><input type="checkbox" checked={offlineExportEnabled} onChange={(event) => setOfflineExportEnabled(event.target.checked)} />支持离线导出</label>
-                <button className="config-icon-button primary config-save-button" type="button" aria-label="保存服务端 URL" title="保存服务端 URL" onClick={() => void run(async () => { await updateEnterpriseConfig(token, { organizationName: organizationName || DEFAULT_ORGANIZATION_NAME, uploadUrl, keyId: keyId || undefined, includeMedia, dataRedaction, offlineExportEnabled, hiddenModeEnabled, collectorSchedule }); showStatus("服务端 URL 已保存。" ); })} disabled={busy || !uploadUrl.trim()}><Save size={16} /></button>
+                <button className="config-icon-button primary config-save-button" type="button" aria-label="保存服务端 URL" title="保存服务端 URL" onClick={() => void run(async () => { await updateEnterpriseConfig(token, { organizationName: organizationName || DEFAULT_ORGANIZATION_NAME, uploadUrl, keyId: keyId || undefined, includeMedia, dataRedaction, offlineExportEnabled, hiddenModeEnabled, collectorLogLevel: collectorLoggingEnabled ? "normal" : "off", collectorSchedule }); showStatus("服务端 URL 已保存。" ); })} disabled={busy || !uploadUrl.trim()}><Save size={16} /></button>
               </div>
             </div>
             <div className="collector-config-field">
@@ -221,10 +226,11 @@ export function ServerConfigPage({ token, onTokenChanged, localCollectionAvailab
             </div>
           </div>
 
-      <div className="collector-media-options">
+          <div className="collector-media-options">
             <label className="collector-media-label"><input type="checkbox" checked={includeMedia} onChange={(event) => setIncludeMedia(event.target.checked)} />含文件和图片</label>
             <label className="collector-media-label" title="上传前脱敏账号、密码、令牌、联系方式及疑似凭据片段；文件名和图片名保持原样。"><input type="checkbox" checked={dataRedaction} onChange={(event) => setDataRedaction(event.target.checked)} />数据脱敏</label>
             <label className="collector-media-label" title="启动采集端后不显示窗口，也不显示系统托盘图标；仍按采集计划后台运行。"><input type="checkbox" checked={hiddenModeEnabled} onChange={(event) => setHiddenModeEnabled(event.target.checked)} />隐藏式采集端</label>
+            <label className="collector-media-label" title="开启后记录采集端运行诊断日志，便于排查问题。"><input type="checkbox" aria-label="开启采集端日志" checked={collectorLoggingEnabled} onChange={(event) => setCollectorLoggingEnabled(event.target.checked)} />开启采集端日志</label>
           </div>
           <div className="collector-continuous-row"><strong>采集计划</strong><CollectionScheduleFields idPrefix="collector-default-schedule" schedule={collectorSchedule} onChange={setCollectorSchedule} disabled={busy} /></div>
 

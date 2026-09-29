@@ -24,6 +24,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Emitter, Manager, State};
 use zeroize::{Zeroize, Zeroizing};
 
+mod diagnostics;
 mod sqlite3mc;
 
 const LOCAL_NOTICE_VERSION: &str = "client-notice.v1";
@@ -43,6 +44,37 @@ fn next_offline_export_file(directory: &Path) -> (String, PathBuf) {
     }
 }
 
+fn collector_data_root() -> Result<PathBuf, CommandError> {
+    std::env::current_exe()
+        .map_err(|_| internal_error())?
+        .parent()
+        .map(|parent| parent.join("collectorData"))
+        .ok_or_else(internal_error)
+}
+
+fn collector_runtime_config_path(collector_id: &str) -> Result<PathBuf, CommandError> {
+    let collector_id = uuid::Uuid::parse_str(collector_id).map_err(|_| internal_error())?;
+    Ok(collector_data_root()?
+        .join("instances")
+        .join(collector_id.to_string())
+        .join("collector-config.dpapi"))
+}
+
+fn legacy_collector_runtime_config_path() -> Result<PathBuf, CommandError> {
+    Ok(collector_data_root()?
+        .parent()
+        .ok_or_else(internal_error)?
+        .join("collector-config.dpapi"))
+}
+
+fn collector_work_root(prefix: &str) -> Result<PathBuf, CommandError> {
+    let root = collector_data_root()?
+        .join("work")
+        .join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).map_err(|_| internal_error())?;
+    Ok(root)
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BootstrapResponse {
@@ -51,6 +83,14 @@ struct BootstrapResponse {
     offline_export_enabled: bool,
     hidden_mode_enabled: bool,
     collector_schedule: CollectionSchedule,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorDiagnosticEvent {
+    timestamp: u64,
+    event: String,
+    details: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +126,8 @@ struct EnterpriseCollectorConfig {
     offline_export_enabled: bool,
     #[serde(default)]
     hidden_mode_enabled: bool,
+    #[serde(default = "default_collector_log_level")]
+    collector_log_level: String,
     #[serde(default)]
     manual_collection_request_id: Option<String>,
     #[serde(default)]
@@ -118,6 +160,10 @@ fn default_schedule_interval_minutes() -> u32 {
 
 fn default_data_redaction() -> bool {
     true
+}
+
+fn default_collector_log_level() -> String {
+    "off".into()
 }
 
 fn default_schedule_daily_time() -> String {
@@ -455,9 +501,23 @@ fn record_upload_success(state: &AppState, export: &ClientExportV1) {
 }
 
 #[tauri::command]
-fn bootstrap() -> Result<BootstrapResponse, CommandError> {
-    let _ = sync_collector_config_with_status(None, None);
-    let config = load_enterprise_collector_config()?;
+async fn bootstrap() -> Result<BootstrapResponse, CommandError> {
+    diagnostics::write("bootstrap_started", "");
+    // The heartbeat can wait for the server for up to 30 seconds. Running it
+    // on the window thread prevents WebView2 from painting the initial page.
+    let config = tauri::async_runtime::spawn_blocking(|| {
+        let _ = sync_collector_config_with_status(None, None);
+        load_enterprise_collector_config()
+    })
+    .await
+    .map_err(|_| internal_error())??;
+    diagnostics::write(
+        "bootstrap_ready",
+        &format!(
+            "hidden_mode={};schedule={:?}",
+            config.hidden_mode_enabled, config.collector_schedule.mode
+        ),
+    );
     Ok(BootstrapResponse {
         organization_name: Some(config.organization_name),
         display_name: (!config.display_name.is_empty()).then_some(config.display_name),
@@ -480,6 +540,16 @@ fn get_collector_schedule_status(
 
 #[tauri::command]
 fn hide_collector_window(window: tauri::WebviewWindow) -> Result<(), CommandError> {
+    // Only an explicitly hidden collector may hide itself through the WebView.
+    let hidden_mode_enabled = load_enterprise_collector_config()?.hidden_mode_enabled;
+    diagnostics::write(
+        "hide_command",
+        &format!("hidden_mode={hidden_mode_enabled}"),
+    );
+    if !hidden_mode_enabled {
+        diagnostics::write("hide_command_ignored", "normal_mode");
+        return Ok(());
+    }
     window.set_skip_taskbar(true).map_err(|_| CommandError {
         code: "WINDOW_HIDE_FAILED",
         message: "无法隐藏采集端窗口。".into(),
@@ -551,8 +621,7 @@ async fn collect_source(
             include_files: config.include_files,
             include_images: config.include_images,
         };
-        let root =
-            std::env::temp_dir().join(format!("wecom-archive-collector-{}", uuid::Uuid::new_v4()));
+        let root = collector_work_root("manual")?;
         let encrypted = candidate
             .databases
             .iter()
@@ -630,8 +699,7 @@ fn collect_local_export_internal(
         .discover(None)
         .map_err(|_| "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned())?;
     progress(15, "读取授权", "已发现数据源，正在准备只读访问。");
-    let temporary_root =
-        std::env::temp_dir().join(format!("wecom-archive-local-{}", uuid::Uuid::new_v4()));
+    let temporary_root = collector_work_root("local").map_err(|error| error.message)?;
     let result = (|| {
         let (candidate, key) = choose_collectable_source(candidates, &mut |source| {
             resolve_collection_key(
@@ -747,10 +815,12 @@ fn export_latest_enterprise(
             recoverable: true,
         })?;
     let package = create_enterprise_package(&export, &config)?;
-    let directory = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-        .ok_or_else(internal_error)?;
+    let directory = collector_data_root()?;
+    fs::create_dir_all(&directory).map_err(|_| CommandError {
+        code: "OFFLINE_EXPORT_FAILED",
+        message: "无法创建 collectorData 目录，请确认采集端所在目录可写。".into(),
+        recoverable: true,
+    })?;
     let _export_file_lock = OFFLINE_EXPORT_FILE_LOCK
         .lock()
         .map_err(|_| internal_error())?;
@@ -781,10 +851,12 @@ fn export_latest_enterprise(
 #[tauri::command]
 #[cfg(windows)]
 fn open_offline_export_directory() -> Result<(), CommandError> {
-    let directory = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-        .ok_or_else(internal_error)?;
+    let directory = collector_data_root()?;
+    fs::create_dir_all(&directory).map_err(|_| CommandError {
+        code: "OFFLINE_EXPORT_DIRECTORY_OPEN_FAILED",
+        message: "无法创建 collectorData 目录。".into(),
+        recoverable: true,
+    })?;
     Command::new("explorer.exe")
         .arg(directory)
         .creation_flags(0x0800_0000)
@@ -905,6 +977,7 @@ fn collector_control_payload(
             "dataRedaction": config.data_redaction,
             "offlineExportEnabled": config.offline_export_enabled,
             "hiddenModeEnabled": config.hidden_mode_enabled,
+            "collectorLogLevel": config.collector_log_level,
             "manualCollectionRequestId": config.manual_collection_request_id,
             "schedule": config.collector_schedule,
         },
@@ -914,21 +987,31 @@ fn collector_control_payload(
 
 fn load_enterprise_collector_config() -> Result<EnterpriseCollectorConfig, CommandError> {
     let executable = std::env::current_exe().map_err(|_| internal_error())?;
-    let bytes = source_windows::dpapi::load_current_user(&collector_runtime_config_path())
-        .map(|bytes| bytes.to_vec())
-        .map_err(|error| error.to_string())
-        .or_else(|_| archive_transfer::read_enterprise_collector_config(&executable))
-        .map_err(|_| CommandError {
-            code: "ENTERPRISE_CONFIG_MISSING",
-            message: "采集端内未找到企业配置。".into(),
-            recoverable: false,
+    let embedded_bytes =
+        archive_transfer::read_enterprise_collector_config(&executable).map_err(|_| {
+            CommandError {
+                code: "ENTERPRISE_CONFIG_MISSING",
+                message: "采集端内未找到企业配置。".into(),
+                recoverable: false,
+            }
         })?;
-    let config: EnterpriseCollectorConfig =
-        serde_json::from_slice(&bytes).map_err(|_| CommandError {
+    let embedded: EnterpriseCollectorConfig =
+        serde_json::from_slice(&embedded_bytes).map_err(|_| CommandError {
             code: "ENTERPRISE_CONFIG_INVALID",
             message: "企业采集配置无效。".into(),
             recoverable: false,
         })?;
+    let runtime = collector_runtime_config_path(&embedded.collector_id)
+        .ok()
+        .and_then(|path| source_windows::dpapi::load_current_user(&path).ok())
+        .or_else(|| {
+            legacy_collector_runtime_config_path()
+                .ok()
+                .and_then(|path| source_windows::dpapi::load_current_user(&path).ok())
+        })
+        .and_then(|bytes| serde_json::from_slice::<EnterpriseCollectorConfig>(&bytes).ok())
+        .filter(|config| config.collector_id == embedded.collector_id);
+    let config = runtime.unwrap_or(embedded);
     let key = hex::decode(&config.public_key_hex).map_err(|_| CommandError {
         code: "ENTERPRISE_CONFIG_INVALID",
         message: "企业采集配置中的加密密钥无效。".into(),
@@ -1011,14 +1094,6 @@ fn ensure_collector_config_fresh(config: &EnterpriseCollectorConfig) -> Result<(
         });
     }
     Ok(())
-}
-
-fn collector_runtime_config_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("collector-config.dpapi")
 }
 
 #[tauri::command]
@@ -1117,6 +1192,13 @@ fn sync_collector_config_with_status(
     app_state: Option<&AppState>,
 ) -> Result<(), CommandError> {
     let current = load_enterprise_collector_config()?;
+    diagnostics::write(
+        "heartbeat_started",
+        &format!(
+            "revision={};hidden_mode={}",
+            current.config_revision, current.hidden_mode_enabled
+        ),
+    );
     if current.collector_id.is_empty() {
         return Ok(());
     }
@@ -1131,7 +1213,8 @@ fn sync_collector_config_with_status(
     } else {
         0
     };
-    let body = serde_json::to_vec(&serde_json::json!({ "clientVersion": env!("CARGO_PKG_VERSION"), "currentConfigRevision": current_revision, "lastAppliedRevision": current.config_revision, "lastRunAt": status.as_ref().and_then(|value| value.last_attempt_at.clone()), "lastSuccessAt": status.as_ref().and_then(|value| value.last_success_at.clone()), "lastError": status.as_ref().and_then(|value| value.last_error.clone()), "lastManualCollectionRequestId": status.as_ref().and_then(|value| value.last_manual_collection_request_id.clone()) })).map_err(|_| internal_error())?;
+    let pending_diagnostics = diagnostics::take_events();
+    let body = serde_json::to_vec(&serde_json::json!({ "clientVersion": env!("CARGO_PKG_VERSION"), "currentConfigRevision": current_revision, "lastAppliedRevision": current.config_revision, "lastRunAt": status.as_ref().and_then(|value| value.last_attempt_at.clone()), "lastSuccessAt": status.as_ref().and_then(|value| value.last_success_at.clone()), "lastError": status.as_ref().and_then(|value| value.last_error.clone()), "lastManualCollectionRequestId": status.as_ref().and_then(|value| value.last_manual_collection_request_id.clone()), "diagnostics": pending_diagnostics.iter().map(|event| CollectorDiagnosticEvent { timestamp: event.timestamp, event: event.event.clone(), details: event.details.clone() }).collect::<Vec<_>>() })).map_err(|_| internal_error())?;
     let mut child = Command::new("curl.exe")
         .args([
             "--fail-with-body",
@@ -1162,6 +1245,8 @@ fn sync_collector_config_with_status(
     }
     let output = child.wait_with_output().map_err(|_| internal_error())?;
     if !output.status.success() {
+        diagnostics::restore_events(pending_diagnostics);
+        diagnostics::write("heartbeat_failed", "http_request_failed");
         if serde_json::from_slice::<serde_json::Value>(&output.stdout)
             .ok()
             .and_then(|body| {
@@ -1193,8 +1278,18 @@ fn sync_collector_config_with_status(
     let response: serde_json::Value =
         serde_json::from_slice(&output.stdout).map_err(|_| internal_error())?;
     let Some(control) = response.get("control") else {
+        diagnostics::write("heartbeat_ok", "control=none");
         return Ok(());
     };
+    let control_hidden_mode = control
+        .get("config")
+        .and_then(|value| value.get("hiddenModeEnabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    diagnostics::write(
+        "heartbeat_control",
+        &format!("hidden_mode={control_hidden_mode}"),
+    );
     verify_collector_control_envelope(
         control,
         &current.signing_public_key_hex,
@@ -1213,6 +1308,7 @@ fn sync_collector_config_with_status(
         ("dataRedaction", "dataRedaction"),
         ("offlineExportEnabled", "offlineExportEnabled"),
         ("hiddenModeEnabled", "hiddenModeEnabled"),
+        ("collectorLogLevel", "collectorLogLevel"),
         ("manualCollectionRequestId", "manualCollectionRequestId"),
         ("schedule", "collectorSchedule"),
         ("configRevision", "configRevision"),
@@ -1237,7 +1333,10 @@ fn sync_collector_config_with_status(
     if let Some(enabled) = config.get("enabled").and_then(|value| value.as_bool()) {
         object.insert("enabled".into(), enabled.into());
     }
-    let path = collector_runtime_config_path();
+    let path = collector_runtime_config_path(&current.collector_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|_| internal_error())?;
+    }
     source_windows::dpapi::store_current_user(
         &path,
         &serde_json::to_vec_pretty(&artifact).map_err(|_| internal_error())?,
@@ -1247,14 +1346,24 @@ fn sync_collector_config_with_status(
         && let Ok(Some(app)) = app_state.tray_app.lock().map(|handle| handle.clone())
     {
         let latest = load_enterprise_collector_config()?;
+        diagnostics::set_level(&latest.collector_log_level);
+        diagnostics::write(
+            "apply_visibility",
+            &format!("hidden_mode={}", latest.hidden_mode_enabled),
+        );
         apply_collector_visibility(&app, &latest).map_err(|_| internal_error())?;
     }
     Ok(())
 }
 
 #[tauri::command]
-fn sync_collector_config(state: State<'_, AppState>) -> Result<(), CommandError> {
-    sync_collector_config_with_status(Some(&state.schedule_status), Some(&state))
+async fn sync_collector_config(state: State<'_, AppState>) -> Result<(), CommandError> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        sync_collector_config_with_status(Some(&state.schedule_status), Some(&state))
+    })
+    .await
+    .map_err(|_| internal_error())?
 }
 
 fn collector_signing_payload(config: &EnterpriseCollectorConfig) -> String {
@@ -1611,8 +1720,7 @@ fn validation_page_prefix(candidate: &SourceCandidate) -> Option<String> {
     {
         return Some(hex::encode(page_prefix));
     }
-    let work_root =
-        std::env::temp_dir().join(format!("wecom-archive-probe-{}", uuid::Uuid::new_v4()));
+    let work_root = collector_work_root("probe").ok()?;
     let receipt = WindowsSourceAdapter
         .snapshot(candidate, work_root.clone())
         .ok()?;
@@ -3266,13 +3374,21 @@ pub fn run_key_probe() -> i32 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    diagnostics::init();
     tauri::Builder::default()
         .manage(AppState::default())
         .setup(|app| {
             let collector_config = load_enterprise_collector_config().ok();
+            if let Some(config) = collector_config.as_ref() {
+                diagnostics::set_level(&config.collector_log_level);
+            }
             let hidden_mode_enabled = collector_config
                 .as_ref()
                 .is_some_and(|config| config.hidden_mode_enabled);
+            diagnostics::write(
+                "window_setup",
+                &format!("config_loaded={};hidden_mode={hidden_mode_enabled}", collector_config.is_some()),
+            );
             // The workspace and generated collectors share one Tauri identifier, but
             // serve different pages. WebView2 must not reuse the workspace browser
             // process (or another collector's process) for the collector window.
@@ -3280,10 +3396,9 @@ pub fn run() {
                 .as_ref()
                 .map(|config| hex::encode(Sha256::digest(config.collector_id.as_bytes())))
                 .unwrap_or_else(|| "unconfigured".into());
-            let webview_data_dir = app
-                .path()
-                .app_local_data_dir()?
-                .join("collector-webview")
+            let webview_data_dir = collector_data_root()
+                .map_err(|_| std::io::Error::other("collectorData path unavailable"))?
+                .join("webview")
                 .join(collector_profile);
             let _collector_window = tauri::WebviewWindowBuilder::new(
                 app,
@@ -3307,20 +3422,26 @@ pub fn run() {
             .min_inner_size(420.0, 340.0)
             .resizable(true)
             .center()
+            // Create hidden-mode collectors without ever presenting the native
+            // window. The page-load callback below keeps the window hidden as
+            // well, while tray actions can still show it when applicable.
+            .visible(!hidden_mode_enabled)
             .skip_taskbar(hidden_mode_enabled)
             .on_page_load(move |window, payload| {
+                diagnostics::verbose(
+                    "page_load",
+                    &format!("event={:?};hidden_mode={hidden_mode_enabled}", payload.event()),
+                );
                 if hidden_mode_enabled
                     && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
                 {
+                    diagnostics::write("page_load_hide", "hidden_mode=true");
                     let _ = window.set_skip_taskbar(true);
                     let _ = window.hide();
                 }
             })
             .icon(collector_tray_icon())?
             .build()?;
-            // Keep the hidden-mode window visible until its first page-load
-            // callback. Hiding during WebView2 initialization can leave a
-            // blank surface when it is shown later from the tray on Windows.
             let app_state = app.state::<AppState>().inner().clone();
             if let Ok(mut tray_app) = app_state.tray_app.lock() {
                 *tray_app = Some(app.handle().clone());
@@ -3379,6 +3500,7 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                diagnostics::write("window_close_requested", "hide_for_tray=true");
                 api.prevent_close();
                 let _ = window.hide();
             }
@@ -3703,8 +3825,7 @@ fn scheduled_collect_and_upload(
         include_files: config.include_files,
         include_images: config.include_images,
     };
-    let root =
-        std::env::temp_dir().join(format!("wecom-archive-collector-{}", uuid::Uuid::new_v4()));
+    let root = collector_work_root("scheduled")?;
     let (candidate, key) = choose_collectable_source(candidates, &mut |source| {
         resolve_collection_key(
             source,
@@ -4567,6 +4688,79 @@ mod tests {
             streamed_files.load(std::sync::atomic::Ordering::Relaxed),
             export.missing_media_count
         );
+    }
+
+    #[test]
+    fn collector_config_without_log_field_uses_signed_off_default() {
+        let (public_key, private_key) =
+            source_windows::enterprise_crypto::generate_rsa_key_pair().unwrap();
+        let expires_at = (Utc::now() + TimeDelta::minutes(5)).to_rfc3339();
+        let mut artifact = serde_json::json!({
+            "schemaVersion": "enterprise-collector.v1",
+            "collectorId": "collector-test",
+            "displayName": "测试采集端",
+            "configRevision": 1,
+            "configExpiresAt": expires_at,
+            "organizationId": "org-test",
+            "organizationName": "测试组织",
+            "collectionNotice": "测试告知",
+            "keyId": "key-test",
+            "publicKeyHex": "aa",
+            "signingPublicKeyHex": hex::encode(&public_key),
+            "signatureHex": "",
+            "uploadUrl": "http://127.0.0.1:9812/api/v1/imports/enterprise",
+            "uploadToken": "test-token",
+            "includeFiles": false,
+            "includeImages": false,
+            "dataRedaction": true,
+            "offlineExportEnabled": false,
+            "hiddenModeEnabled": false,
+            "enabled": true,
+            "manualCollectionRequestId": null,
+            "collectorSchedule": { "mode": "disabled", "intervalMinutes": 60, "dailyTime": "02:00" },
+        });
+        let config: EnterpriseCollectorConfig = serde_json::from_value(artifact.clone()).unwrap();
+        assert_eq!(config.collector_log_level, "off");
+        let signed_payload = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": "collector-control.v1",
+            "configRevision": 1,
+            "expiresAt": expires_at,
+            "config": {
+                "collectorId": "collector-test",
+                "displayName": "测试采集端",
+                "enabled": true,
+                "configRevision": 1,
+                "organizationId": "org-test",
+                "organizationName": "测试组织",
+                "collectionNotice": "测试告知",
+                "uploadUrl": "http://127.0.0.1:9812/api/v1/imports/enterprise",
+                "keyId": "key-test",
+                "publicKeyHex": "aa",
+                "includeMedia": false,
+                "dataRedaction": true,
+                "offlineExportEnabled": false,
+                "hiddenModeEnabled": false,
+                "collectorLogLevel": "off",
+                "manualCollectionRequestId": null,
+                "schedule": { "mode": "disabled", "intervalMinutes": 60, "dailyTime": "02:00" },
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            collector_control_payload(&config, &expires_at).unwrap(),
+            signed_payload
+        );
+        let signature =
+            source_windows::enterprise_crypto::sign(&private_key, &signed_payload).unwrap();
+        artifact["signatureHex"] = hex::encode(signature).into();
+        let loaded: EnterpriseCollectorConfig = serde_json::from_value(artifact).unwrap();
+        let signature = hex::decode(&loaded.signature_hex).unwrap();
+        source_windows::enterprise_crypto::verify(
+            &public_key,
+            &collector_control_payload(&loaded, &expires_at).unwrap(),
+            &signature,
+        )
+        .unwrap();
     }
 
     #[test]

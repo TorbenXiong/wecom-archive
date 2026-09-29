@@ -14,7 +14,7 @@ describe("collector", () => {
 
     expect(await screen.findByText(/完成首次自动采集并上传，之后将按计划自动采集并上传/)).toBeInTheDocument();
     expect(uploadLatest).toHaveBeenCalledOnce();
-    await waitFor(() => expect(hide).toHaveBeenCalledOnce());
+    await waitFor(() => expect(hide).not.toHaveBeenCalled());
   });
 
   it("automatically prepares local data and uploads it to the archive workspace", async () => {
@@ -31,6 +31,15 @@ describe("collector", () => {
     expect(await screen.findByRole("heading", { name: "上传完成" })).toBeInTheDocument();
     expect(screen.getByText(/共 238 条消息/)).toBeInTheDocument();
     expect(uploadLatest).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the ready page visible when a status refresh has no collection count", async () => {
+    vi.spyOn(backend, "getCollectorScheduleStatus").mockResolvedValue({ running: false, lastMessageCount: null as unknown as number, lastMediaCount: null as unknown as number });
+    render(<ClientApp />);
+    await screen.findByRole("heading", { name: "示例采集端" });
+    await waitFor(() => expect(backend.getCollectorScheduleStatus).toHaveBeenCalled());
+    expect(screen.getByText("238")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "上传到归档工作台" })).toBeEnabled();
   });
 
   it("exports an encrypted offline package and offers its directory", async () => {

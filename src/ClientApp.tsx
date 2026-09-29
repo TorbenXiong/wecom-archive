@@ -58,8 +58,6 @@ export default function ClientApp() {
           setStatus("采集端已完成首次自动采集并上传，之后将按计划自动采集并上传，无需手动操作。");
         } catch (reason) {
           setStatus(`采集已准备，但首次自动上传失败：${formatBackendError(reason, "请检查服务端连接，后台计划会继续重试。")}`);
-        } finally {
-          await backend.hideCollectorWindow();
         }
       } else {
         setStatus("本机数据已采集，可手动上传或导出。");
@@ -80,7 +78,7 @@ export default function ClientApp() {
         const next = await backend.getCollectorScheduleStatus();
         if (!active) return;
         setScheduleStatus(next);
-        if (next.lastMessageCount !== undefined) {
+        if (next.lastMessageCount != null) {
           setSummary((current) => current ? {
             ...current,
             messageCount: next.lastMessageCount!,

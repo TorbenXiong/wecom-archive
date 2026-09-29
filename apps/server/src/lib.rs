@@ -37,6 +37,8 @@ use zeroize::Zeroizing;
 
 static EXPORT_FILE_LOCK: Mutex<()> = Mutex::new(());
 
+mod diagnostics;
+
 fn next_export_file(export_root: &Path, extension: &str) -> (String, PathBuf) {
     loop {
         let file_name = format!(
@@ -235,6 +237,10 @@ struct EnterpriseConfig {
     offline_export_enabled: bool,
     #[serde(default)]
     hidden_mode_enabled: bool,
+    #[serde(default = "default_log_level")]
+    server_log_level: String,
+    #[serde(default = "default_collector_log_level")]
+    collector_log_level: String,
     #[serde(default = "default_super_admin_enabled")]
     super_admin_enabled: bool,
     #[serde(default)]
@@ -331,6 +337,21 @@ fn default_data_redaction() -> bool {
     true
 }
 
+fn default_log_level() -> String {
+    "normal".into()
+}
+
+fn default_collector_log_level() -> String {
+    "off".into()
+}
+
+fn normalize_log_level(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "verbose" => value.trim().to_ascii_lowercase(),
+        _ => "normal".into(),
+    }
+}
+
 fn default_schedule_daily_time() -> String {
     "02:00".into()
 }
@@ -363,6 +384,8 @@ struct EnterpriseCollectorRecord {
     offline_export_enabled: bool,
     #[serde(default)]
     hidden_mode_enabled: bool,
+    #[serde(default = "default_collector_log_level")]
+    collector_log_level: String,
     #[serde(default)]
     schedule: CollectionSchedule,
     #[serde(default)]
@@ -453,6 +476,10 @@ struct EnterpriseConfigRequest {
     offline_export_enabled: bool,
     #[serde(default)]
     hidden_mode_enabled: bool,
+    #[serde(default = "default_log_level")]
+    server_log_level: String,
+    #[serde(default = "default_collector_log_level")]
+    collector_log_level: String,
     #[serde(default)]
     super_admin_enabled: Option<bool>,
     #[serde(default)]
@@ -475,6 +502,8 @@ struct EnterpriseConfigResponse {
     offline_export_enabled: bool,
     #[serde(default)]
     hidden_mode_enabled: bool,
+    server_log_level: String,
+    collector_log_level: String,
     super_admin_enabled: bool,
     server_schedule: CollectionSchedule,
     collector_schedule: CollectionSchedule,
@@ -544,6 +573,10 @@ struct CollectionTargetResponse {
     offline_export_enabled: Option<bool>,
     #[serde(default)]
     hidden_mode_enabled: Option<bool>,
+    #[serde(default)]
+    collector_log_level: Option<String>,
+    #[serde(default)]
+    log_directory: Option<String>,
     plans: Vec<CollectionPlanResponse>,
 }
 
@@ -580,6 +613,7 @@ struct CollectorDesiredConfigResponse {
     data_redaction: bool,
     offline_export_enabled: bool,
     hidden_mode_enabled: bool,
+    collector_log_level: String,
     schedule: CollectionSchedule,
     manual_collection_request_id: Option<String>,
 }
@@ -604,6 +638,16 @@ struct CollectorHeartbeatRequest {
     last_success_at: Option<String>,
     last_error: Option<String>,
     last_manual_collection_request_id: Option<String>,
+    #[serde(default)]
+    diagnostics: Vec<CollectorDiagnosticEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectorDiagnosticEvent {
+    timestamp: u64,
+    event: String,
+    details: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -624,6 +668,8 @@ struct CollectorUpdateRequest {
     offline_export_enabled: bool,
     #[serde(default)]
     hidden_mode_enabled: bool,
+    #[serde(default = "default_collector_log_level")]
+    collector_log_level: String,
     #[serde(default)]
     collection_notice: String,
     schedule: CollectionSchedule,
@@ -640,6 +686,7 @@ struct CollectorPlanResponse {
     data_redaction: bool,
     offline_export_enabled: bool,
     hidden_mode_enabled: bool,
+    collector_log_level: String,
     schedule: CollectionSchedule,
     created_at: String,
     last_upload_at: Option<String>,
@@ -995,10 +1042,13 @@ fn prepare_server(
         .unwrap_or_else(default_data_root);
     std::fs::create_dir_all(&data_root)
         .map_err(|error| format!("服务端数据目录不可用（{}），请检查目录权限。", error.kind()))?;
+    diagnostics::init(&data_root);
+    diagnostics::write("server_prepare_started", "");
     let access_token_path = data_root.join(ACCESS_TOKEN_FILE);
     let token = load_or_generate_access_token(&access_token_path)
         .map_err(|_| "服务端访问令牌初始化失败，请检查 serverData 目录权限。".to_owned())?;
     let enterprise_config = load_enterprise_config(&data_root);
+    diagnostics::set_level(&enterprise_config.server_log_level);
     let (address, automatic_remote) = std::env::var(LISTEN_ENV)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -1011,6 +1061,18 @@ fn prepare_server(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_SERVER_PORT),
             false,
         ));
+    diagnostics::write(
+        "server_config_ready",
+        &format!(
+            "network_mode={};port={}",
+            if address.ip().is_loopback() {
+                "loopback_only"
+            } else {
+                "configured_remote"
+            },
+            address.port()
+        ),
+    );
     if !address.ip().is_loopback()
         && !automatic_remote
         && !std::env::var(ALLOW_REMOTE_ENV)
@@ -1085,7 +1147,7 @@ fn prepare_server(
         )
         .route(
             "/api/v1/collectors/{collector_id}/heartbeat",
-            post(collector_heartbeat),
+            post(collector_heartbeat).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route(
             "/api/v1/collectors/{collector_id}/revoke",
@@ -1171,6 +1233,7 @@ async fn serve(
     let listener = match tokio::net::TcpListener::bind(prepared.address).await {
         Ok(listener) => listener,
         Err(error) => {
+            diagnostics::write("server_bind_failed", &format!("kind={}", error.kind()));
             let message = format!(
                 "服务端启动失败（{}）。请确认 {} 端口未被占用。",
                 error.kind(),
@@ -1185,6 +1248,7 @@ async fn serve(
     if let Some(sender) = ready_sender {
         let _ = sender.send(Ok(()));
     }
+    diagnostics::write("server_ready", &format!("port={}", prepared.address.port()));
     let scheduler = tokio::spawn(run_local_collection_scheduler(prepared.state.clone()));
     axum::serve(
         listener,
@@ -1198,6 +1262,7 @@ async fn serve(
     .await
     .map_err(|_| "本机归档服务异常退出。".to_owned())?;
     scheduler.abort();
+    diagnostics::write("server_shutdown", "");
     Ok(())
 }
 
@@ -1389,6 +1454,8 @@ fn new_enterprise_config() -> EnterpriseConfig {
         data_redaction: true,
         offline_export_enabled: false,
         hidden_mode_enabled: false,
+        server_log_level: default_log_level(),
+        collector_log_level: default_collector_log_level(),
         super_admin_enabled: default_super_admin_enabled(),
         local_collection_plans: Vec::new(),
         server_include_media: false,
@@ -1416,6 +1483,8 @@ fn enterprise_config_response(config: &EnterpriseConfig) -> EnterpriseConfigResp
         data_redaction: config.data_redaction,
         offline_export_enabled: config.offline_export_enabled,
         hidden_mode_enabled: config.hidden_mode_enabled,
+        server_log_level: config.server_log_level.clone(),
+        collector_log_level: config.collector_log_level.clone(),
         super_admin_enabled: config.super_admin_enabled,
         server_schedule: config.server_schedule.clone(),
         collector_schedule: config.collector_schedule.clone(),
@@ -1492,6 +1561,7 @@ fn collector_plan_responses(
             data_redaction: collector.data_redaction,
             offline_export_enabled: collector.offline_export_enabled,
             hidden_mode_enabled: collector.hidden_mode_enabled,
+            collector_log_level: collector.collector_log_level.clone(),
             schedule: collector.schedule.clone(),
             created_at: collector.created_at.clone(),
             last_upload_at: collector.last_upload_at.clone(),
@@ -1573,6 +1643,7 @@ fn collector_desired_config(
         data_redaction: collector.data_redaction,
         offline_export_enabled: collector.offline_export_enabled,
         hidden_mode_enabled: collector.hidden_mode_enabled,
+        collector_log_level: collector.collector_log_level.clone(),
         schedule: collector.schedule.clone(),
         manual_collection_request_id: collector.manual_collection_request_id.clone(),
     }
@@ -1660,6 +1731,8 @@ fn collection_target_response(
         data_redaction: Some(config.data_redaction),
         offline_export_enabled: Some(config.offline_export_enabled),
         hidden_mode_enabled: Some(config.hidden_mode_enabled),
+        collector_log_level: None,
+        log_directory: None,
         plans: server_plans,
     }];
     for collector in config
@@ -1713,6 +1786,8 @@ fn collection_target_response(
             data_redaction: Some(collector.data_redaction),
             offline_export_enabled: Some(collector.offline_export_enabled),
             hidden_mode_enabled: Some(collector.hidden_mode_enabled),
+            collector_log_level: Some(collector.collector_log_level.clone()),
+            log_directory: Some(format!("collector/{}", collector.collector_id)),
             plans: vec![plan],
         });
     }
@@ -2013,6 +2088,16 @@ async fn update_enterprise_config(
     config.data_redaction = request.data_redaction;
     config.offline_export_enabled = request.offline_export_enabled;
     config.hidden_mode_enabled = request.hidden_mode_enabled;
+    config.server_log_level = normalize_log_level(&request.server_log_level);
+    config.collector_log_level = normalize_log_level(&request.collector_log_level);
+    diagnostics::set_level(&config.server_log_level);
+    diagnostics::write(
+        "enterprise_config_update",
+        &format!(
+            "hidden_mode={};include_media={}",
+            config.hidden_mode_enabled, request.include_media
+        ),
+    );
     if let Some(enabled) = request.super_admin_enabled {
         config.super_admin_enabled = enabled;
     }
@@ -2065,6 +2150,13 @@ async fn generate_collector(
     }
     let upload_url = upload_endpoint(&config.upload_url);
     let collector_id = Uuid::new_v4().to_string();
+    diagnostics::write(
+        "collector_generate_started",
+        &format!(
+            "hidden_mode={};schedule={:?}",
+            config.hidden_mode_enabled, config.collector_schedule.mode
+        ),
+    );
     let upload_token = random_access_token();
     let upload_token_sha256 = encode_hex(&Sha256::digest(upload_token.as_bytes()));
     let key_id = config.key_id.clone();
@@ -2081,6 +2173,7 @@ async fn generate_collector(
         data_redaction: config.data_redaction,
         offline_export_enabled: config.offline_export_enabled,
         hidden_mode_enabled: config.hidden_mode_enabled,
+        collector_log_level: config.collector_log_level.clone(),
         schedule: config.collector_schedule.clone(),
         last_upload_at: None,
         last_run_at: None,
@@ -2125,6 +2218,7 @@ async fn generate_collector(
         "dataRedaction": config.data_redaction,
         "offlineExportEnabled": config.offline_export_enabled,
         "hiddenModeEnabled": config.hidden_mode_enabled,
+        "collectorLogLevel": config.collector_log_level,
         "enabled": desired.enabled,
         "manualCollectionRequestId": desired.manual_collection_request_id,
         "collectorSchedule": &config.collector_schedule,
@@ -2174,6 +2268,9 @@ async fn generate_collector(
             let _ = std::fs::remove_file(&executable_path);
             return Err(error);
         }
+        diagnostics::write("collector_generate_completed", "executable=true");
+    } else {
+        diagnostics::write("collector_generate_completed", "executable=false");
     }
     Ok(Json(CollectorResponse {
         file_name,
@@ -2250,6 +2347,14 @@ async fn collector_heartbeat(
     Json(request): Json<CollectorHeartbeatRequest>,
 ) -> Result<Json<CollectorHeartbeatResponse>, ApiError> {
     let client_ip = remote_addr.ip().to_string();
+    diagnostics::verbose(
+        "collector_heartbeat",
+        &format!(
+            "revision={};client_revision={}",
+            request.last_applied_revision.unwrap_or_default(),
+            request.current_config_revision.unwrap_or_default()
+        ),
+    );
     let mut config = state
         .enterprise_config
         .lock()
@@ -2288,7 +2393,7 @@ async fn collector_heartbeat(
     let snapshot = {
         let collector = collector_by_device_token(&mut config, &collector_id, &headers)?;
         collector.last_seen_at = Some(Utc::now().to_rfc3339());
-        collector.last_client_ip = Some(client_ip);
+        collector.last_client_ip = Some(client_ip.clone());
         collector.client_version = request.client_version;
         collector.last_applied_revision = request
             .last_applied_revision
@@ -2309,6 +2414,18 @@ async fn collector_heartbeat(
         }
         collector.clone()
     };
+    let collector_diagnostics = request.diagnostics;
+    for event in collector_diagnostics.into_iter().take(100) {
+        let event_name = event.event.trim();
+        if event_name.is_empty() {
+            continue;
+        }
+        let details = format!(
+            "timestamp={};display_name={};client_ip={};details={}",
+            event.timestamp, snapshot.display_name, client_ip, event.details
+        );
+        diagnostics::collector(&snapshot.collector_id, event_name, &details);
+    }
     persist_enterprise_config(&state.data_root, &config)?;
     for file_name in replaced_files {
         let _ = std::fs::remove_file(state.data_root.join("collectors").join(file_name));
@@ -2322,6 +2439,13 @@ async fn collector_heartbeat(
     } else {
         None
     };
+    diagnostics::write(
+        "collector_heartbeat_response",
+        &format!(
+            "should_send_control={};hidden_mode={};revision={}",
+            should_send, snapshot.hidden_mode_enabled, snapshot.config_revision
+        ),
+    );
     Ok(Json(CollectorHeartbeatResponse {
         status: if snapshot.enabled {
             "ok".into()
@@ -2379,6 +2503,7 @@ async fn update_collector(
     collector.data_redaction = request.data_redaction;
     collector.offline_export_enabled = request.offline_export_enabled;
     collector.hidden_mode_enabled = request.hidden_mode_enabled;
+    collector.collector_log_level = normalize_log_level(&request.collector_log_level);
     if !request.collection_notice.trim().is_empty() {
         collector.collection_notice = request.collection_notice.trim().to_owned();
     }
@@ -4558,6 +4683,8 @@ mod tests {
                 data_redaction: false,
                 offline_export_enabled: false,
                 hidden_mode_enabled: false,
+                server_log_level: default_log_level(),
+                collector_log_level: default_collector_log_level(),
                 super_admin_enabled: None,
                 server_schedule: None,
                 collector_schedule: None,
@@ -4791,6 +4918,7 @@ mod tests {
         let artifact: serde_json::Value = serde_json::from_str(&response.artifact).unwrap();
         assert_eq!(artifact["keyId"], before.key_id);
         assert_eq!(artifact["publicKeyHex"], before.public_key_hex);
+        assert_eq!(artifact["collectorLogLevel"], before.collector_log_level);
         assert_eq!(artifact["collectorSchedule"]["mode"], "interval");
         assert_eq!(artifact["collectorSchedule"]["intervalMinutes"], 45);
         let after = app_state.enterprise_config.lock().unwrap().clone();
@@ -4893,6 +5021,8 @@ mod tests {
                 data_redaction: false,
                 offline_export_enabled: false,
                 hidden_mode_enabled: false,
+                server_log_level: default_log_level(),
+                collector_log_level: default_collector_log_level(),
                 super_admin_enabled: None,
                 server_schedule: None,
                 collector_schedule: None,
@@ -5326,6 +5456,7 @@ mod tests {
                 last_success_at: Some("2026-09-23T01:01:00Z".into()),
                 last_error: None,
                 last_manual_collection_request_id: None,
+                diagnostics: Vec::new(),
             }),
         )
         .await
@@ -5355,6 +5486,7 @@ mod tests {
                 data_redaction: true,
                 offline_export_enabled: true,
                 hidden_mode_enabled: false,
+                collector_log_level: default_collector_log_level(),
                 collection_notice: "测试告知".into(),
                 schedule: CollectionSchedule {
                     mode: CollectionScheduleMode::Daily,
@@ -5382,6 +5514,7 @@ mod tests {
                 last_success_at: None,
                 last_error: Some("test_error".into()),
                 last_manual_collection_request_id: None,
+                diagnostics: Vec::new(),
             }),
         )
         .await
@@ -5409,6 +5542,7 @@ mod tests {
                 data_redaction: true,
                 offline_export_enabled: false,
                 hidden_mode_enabled: false,
+                collector_log_level: default_collector_log_level(),
                 collection_notice: "测试告知".into(),
                 schedule: CollectionSchedule {
                     mode: CollectionScheduleMode::Interval,
@@ -5453,6 +5587,7 @@ mod tests {
                 last_success_at: None,
                 last_error: None,
                 last_manual_collection_request_id: None,
+                diagnostics: Vec::new(),
             }),
         )
         .await
@@ -5479,6 +5614,7 @@ mod tests {
                 last_success_at: None,
                 last_error: None,
                 last_manual_collection_request_id: Some(request_id),
+                diagnostics: Vec::new(),
             }),
         )
         .await
@@ -5513,6 +5649,7 @@ mod tests {
                 last_success_at: None,
                 last_error: None,
                 last_manual_collection_request_id: None,
+                diagnostics: Vec::new(),
             }),
         )
         .await
@@ -5555,6 +5692,7 @@ mod tests {
                 last_success_at: None,
                 last_error: None,
                 last_manual_collection_request_id: None,
+                diagnostics: Vec::new(),
             }),
         )
         .await
@@ -5575,6 +5713,7 @@ mod tests {
                 last_success_at: None,
                 last_error: None,
                 last_manual_collection_request_id: None,
+                diagnostics: Vec::new(),
             }),
         )
         .await
@@ -5601,6 +5740,7 @@ mod tests {
                 last_success_at: None,
                 last_error: None,
                 last_manual_collection_request_id: None,
+                diagnostics: Vec::new(),
             }),
         )
         .await
