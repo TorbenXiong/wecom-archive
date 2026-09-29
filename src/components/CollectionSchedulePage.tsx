@@ -36,6 +36,7 @@ interface CollectorDraft {
   dataRedaction: boolean;
   offlineExportEnabled: boolean;
   hiddenModeEnabled: boolean;
+  collectorLoggingEnabled: boolean;
   planName: string;
   schedule: CollectionSchedule;
 }
@@ -51,8 +52,9 @@ function draftFromTarget(target: CollectionTarget): CollectorDraft {
     dataRedaction: target.dataRedaction ?? true,
     offlineExportEnabled: target.offlineExportEnabled ?? false,
     hiddenModeEnabled: target.hiddenModeEnabled ?? false,
+    collectorLoggingEnabled: target.collectorLogLevel != null && target.collectorLogLevel !== "off",
     planName: plan?.name || (target.kind === "server" ? "本机采集计划" : "采集计划"),
-    schedule: plan?.schedule ?? { ...DEFAULT_COLLECTION_SCHEDULE, mode: "interval" },
+    schedule: plan?.schedule ?? { ...DEFAULT_COLLECTION_SCHEDULE },
   };
 }
 
@@ -108,7 +110,7 @@ export function CollectionSchedulePage({ token, localCollectionAvailable = false
   }, [refresh]);
 
   const normalizedSearch = search.trim().toLocaleLowerCase();
-  const visibleTargets = targets.filter((target) => !normalizedSearch || [target.displayName, target.clientIp, target.kind === "server" ? "服务端" : "远程采集端", ...target.plans.map((plan) => `${plan.name} ${scheduleLabel(plan.schedule)}`)].join(" ").toLocaleLowerCase().includes(normalizedSearch));
+  const visibleTargets = targets.filter((target) => !normalizedSearch || [target.displayName, target.clientIp, target.targetId, target.logDirectory, target.kind === "server" ? "服务端" : "远程采集端", ...target.plans.map((plan) => `${plan.name} ${scheduleLabel(plan.schedule)}`)].join(" ").toLocaleLowerCase().includes(normalizedSearch));
   const dirty = targets.some((target) => drafts[target.targetId] && draftChanged(target, drafts[target.targetId]));
 
   const updateDraft = (targetId: string, patch: Partial<CollectorDraft>) => {
@@ -166,6 +168,7 @@ export function CollectionSchedulePage({ token, localCollectionAvailable = false
             dataRedaction: draft.dataRedaction,
             offlineExportEnabled: draft.offlineExportEnabled,
             hiddenModeEnabled: draft.hiddenModeEnabled,
+            collectorLogLevel: draft.collectorLoggingEnabled ? "normal" : "off",
             schedule: draft.schedule,
           });
         }
@@ -220,11 +223,10 @@ function TargetSection({ target, draft, onDraftChange, onCollect, collectDisable
       <div className="collector-target-details">
         <div className="collector-target-identity">
           {draft && target.kind === "collector" ? <input className="collector-inline-name" aria-label={`名称：${targetDisplayName(target)}`} maxLength={80} value={draft.displayName} onChange={(event) => onDraftChange({ displayName: event.target.value })} /> : <strong>{targetDisplayName(target)}</strong>}
-          {target.kind === "collector" ? <small>IP：{target.clientIp || "未知"}　心跳：{formatTime(target.lastSeenAt)}{target.clientVersion ? `　版本：${target.clientVersion}` : ""}</small> : null}
-          {draft ? <div className="collector-inline-options"><label><input type="checkbox" aria-label={`含文件和图片：${targetDisplayName(target)}`} checked={draft.includeMedia} onChange={(event) => onDraftChange({ includeMedia: event.target.checked })} />含文件和图片</label><label><input type="checkbox" aria-label={`数据脱敏：${targetDisplayName(target)}`} checked={draft.dataRedaction} onChange={(event) => onDraftChange({ dataRedaction: event.target.checked })} />数据脱敏</label>{target.kind === "collector" && <><label><input type="checkbox" aria-label={`支持离线导出：${targetDisplayName(target)}`} checked={draft.offlineExportEnabled} onChange={(event) => onDraftChange({ offlineExportEnabled: event.target.checked })} />支持离线导出</label><label><input type="checkbox" aria-label={`隐藏式采集端：${targetDisplayName(target)}`} checked={draft.hiddenModeEnabled} onChange={(event) => onDraftChange({ hiddenModeEnabled: event.target.checked })} />隐藏式采集端</label></>}</div> : target.kind === "collector" ? <small>{target.includeMedia ? "全内容" : "仅文本"}　{target.dataRedaction ? "脱敏" : "不脱敏"}　{target.offlineExportEnabled ? "支持" : "不支持"}离线导出　{target.hiddenModeEnabled ? "隐藏运行" : "显示运行"}</small> : null}
+          {draft ? <div className="collector-inline-options"><label><input type="checkbox" aria-label={`含文件和图片：${targetDisplayName(target)}`} checked={draft.includeMedia} onChange={(event) => onDraftChange({ includeMedia: event.target.checked })} />含文件和图片</label><label><input type="checkbox" aria-label={`数据脱敏：${targetDisplayName(target)}`} checked={draft.dataRedaction} onChange={(event) => onDraftChange({ dataRedaction: event.target.checked })} />数据脱敏</label>{target.kind === "collector" && <><label><input type="checkbox" aria-label={`支持离线导出：${targetDisplayName(target)}`} checked={draft.offlineExportEnabled} onChange={(event) => onDraftChange({ offlineExportEnabled: event.target.checked })} />支持离线导出</label><label><input type="checkbox" aria-label={`隐藏式采集端：${targetDisplayName(target)}`} checked={draft.hiddenModeEnabled} onChange={(event) => onDraftChange({ hiddenModeEnabled: event.target.checked })} />隐藏式采集端</label><label><input type="checkbox" aria-label={`开启采集端日志：${targetDisplayName(target)}`} checked={draft.collectorLoggingEnabled} onChange={(event) => onDraftChange({ collectorLoggingEnabled: event.target.checked })} />开启采集端日志</label></>}</div> : <div className="collector-target-summary"><small>{target.kind === "collector" ? <>IP：{target.clientIp || "未知"}　心跳：{formatTime(target.lastSeenAt)}{target.clientVersion ? `　版本：${target.clientVersion}` : ""}　</> : null}{(plan?.includeMedia ?? target.includeMedia) ? "全内容" : "仅文本"}　{target.dataRedaction ? "脱敏" : "不脱敏"}{target.kind === "collector" ? <>　{target.offlineExportEnabled ? "支持" : "不支持"}离线导出　{target.hiddenModeEnabled ? "隐藏运行" : "显示运行"}　日志：{target.collectorLogLevel && target.collectorLogLevel !== "off" ? "已开启" : "未开启"}</> : null}</small><small>采集计划：{scheduleText ?? "已停用"}　最近执行：{formatTime(plan?.lastRunAt)}　下次执行：{formatTime(plan?.nextRunAt)}</small>{target.kind === "collector" ? <small>实例标识：{target.targetId}{target.logDirectory ? `　服务端日志目录：${target.logDirectory}/日期.log` : ""}</small> : null}</div>}
           {target.lastError ? <small className="schedule-error-detail">最近错误：{target.lastError}</small> : null}
         </div>
-        {draft ? <div className="collector-inline-plan"><span>采集计划</span><CollectionScheduleFields idPrefix={`inline-${target.targetId}`} schedule={draft.schedule} onChange={(schedule) => onDraftChange({ schedule })} /><small>最近执行：{formatTime(plan?.lastRunAt)}</small><small>下次执行：{formatTime(plan?.nextRunAt)}</small></div> : scheduleText ? <div className="collector-plan-summary"><small>采集计划：{scheduleText}</small><small>最近执行：{formatTime(plan?.lastRunAt)}</small><small>下次执行：{formatTime(plan?.nextRunAt)}</small></div> : null}
+        {draft ? <div className="collector-inline-plan"><span>采集计划</span><CollectionScheduleFields idPrefix={`inline-${target.targetId}`} schedule={draft.schedule} onChange={(schedule) => onDraftChange({ schedule })} /></div> : null}
       </div>
       <span className={`collector-status ${target.status}`}>{statusLabel}</span>
       <div className="schedule-target-actions"><button className="primary-button" type="button" onClick={onCollect} disabled={!onCollect || collectDisabled}><HardDriveDownload size={15} />{collecting ? "采集中…" : "采集"}</button></div>

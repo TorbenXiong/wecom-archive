@@ -111,12 +111,15 @@ export interface EnterpriseConfig {
   dataRedaction: boolean;
   offlineExportEnabled: boolean;
   hiddenModeEnabled: boolean;
+  serverLogLevel: LogLevel;
+  collectorLogLevel: LogLevel;
   superAdminEnabled: boolean;
   serverSchedule: CollectionSchedule;
   collectorSchedule: CollectionSchedule;
 }
 
 export type CollectionScheduleMode = "disabled" | "interval" | "daily";
+export type LogLevel = "off" | "normal" | "verbose";
 
 export interface CollectionSchedule {
   mode: CollectionScheduleMode;
@@ -161,6 +164,8 @@ export interface CollectionTarget {
   dataRedaction?: boolean;
   offlineExportEnabled?: boolean;
   hiddenModeEnabled?: boolean;
+  collectorLogLevel?: LogLevel;
+  logDirectory?: string;
   plans: CollectionPlan[];
 }
 
@@ -182,6 +187,7 @@ export interface CollectorDesiredConfig {
   dataRedaction: boolean;
   offlineExportEnabled: boolean;
   hiddenModeEnabled: boolean;
+  collectorLogLevel: LogLevel;
   schedule: CollectionSchedule;
   manualCollectionRequestId?: string;
 }
@@ -216,6 +222,7 @@ export interface CollectorPlan {
   dataRedaction: boolean;
   offlineExportEnabled: boolean;
   hiddenModeEnabled: boolean;
+  collectorLogLevel: LogLevel;
   schedule: CollectionSchedule;
   createdAt: string;
   lastUploadAt?: string;
@@ -409,6 +416,7 @@ export function updateCollector(token: string, collectorId: string, input: {
   dataRedaction: boolean;
   offlineExportEnabled: boolean;
   hiddenModeEnabled?: boolean;
+  collectorLogLevel?: LogLevel;
   schedule: CollectionSchedule;
 }): Promise<{ config: CollectorDesiredConfig; status: string }> {
   return request<{ config: CollectorDesiredConfig; status: string }>(`/api/v1/collectors/${encodeURIComponent(collectorId)}`, token, {
@@ -472,6 +480,8 @@ export function updateEnterpriseConfig(token: string, config: {
   dataRedaction?: boolean;
   offlineExportEnabled?: boolean;
   hiddenModeEnabled?: boolean;
+  serverLogLevel?: LogLevel;
+  collectorLogLevel?: LogLevel;
   superAdminEnabled?: boolean;
   serverSchedule?: CollectionSchedule;
   collectorSchedule?: CollectionSchedule;

@@ -8,7 +8,7 @@ it("renders server and remote collectors in one list and edits local plans", asy
   const requests: Array<{ method: string; url: string; body?: Record<string, unknown> }> = [];
   let targets = {
     targets: [
-      { targetId: "server", kind: "server", displayName: "测试服务端", status: "online", plans: [{ id: "plan-1", name: "早班采集", includeMedia: false, schedule: { mode: "interval", intervalMinutes: 30, dailyTime: "02:00" }, createdAt: "2026-09-21T01:00:00Z", updatedAt: "2026-09-21T01:00:00Z", nextRunAt: "2026-09-21T01:30:00Z" }] },
+      { targetId: "server", kind: "server", displayName: "测试服务端", status: "online", includeMedia: true, dataRedaction: true, plans: [{ id: "plan-1", name: "早班采集", includeMedia: true, schedule: { mode: "interval", intervalMinutes: 30, dailyTime: "02:00" }, createdAt: "2026-09-21T01:00:00Z", updatedAt: "2026-09-21T01:00:00Z", nextRunAt: "2026-09-21T01:30:00Z" }] },
       { targetId: "collector-1", kind: "collector", displayName: "采集端 abc12345", clientIp: "10.0.0.2", status: "offline", clientVersion: "0.1.0", includeMedia: true, dataRedaction: true, offlineExportEnabled: false, lastSeenAt: "2026-09-21T02:00:00Z", plans: [{ id: "collector-1", name: "销售电脑", includeMedia: true, schedule: { mode: "daily", intervalMinutes: 60, dailyTime: "03:00" }, createdAt: "2026-09-21T01:00:00Z", updatedAt: "2026-09-21T01:00:00Z", nextRunAt: "2026-09-22T03:00:00Z" }] },
     ],
   };
@@ -23,6 +23,8 @@ it("renders server and remote collectors in one list and edits local plans", asy
   expect(screen.getByText(/IP：10\.0\.0\.2/)).toBeInTheDocument();
   expect(screen.getByText(/全内容.*脱敏.*不支持离线导出/)).toBeInTheDocument();
   expect(screen.getByText(/采集计划：每日 03:00 执行/)).toBeInTheDocument();
+  expect(screen.getAllByText(/全内容.*脱敏/, { selector: ".collector-target-summary small" })).toHaveLength(2);
+  expect(screen.getByText(/采集计划：每 30 分钟执行/)).toBeInTheDocument();
   expect(screen.queryByText(/配置 \d+\/\d+/)).not.toBeInTheDocument();
   expect(screen.getByText("本机", { selector: "strong" })).toBeInTheDocument();
   expect(screen.queryByText("不含图片和文件")).not.toBeInTheDocument();
@@ -52,6 +54,16 @@ it("keeps the collector node visible when it has no plans", async () => {
   expect(await screen.findByText("本机")).toBeInTheDocument();
   expect(screen.queryByText("暂无采集计划")).not.toBeInTheDocument();
   expect(screen.queryByRole("article")).not.toBeInTheDocument();
+});
+
+it("keeps a plan-less local target disabled when editing its current value", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ targets: [{ targetId: "server", kind: "server", displayName: "测试服务端", status: "online", plans: [] }] })));
+  render(<CollectionSchedulePage token="test-token" />);
+  await screen.findByText("本机");
+  fireEvent.click(screen.getByRole("switch", { name: "编辑模式" }));
+  expect(screen.getByLabelText("按间隔")).not.toBeChecked();
+  expect(screen.getByLabelText("每日定时")).not.toBeChecked();
+  expect(screen.queryByLabelText("间隔（分钟）")).not.toBeInTheDocument();
 });
 
 it("automatically discovers new collectors without replacing an active edit", async () => {
@@ -89,16 +101,20 @@ it("automatically discovers new collectors without replacing an active edit", as
 it("shows the remote plan on three rows and aligns both editors with shared controls", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     if (String(input).endsWith("/api/v1/collectors/collector-1")) return Response.json({ config: { displayName: "10.0.0.2", enabled: true, includeMedia: true, dataRedaction: true, offlineExportEnabled: false, schedule: { mode: "interval", intervalMinutes: 20, dailyTime: "02:00" } } });
-    return Response.json({ targets: [{ targetId: "collector-1", kind: "collector", displayName: "10.0.0.2", clientIp: "10.0.0.2", status: "online", configRevision: 1, lastAppliedRevision: 1, plans: [{ id: "collector-1", name: "远程计划", includeMedia: true, schedule: { mode: "interval", intervalMinutes: 20, dailyTime: "02:00" }, lastRunAt: "2026-09-24T10:00:00Z", nextRunAt: "2026-09-24T10:20:00Z" }] }] });
+    return Response.json({ targets: [{ targetId: "collector-1", kind: "collector", displayName: "10.0.0.2", clientIp: "10.0.0.2", status: "online", configRevision: 1, lastAppliedRevision: 1, logDirectory: "collector/collector-1", plans: [{ id: "collector-1", name: "远程计划", includeMedia: true, schedule: { mode: "interval", intervalMinutes: 20, dailyTime: "02:00" }, lastRunAt: "2026-09-24T10:00:00Z", nextRunAt: "2026-09-24T10:20:00Z" }] }] });
   }));
   const { container } = render(<CollectionSchedulePage token="test-token" />);
-  expect(await screen.findByText("采集计划：每 20 分钟执行")).toBeInTheDocument();
-  const summary = container.querySelector(".collector-plan-summary");
+  expect(await screen.findByText(/采集计划：每 20 分钟执行/)).toBeInTheDocument();
+  expect(screen.getByText(/服务端日志目录：collector\/collector-1\/日期.log/)).toBeInTheDocument();
+  fireEvent.change(screen.getByRole("textbox", { name: "检索采集端" }), { target: { value: "collector-1" } });
+  expect(screen.getByText(/实例标识：collector-1/)).toBeInTheDocument();
+  const summary = container.querySelector(".collector-target-summary");
   expect(summary?.children).toHaveLength(3);
   expect(summary?.children[1]).toHaveTextContent("最近执行：");
-  expect(summary?.children[2]).toHaveTextContent("下次执行：");
+  expect(summary?.children[1]).toHaveTextContent("下次执行：");
   expect(screen.queryByText(/配置 1\/1/)).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("switch", { name: "编辑模式" }));
+  expect(screen.queryByText(/IP：/)).not.toBeInTheDocument();
   expect(screen.queryByRole("dialog", { name: "编辑采集端" })).not.toBeInTheDocument();
   expect(screen.getByText("采集计划", { selector: ".collector-inline-plan > span" })).toBeInTheDocument();
   expect(screen.getByLabelText("间隔（分钟）").parentElement).toHaveTextContent("分钟");

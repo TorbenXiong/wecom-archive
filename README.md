@@ -15,6 +15,8 @@
 
 `WeComArchive.exe` 在同一进程内运行桌面窗口、本机归档服务和服务端生成的采集端运行时，默认监听 `127.0.0.1:9812`。窗口可隐藏并按计划后台运行；退出程序会停止服务和任务。生成的采集端使用服务端预置的绑定身份和签名配置，并按心跳同步后续修改。
 
+采集端产生的运行配置、工作副本、离线导出和脱敏诊断日志统一放在 exe 同目录的 `collectorData` 中；日志按天写入 `collectorData/logs/YYYY-MM-DD.log`，仅在开启采集端日志后创建。服务端自身日志写入 `serverData/logs/server/YYYY-MM-DD.log`，并按采集端管理中的稳定 `collectorId` 分目录接收采集端日志：`serverData/logs/collector/<collectorId>/YYYY-MM-DD.log`。采集端管理会直接显示每个实例对应的服务端日志目录，名称或 IP 变更不影响关联。日志行时间统一为 `yyyy-MM-dd HH:mm:ss.SSS`。工作台的“生成默认配置”和“采集端管理”页面提供“开启采集端日志”勾选项，默认关闭；环境变量 `WECOM_ARCHIVE_COLLECTOR_LOG`、`WECOM_ARCHIVE_SERVER_LOG` 仍可作为启动时默认值。
+
 当已保存的采集端服务端 URL 使用明确的私有局域网 IP（例如 `http://10.10.1.202:9812`）时，服务端启动会自动监听该地址，已生成采集端无需另外配置监听参数。环境变量 `WECOM_ARCHIVE_SERVER_LISTEN` 仍可作为显式覆盖；域名、公网地址或无效 URL 不会触发自动局域网监听。Windows 防火墙仍需允许对应 TCP 端口。
 
 启用计划的专属采集端首次采集上传后收起到系统托盘；关闭采集端窗口也会收起，右键托盘图标选择“退出采集端”才会停止运行。托盘提示展示上传状态和计划时间。

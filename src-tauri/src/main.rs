@@ -137,19 +137,10 @@ mod collector_instance {
         let executable = std::env::current_exe().map_err(|_| ())?;
         let bytes =
             archive_transfer::read_enterprise_collector_config(&executable).map_err(|_| ())?;
-        let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
-        let id = config
-            .get("collectorId")
-            .and_then(|value| value.as_str())
-            .ok_or(())?;
-        if id.is_empty()
-            || !id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
-            return Err(());
-        }
-        let name: Vec<u16> = OsStr::new(&format!("Local\\WeComArchiveCollector-{id}"))
+        let _: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| ())?;
+        // The machine is the identity boundary: regenerated collectors and
+        // upgraded binaries must still share one mutex on the same computer.
+        let name: Vec<u16> = OsStr::new("Local\\WeComArchiveCollector")
             .encode_wide()
             .chain(Some(0))
             .collect();
@@ -167,7 +158,7 @@ mod collector_instance {
     }
 
     pub fn show_already_running() {
-        super::show_notice("采集已启动，请从系统托盘打开采集端。")
+        super::show_notice("采集端已启动")
     }
 }
 
