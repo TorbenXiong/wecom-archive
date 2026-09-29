@@ -1,5 +1,4 @@
 pub mod enterprise_crypto;
-mod roots;
 mod snapshot;
 
 #[cfg(windows)]
@@ -20,7 +19,6 @@ use archive_domain::{
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-pub use roots::default_roots;
 pub use snapshot::{SnapshotOptions, create_consistent_snapshot};
 
 pub const ADAPTER_ID: &str = "windows-local-v1";
@@ -44,7 +42,7 @@ impl SourceAdapter for WindowsSourceAdapter {
     ) -> Result<Vec<SourceCandidate>, DomainError> {
         let roots = match selected_root {
             Some(root) => vec![root],
-            None => roots::default_roots(),
+            None => default_roots(),
         };
         Ok(discover_roots(&roots))
     }
@@ -237,6 +235,23 @@ fn path_fingerprint(path: &Path) -> String {
         .to_ascii_lowercase();
     let digest = Sha256::digest(normalized.as_bytes());
     format!("src-{}", &hex::encode(digest)[..20])
+}
+
+/// The folders WeCom data is expected to be found in.
+///
+/// Public so the desktop app can put a user-chosen directory in front of these
+/// instead of replacing them.
+pub fn default_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        roots.push(PathBuf::from(app_data).join("Tencent").join("WXWork"));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        roots.push(PathBuf::from(profile).join("Documents").join("WXWork"));
+    }
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 #[cfg(test)]
