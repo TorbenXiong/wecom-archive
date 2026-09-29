@@ -315,8 +315,9 @@ export function getCollectedUsers(token: string, signal?: AbortSignal): Promise<
   return request<CollectedUser[]>("/api/v1/archive/collected-users", token, { signal });
 }
 
-export function collectLocalArchive(token: string, includeMedia: boolean): Promise<ServerImportResult> {
+export function collectLocalArchive(token: string, includeMedia: boolean, sourceRoot?: string): Promise<ServerImportResult> {
   const parameters = new URLSearchParams({ include_media: String(includeMedia) });
+  if (sourceRoot) parameters.set("source_root", sourceRoot);
   return request<ServerImportResult>(`/api/v1/collections/local?${parameters}`, token, { method: "POST" });
 }
 

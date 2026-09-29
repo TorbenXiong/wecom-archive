@@ -191,6 +191,7 @@ type LocalCollector = Arc<
             bool,
             bool,
             Option<i64>,
+            Option<String>,
             LocalCollectionProgressReporter,
             LocalCollectionMediaSink,
         ) -> Result<ClientExportV1, String>
@@ -727,6 +728,7 @@ struct PageQuery {
 #[derive(Debug, Deserialize)]
 struct LocalCollectionQuery {
     include_media: Option<bool>,
+    source_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -935,6 +937,7 @@ where
             bool,
             bool,
             Option<i64>,
+            Option<String>,
             LocalCollectionProgressReporter,
             LocalCollectionMediaSink,
         ) -> Result<ClientExportV1, String>
@@ -2923,6 +2926,7 @@ async fn collect_local(
         (config.server_include_media, config.data_redaction)
     };
     let include_media = query.include_media.unwrap_or(configured_include_media);
+    let source_root = query.source_root;
     set_local_collection_progress(&state, true, 3, "准备采集", "正在初始化本机采集任务。");
     let progress = Arc::clone(&state.local_collection_progress);
     let reporter: LocalCollectionProgressReporter = Arc::new(move |percent, stage, detail| {
@@ -2942,7 +2946,14 @@ async fn collect_local(
                 .map_err(|_| "媒体文件写入归档失败。".to_owned())
         });
     let export = match tokio::task::spawn_blocking(move || {
-        collector(include_media, data_redaction, None, reporter, media_sink)
+        collector(
+            include_media,
+            data_redaction,
+            None,
+            source_root,
+            reporter,
+            media_sink,
+        )
     })
     .await
     {
@@ -3127,6 +3138,7 @@ async fn run_local_collection_once(
             include_media,
             data_redaction,
             since_unix_ms,
+            None,
             reporter,
             media_sink,
         )
@@ -3688,8 +3700,15 @@ async fn create_local_export(
                 persist_local_media_file(&media_root, source, expected_hash, expected_size)
                     .map_err(|_| "媒体文件写入归档失败。".to_owned())
             });
-        let mut export = collector(include_media, data_redaction, None, reporter, media_sink)
-            .map_err(ApiError::local_collection_failed)?;
+        let mut export = collector(
+            include_media,
+            data_redaction,
+            None,
+            None,
+            reporter,
+            media_sink,
+        )
+        .map_err(ApiError::local_collection_failed)?;
         let export_id = export.export_id;
         let export_root = data_root.join("exports");
         std::fs::create_dir_all(&export_root).map_err(|_| ApiError::store())?;
@@ -4726,7 +4745,7 @@ mod tests {
             "local-collection",
         ))
         .unwrap();
-        app_state.local_collector = Some(Arc::new(move |include_media, _, _, reporter, _| {
+        app_state.local_collector = Some(Arc::new(move |include_media, _, _, _, reporter, _| {
             captured_modes.lock().unwrap().push(include_media);
             reporter(55, "解析消息", "正在解析测试消息。");
             Ok(export.clone())
@@ -4737,6 +4756,7 @@ mod tests {
             authorized_headers(),
             Query(LocalCollectionQuery {
                 include_media: Some(true),
+                source_root: None,
             }),
         )
         .await
@@ -5155,7 +5175,7 @@ mod tests {
         enable_super_admin(&app_state);
         let bytes = export_bytes("普通消息\n第二行", Uuid::new_v4(), "fixture");
         let export: ClientExportV1 = serde_json::from_slice(&bytes).unwrap();
-        app_state.local_collector = Some(Arc::new(move |_, _, _, _, _| {
+        app_state.local_collector = Some(Arc::new(move |_, _, _, _, _, _| {
             let mut snapshot = export.clone();
             snapshot.export_id = Uuid::new_v4();
             Ok(snapshot)
