@@ -19,6 +19,7 @@ use message_parser::{RawMessageRow, normalize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use source_windows::WindowsSourceAdapter;
+use source_windows::roots::normalize_source_root;
 use tauri::menu::{MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, State};
@@ -31,6 +32,7 @@ const LOCAL_NOTICE_VERSION: &str = "client-notice.v1";
 const LOCAL_NOTICE_TEXT: &str = "加密传输本机企业微信聊天记录到服务端";
 
 static OFFLINE_EXPORT_FILE_LOCK: Mutex<()> = Mutex::new(());
+static SOURCE_ROOTS_FILE_LOCK: Mutex<()> = Mutex::new(());
 
 fn next_offline_export_file(directory: &Path) -> (String, PathBuf) {
     loop {
@@ -463,6 +465,23 @@ struct CollectorScheduleStatus {
     last_manual_collection_request_id: Option<String>,
 }
 
+fn begin_collector_attempt(state: &AppState) {
+    if let Ok(mut status) = state.schedule_status.lock() {
+        status.running = true;
+        status.last_attempt_at = Some(Utc::now().to_rfc3339());
+        status.last_error = None;
+    }
+}
+
+fn finish_collector_attempt<T>(state: &AppState, result: &Result<T, CommandError>) {
+    if let Ok(mut status) = state.schedule_status.lock() {
+        status.running = false;
+        if let Err(error) = result {
+            status.last_error = Some(error.message.clone());
+        }
+    }
+}
+
 fn message_fingerprints(export: &ClientExportV1) -> BTreeMap<String, String> {
     export
         .batches
@@ -482,6 +501,13 @@ fn message_fingerprints(export: &ClientExportV1) -> BTreeMap<String, String> {
 }
 
 fn has_upload_changes(state: &AppState, export: &ClientExportV1) -> bool {
+    if state
+        .schedule_status
+        .lock()
+        .map_or(true, |status| status.last_success_at.is_none())
+    {
+        return true;
+    }
     let current = message_fingerprints(export);
     state.uploaded_messages.lock().map_or(true, |uploaded| {
         current
@@ -566,17 +592,9 @@ fn hide_collector_window(window: tauri::WebviewWindow) -> Result<(), CommandErro
 async fn discover_sources(
     state: State<'_, AppState>,
 ) -> Result<Vec<SafeSourceCandidate>, CommandError> {
-    let candidates = tauri::async_runtime::spawn_blocking(|| {
-        WindowsSourceAdapter
-            .discover(None)
-            .map_err(|error| CommandError {
-                code: "SOURCE_DISCOVERY_FAILED",
-                message: sanitize_error(&error.to_string()),
-                recoverable: true,
-            })
-    })
-    .await
-    .map_err(|_| internal_error())??;
+    let candidates = tauri::async_runtime::spawn_blocking(discover_local_sources)
+        .await
+        .map_err(|_| internal_error())?;
     store_candidates(&state, candidates)
 }
 
@@ -597,36 +615,38 @@ async fn collect_source(
         });
     }
     let _run_guard = CollectionRunGuard(Arc::clone(&state.collection_running));
+    begin_collector_attempt(&state);
     let authorization = CollectionAuthorization {
         notice_version: LOCAL_NOTICE_VERSION.into(),
         notice_displayed_at: Utc::now(),
     };
-    let candidate = state
-        .discovered_sources
-        .lock()
-        .map_err(|_| internal_error())?
-        .get(&source_id)
-        .cloned()
-        .ok_or(CommandError {
-            code: "SOURCE_HANDLE_EXPIRED",
-            message: "数据源授权已失效，请重新发现。".into(),
-            recoverable: true,
-        })?;
     // 密钥探针、快照复制和数据库读取都可能耗时较长，必须全部放到阻塞线程，
     // 否则 Tauri 主线程会被拖住，窗口表现为“未响应”或只显示空白页。
+    let collection_state = state.inner().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        let candidate = collection_state
+            .discovered_sources
+            .lock()
+            .map_err(|_| internal_error())?
+            .get(&source_id)
+            .cloned()
+            .ok_or(CommandError {
+                code: "SOURCE_HANDLE_EXPIRED",
+                message: "数据源授权已失效，请重新发现。".into(),
+                recoverable: true,
+            })?;
         let config = load_enterprise_collector_config()?;
         ensure_collector_config_fresh(&config)?;
         let media_options = MediaCollectionOptions {
             include_files: config.include_files,
             include_images: config.include_images,
         };
-        let root = collector_work_root("manual")?;
         let encrypted = candidate
             .databases
             .iter()
             .any(|database| database.encrypted);
         let key = resolve_collection_key(&candidate, encrypted)?;
+        let root = collector_work_root("manual")?;
         let result = collect_candidate_with_options(
             candidate,
             root.join("work"),
@@ -640,11 +660,14 @@ async fn collect_source(
         result
     })
     .await
-    .map_err(|_| internal_error())?;
-    let export = result?;
-    let summary = CollectionSummary::from(&export);
-    *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
-    Ok(summary)
+    .unwrap_or_else(|_| Err(internal_error()));
+    let result = result.and_then(|export| {
+        let summary = CollectionSummary::from(&export);
+        *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
+        Ok(summary)
+    });
+    finish_collector_attempt(&state, &result);
+    result
 }
 
 struct CollectionRunGuard(Arc<AtomicBool>);
@@ -661,11 +684,13 @@ impl Drop for CollectionRunGuard {
 pub fn collect_local_export(
     include_media: bool,
     data_redaction: bool,
+    source_root: Option<String>,
 ) -> Result<ClientExportV1, String> {
     collect_local_export_internal(
         include_media,
         data_redaction,
         None,
+        source_root,
         std::sync::Arc::new(|_, _, _| {}),
         None,
     )
@@ -675,6 +700,7 @@ pub fn collect_local_export_with_progress(
     include_media: bool,
     data_redaction: bool,
     since_unix_ms: Option<i64>,
+    source_root: Option<String>,
     progress: wecom_archive_server::LocalCollectionProgressReporter,
     media_sink: wecom_archive_server::LocalCollectionMediaSink,
 ) -> Result<ClientExportV1, String> {
@@ -682,6 +708,7 @@ pub fn collect_local_export_with_progress(
         include_media,
         data_redaction,
         since_unix_ms,
+        source_root,
         progress,
         Some(&media_sink),
     )
@@ -691,13 +718,38 @@ fn collect_local_export_internal(
     include_media: bool,
     data_redaction: bool,
     since_unix_ms: Option<i64>,
+    source_root: Option<String>,
     progress: wecom_archive_server::LocalCollectionProgressReporter,
     media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
 ) -> Result<ClientExportV1, String> {
     progress(6, "发现数据源", "正在查找当前登录的企业微信数据。");
-    let candidates = WindowsSourceAdapter
-        .discover(None)
-        .map_err(|_| "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned())?;
+    let pasted_resolved_root = source_root
+        .as_deref()
+        .map(|raw| {
+            normalize_source_root(raw)
+                .as_deref()
+                .and_then(source_windows::roots::resolve_source_root)
+                .ok_or_else(|| "数据目录无效或无法访问，请填写本机磁盘上的企业微信存储目录（不能是盘符根目录）。".to_owned())
+        })
+        .transpose()?;
+    let roots = if let Some(root) = pasted_resolved_root.as_ref() {
+        vec![root.clone()]
+    } else {
+        collection_roots(
+            None,
+            &load_remembered_source_roots(&source_roots_config_path()),
+            &source_windows::default_roots(),
+        )
+    };
+    let candidates = source_windows::discover_roots(&roots);
+    if candidates.is_empty() {
+        return Err(if source_root.is_some() {
+            "这个文件夹里没找到企业微信数据库，请填企业微信实际存放聊天记录的那一层目录。"
+                .to_owned()
+        } else {
+            "未发现可支持的本机企业微信数据，请确认客户端已登录。".to_owned()
+        });
+    }
     progress(15, "读取授权", "已发现数据源，正在准备只读访问。");
     let temporary_root = collector_work_root("local").map_err(|error| error.message)?;
     let result = (|| {
@@ -732,7 +784,13 @@ fn collect_local_export_internal(
         })
     })();
     let _ = fs::remove_dir_all(&temporary_root);
-    result.map_err(|error| error.message)
+    let export = result.map_err(|error| error.message)?;
+    if let Some(root) = pasted_resolved_root.as_ref()
+        && remember_source_root(&source_roots_config_path(), root).is_err()
+    {
+        diagnostics::write("source_root_persist", "status=failed");
+    }
+    Ok(export)
 }
 
 #[tauri::command]
@@ -740,18 +798,25 @@ async fn upload_latest_enterprise(
     state: State<'_, AppState>,
 ) -> Result<UploadResult, CommandError> {
     let state = state.inner().clone();
-    if let Ok(mut status) = state.schedule_status.lock() {
-        status.running = true;
-        status.last_error = None;
+    if state
+        .collection_running
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(CommandError {
+            code: "COLLECTION_RUNNING",
+            message: "已有采集任务正在运行，请稍后重试。".into(),
+            recoverable: true,
+        });
     }
-    let status_state = state.clone();
-    let finish_state = state.clone();
-    let schedule = load_enterprise_collector_config()?.collector_schedule;
+    let _run_guard = CollectionRunGuard(Arc::clone(&state.collection_running));
+    begin_collector_attempt(&state);
+    let upload_state = state.clone();
     let result: Result<UploadResult, CommandError> =
         tauri::async_runtime::spawn_blocking(move || {
             let config = load_enterprise_collector_config()?;
             ensure_collector_config_fresh(&config)?;
-            let export = state
+            let export = upload_state
                 .latest_export
                 .lock()
                 .map_err(|_| internal_error())?
@@ -761,7 +826,7 @@ async fn upload_latest_enterprise(
                     message: "没有可上传的采集结果，请先完成采集。".into(),
                     recoverable: true,
                 })?;
-            if !has_upload_changes(&state, &export) {
+            if !has_upload_changes(&upload_state, &export) {
                 return Ok(UploadResult { message_count: 0 });
             }
             let package = create_enterprise_package(&export, &config)?;
@@ -770,25 +835,20 @@ async fn upload_latest_enterprise(
                 config.upload_token.as_bytes(),
                 &package,
             )?;
-            record_upload_success(&state, &export);
-            if let Ok(mut status) = status_state.schedule_status.lock() {
+            record_upload_success(&upload_state, &export);
+            if let Ok(mut status) = upload_state.schedule_status.lock() {
                 status.last_success_at = Some(completed_at);
                 status.last_message_count = Some(export.message_count);
                 status.last_media_count = Some(export.media_count);
             }
-            set_next_run_from_completion(&status_state, &schedule);
+            set_next_run_from_completion(&upload_state, &config.collector_schedule);
             Ok(UploadResult {
                 message_count: export.message_count,
             })
         })
         .await
-        .map_err(|_| internal_error())?;
-    if let Ok(mut status) = finish_state.schedule_status.lock() {
-        status.running = false;
-        if let Err(error) = &result {
-            status.last_error = Some(error.message.clone());
-        }
-    }
+        .unwrap_or_else(|_| Err(internal_error()));
+    finish_collector_attempt(&state, &result);
     result
 }
 
@@ -1096,6 +1156,90 @@ fn ensure_collector_config_fresh(config: &EnterpriseCollectorConfig) -> Result<(
     Ok(())
 }
 
+const REMEMBERED_SOURCE_ROOTS_SCHEMA: u32 = 1;
+const MAX_REMEMBERED_SOURCE_ROOTS: usize = 3;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RememberedSourceRoots {
+    schema_version: u32,
+    roots: Vec<PathBuf>,
+}
+
+fn source_roots_config_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("source-roots.dpapi")
+}
+
+fn load_remembered_source_roots(path: &Path) -> Vec<PathBuf> {
+    let Ok(plaintext) = source_windows::dpapi::load_current_user(path) else {
+        return Vec::new();
+    };
+    let Ok(stored) = serde_json::from_slice::<RememberedSourceRoots>(&plaintext) else {
+        return Vec::new();
+    };
+    if stored.schema_version != REMEMBERED_SOURCE_ROOTS_SCHEMA {
+        return Vec::new();
+    }
+    stored
+        .roots
+        .into_iter()
+        .filter_map(|root| source_windows::roots::resolve_source_root(&root))
+        .take(MAX_REMEMBERED_SOURCE_ROOTS)
+        .collect()
+}
+
+fn remember_source_root(path: &Path, root: &Path) -> Result<(), String> {
+    // Local collection and quick export can finish concurrently. Serialize the
+    // read-modify-write so they don't share a DPAPI partial file or lose roots.
+    let _guard = SOURCE_ROOTS_FILE_LOCK
+        .lock()
+        .map_err(|_| "无法保存企业微信数据目录。".to_owned())?;
+    let mut roots = vec![root.to_path_buf()];
+    roots.extend(
+        load_remembered_source_roots(path)
+            .into_iter()
+            .filter(|existing| existing != root),
+    );
+    roots.truncate(MAX_REMEMBERED_SOURCE_ROOTS);
+    let payload = serde_json::to_vec(&RememberedSourceRoots {
+        schema_version: REMEMBERED_SOURCE_ROOTS_SCHEMA,
+        roots,
+    })
+    .map_err(|_| "无法保存企业微信数据目录。".to_owned())?;
+    source_windows::dpapi::store_current_user(path, &payload)
+        .map_err(|_| "无法保存企业微信数据目录。".to_owned())
+}
+
+fn collection_roots(
+    pasted_root: Option<&str>,
+    remembered: &[PathBuf],
+    detected: &[PathBuf],
+) -> Vec<PathBuf> {
+    // An explicit retry must never silently collect a different account from
+    // another root. Automatic discovery still combines saved and default roots.
+    if let Some(raw) = pasted_root {
+        return normalize_source_root(raw).into_iter().collect();
+    }
+    let mut roots = Vec::new();
+    for root in remembered.iter().chain(detected) {
+        if !roots.contains(root) {
+            roots.push(root.clone());
+        }
+    }
+    roots
+}
+
+fn discover_local_sources() -> Vec<SourceCandidate> {
+    source_windows::discover_roots(&collection_roots(
+        None,
+        &load_remembered_source_roots(&source_roots_config_path()),
+        &source_windows::default_roots(),
+    ))
+}
+
 #[tauri::command]
 fn verify_collector_control_envelope(
     control: &serde_json::Value,
@@ -1352,6 +1496,7 @@ fn sync_collector_config_with_status(
             &format!("hidden_mode={}", latest.hidden_mode_enabled),
         );
         apply_collector_visibility(&app, &latest).map_err(|_| internal_error())?;
+        let _ = app.emit("collector:schedule-updated", &latest.collector_schedule);
     }
     Ok(())
 }
@@ -3460,7 +3605,7 @@ pub fn run() {
                             .last_success_at
                             .as_deref()
                             .map(format_status_time)
-                            .unwrap_or_else(|| "暂无".into());
+                            .unwrap_or_else(|| "尚未成功".into());
                         let next = status.next_run_at.as_deref().unwrap_or("计算中");
                         let state = if status.running {
                             "上传中"
@@ -3472,7 +3617,7 @@ pub fn run() {
                         let schedule_tip = load_enterprise_collector_config()
                             .map(|config| describe_collector_schedule(&config.collector_schedule))
                             .unwrap_or_else(|_| "采集计划加载中".into());
-                        format!("{}\n状态：{}\n上次上传：{}\n下次上传：{}\n已上传：{} 条", schedule_tip, state, last, next, status.uploaded_count)
+                        format!("{}\n状态：{}\n最近成功：{}\n下次执行：{}\n已上传：{} 条", schedule_tip, state, last, next, status.uploaded_count)
                     });
                     if let (Some(tray), Some(tip)) = (tray_app.tray_by_id("collector-tray"), tip) {
                         let _ = tray.set_tooltip(Some(tip));
@@ -3587,14 +3732,54 @@ fn open_collector_window(app: &tauri::AppHandle, request_export: bool) {
     }
 }
 
+struct CollectorScheduleTimer {
+    schedule: CollectionSchedule,
+    next_run: Option<chrono::DateTime<Local>>,
+    activation_pending: bool,
+}
+
+impl CollectorScheduleTimer {
+    fn new(schedule: CollectionSchedule, now: chrono::DateTime<Local>) -> Self {
+        Self {
+            next_run: next_schedule_at(&schedule, now),
+            schedule,
+            activation_pending: false,
+        }
+    }
+
+    fn update(&mut self, schedule: &CollectionSchedule, now: chrono::DateTime<Local>) -> bool {
+        if self.schedule == *schedule {
+            return false;
+        }
+        if schedule.mode == CollectionScheduleMode::Disabled {
+            self.activation_pending = false;
+        } else if self.schedule.mode == CollectionScheduleMode::Disabled {
+            self.activation_pending = true;
+        }
+        self.schedule = schedule.clone();
+        // Keep the first run pending while another collection holds the lock.
+        // Repeated heartbeats must not move it into the next interval.
+        self.next_run = if self.activation_pending {
+            Some(now)
+        } else {
+            next_schedule_at(schedule, now)
+        };
+        true
+    }
+
+    fn completed(&mut self, now: chrono::DateTime<Local>) {
+        self.activation_pending = false;
+        self.next_run = next_schedule_at(&self.schedule, now);
+    }
+}
+
 fn collector_scheduler(state: AppState) {
     let config = match load_enterprise_collector_config() {
         Ok(config) => config,
         Err(_) => return,
     };
-    let mut schedule = config.collector_schedule.clone();
-    let mut next_run = next_schedule_at(&schedule, Local::now());
-    set_next_run(&state, next_run);
+    let mut timer = CollectorScheduleTimer::new(config.collector_schedule.clone(), Local::now());
+    set_next_run(&state, timer.next_run);
     loop {
         std::thread::sleep(Duration::from_secs(15));
         let _ = sync_collector_config_with_status(Some(&state.schedule_status), Some(&state));
@@ -3614,6 +3799,13 @@ fn collector_scheduler(state: AppState) {
             continue;
         }
         if !latest.enabled {
+            timer.update(
+                &CollectionSchedule {
+                    mode: CollectionScheduleMode::Disabled,
+                    ..latest.collector_schedule.clone()
+                },
+                Local::now(),
+            );
             set_next_run(&state, None);
             continue;
         }
@@ -3631,7 +3823,7 @@ fn collector_scheduler(state: AppState) {
                 if let Ok(mut status) = state.schedule_status.lock() {
                     status.manual_collection_attempted_id = Some(request_id.clone());
                 }
-                if let Some(result) = run_collection_and_record(&state, &latest) {
+                if let Some(result) = run_collection_and_record(&state, &latest, false) {
                     if result.is_ok()
                         && let Ok(mut status) = state.schedule_status.lock()
                     {
@@ -3639,52 +3831,47 @@ fn collector_scheduler(state: AppState) {
                     } else if let Ok(mut status) = state.schedule_status.lock() {
                         status.manual_collection_attempted_id = None;
                     }
-                    schedule = latest.collector_schedule.clone();
-                    next_run = next_schedule_at(&schedule, Local::now());
-                    set_next_run(&state, next_run);
+                    timer.update(&latest.collector_schedule, Local::now());
+                    timer.completed(Local::now());
+                    set_next_run(&state, timer.next_run);
                     continue;
                 } else if let Ok(mut status) = state.schedule_status.lock() {
                     status.manual_collection_attempted_id = None;
                 }
             }
         }
-        if latest.collector_schedule != schedule {
-            schedule = latest.collector_schedule.clone();
-            next_run = next_schedule_at(&schedule, Local::now());
-            set_next_run(&state, next_run);
+        if timer.update(&latest.collector_schedule, Local::now()) {
+            set_next_run(&state, timer.next_run);
         }
-        let Some(due_at) = next_run else {
-            continue;
-        };
-        if schedule.mode == CollectionScheduleMode::Interval
+        if !timer.activation_pending
+            && timer.schedule.mode == CollectionScheduleMode::Interval
             && let Ok(status) = state.schedule_status.lock()
             && let Some(value) = status.next_run_at.as_deref()
             && let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
         {
-            next_run = parsed.and_local_timezone(Local).earliest();
-            if Local::now() < next_run.unwrap_or_else(Local::now) {
-                continue;
-            }
+            timer.next_run = parsed.and_local_timezone(Local).earliest();
         }
+        let Some(due_at) = timer.next_run else {
+            continue;
+        };
         if Local::now() < due_at {
             continue;
         }
-        let _ = run_collection_and_record(&state, &latest);
+        if run_collection_and_record(&state, &latest, timer.activation_pending).is_none() {
+            continue;
+        }
         if state.scheduler_shutdown.load(Ordering::Acquire) {
             return;
         }
-        next_run = if schedule.mode == CollectionScheduleMode::Interval {
-            Some(Local::now() + TimeDelta::minutes(i64::from(schedule.interval_minutes.max(1))))
-        } else {
-            next_schedule_at(&schedule, Local::now())
-        };
-        set_next_run(&state, next_run);
+        timer.completed(Local::now());
+        set_next_run(&state, timer.next_run);
     }
 }
 
 fn run_collection_and_record(
     state: &AppState,
     config: &EnterpriseCollectorConfig,
+    force_upload: bool,
 ) -> Option<Result<ScheduledCollectionOutcome, CommandError>> {
     if state
         .collection_running
@@ -3694,23 +3881,16 @@ fn run_collection_and_record(
         return None;
     }
     let _guard = CollectionRunGuard(Arc::clone(&state.collection_running));
-    if let Ok(mut status) = state.schedule_status.lock() {
-        status.running = true;
-        status.last_attempt_at = Some(Utc::now().to_rfc3339());
-        status.last_error = None;
-    }
-    let result = scheduled_collect_and_upload(state, config);
-    if let Ok(mut status) = state.schedule_status.lock() {
-        status.running = false;
-        match &result {
-            Ok(outcome) => {
-                status.last_message_count = Some(outcome.summary.message_count);
-                status.last_media_count = Some(outcome.summary.media_count);
-                if let Some(completed_at) = outcome.completed_at.as_ref() {
-                    status.last_success_at = Some(completed_at.clone());
-                }
-            }
-            Err(error) => status.last_error = Some(error.message.clone()),
+    begin_collector_attempt(state);
+    let result = scheduled_collect_and_upload(state, config, force_upload);
+    finish_collector_attempt(state, &result);
+    if let Ok(outcome) = &result
+        && let Ok(mut status) = state.schedule_status.lock()
+    {
+        status.last_message_count = Some(outcome.summary.message_count);
+        status.last_media_count = Some(outcome.summary.media_count);
+        if let Some(completed_at) = outcome.completed_at.as_ref() {
+            status.last_success_at = Some(completed_at.clone());
         }
     }
     Some(result)
@@ -3813,25 +3993,20 @@ struct ScheduledCollectionOutcome {
 fn scheduled_collect_and_upload(
     state: &AppState,
     config: &EnterpriseCollectorConfig,
+    force_upload: bool,
 ) -> Result<ScheduledCollectionOutcome, CommandError> {
-    let candidates = WindowsSourceAdapter
-        .discover(None)
-        .map_err(|error| CommandError {
-            code: "SOURCE_DISCOVERY_FAILED",
-            message: sanitize_error(&error.to_string()),
-            recoverable: true,
-        })?;
+    let candidates = discover_local_sources();
     let media_options = MediaCollectionOptions {
         include_files: config.include_files,
         include_images: config.include_images,
     };
-    let root = collector_work_root("scheduled")?;
     let (candidate, key) = choose_collectable_source(candidates, &mut |source| {
         resolve_collection_key(
             source,
             source.databases.iter().any(|database| database.encrypted),
         )
     })?;
+    let root = collector_work_root("scheduled")?;
     let result = (|| {
         let export = collect_candidate_with_options(
             candidate,
@@ -3846,7 +4021,7 @@ fn scheduled_collect_and_upload(
             None,
         )?;
         let changed = has_upload_changes(state, &export);
-        if !changed {
+        if !changed && !force_upload {
             let summary = CollectionSummary::from(&export);
             *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
             return Ok(ScheduledCollectionOutcome {
@@ -3892,6 +4067,166 @@ impl From<&SourceCandidate> for SafeSourceCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collector_schedule_enabling_runs_now_before_waiting_for_the_interval() {
+        let now = Local.with_ymd_and_hms(2026, 9, 24, 9, 0, 0).unwrap();
+        let disabled = CollectionSchedule {
+            mode: CollectionScheduleMode::Disabled,
+            interval_minutes: 60,
+            daily_time: "02:00".into(),
+        };
+        let enabled = CollectionSchedule {
+            mode: CollectionScheduleMode::Interval,
+            ..disabled.clone()
+        };
+        let mut timer = CollectorScheduleTimer::new(disabled.clone(), now);
+        assert_eq!(timer.next_run, None);
+        assert!(timer.update(&enabled, now));
+        assert_eq!(timer.next_run, Some(now));
+        assert!(timer.activation_pending);
+
+        // A busy collector receives the same settings on the next heartbeat.
+        // Its first due time must remain pending rather than skipping one hour.
+        let later = now + TimeDelta::seconds(15);
+        assert!(!timer.update(&enabled, later));
+        assert_eq!(timer.next_run, Some(now));
+        assert!(timer.activation_pending);
+        let changed = CollectionSchedule {
+            interval_minutes: 30,
+            ..enabled.clone()
+        };
+        assert!(timer.update(&changed, later));
+        assert!(timer.activation_pending);
+        assert_eq!(timer.next_run, Some(later));
+
+        timer.completed(later);
+        assert!(!timer.activation_pending);
+        assert_eq!(timer.next_run, Some(later + TimeDelta::minutes(30)));
+        assert!(!timer.update(&changed, later + TimeDelta::seconds(15)));
+        assert_eq!(timer.next_run, Some(later + TimeDelta::minutes(30)));
+        assert!(timer.update(&disabled, later));
+        assert_eq!(timer.next_run, None);
+        assert!(timer.update(&enabled, later));
+        assert_eq!(timer.next_run, Some(later));
+    }
+
+    #[test]
+    fn collector_schedule_daily_enable_runs_now_then_returns_to_the_daily_time() {
+        let now = Local.with_ymd_and_hms(2026, 9, 24, 9, 0, 0).unwrap();
+        let disabled = CollectionSchedule {
+            mode: CollectionScheduleMode::Disabled,
+            interval_minutes: 60,
+            daily_time: "20:00".into(),
+        };
+        let enabled = CollectionSchedule {
+            mode: CollectionScheduleMode::Daily,
+            ..disabled.clone()
+        };
+        let mut timer = CollectorScheduleTimer::new(disabled, now);
+        assert!(timer.update(&enabled, now));
+        assert_eq!(timer.next_run, Some(now));
+        timer.completed(now + TimeDelta::minutes(1));
+        assert_eq!(
+            timer.next_run,
+            Some(Local.with_ymd_and_hms(2026, 9, 24, 20, 0, 0).unwrap())
+        );
+        let already_enabled = CollectorScheduleTimer::new(enabled, now);
+        assert!(!already_enabled.activation_pending);
+        assert_eq!(already_enabled.next_run, timer.next_run);
+    }
+
+    #[test]
+    fn collector_initial_empty_export_is_uploaded_before_deduplication() {
+        let state = AppState::default();
+        let export =
+            archive_transfer::create_export("test-client", vec![], vec![], vec![]).unwrap();
+        assert!(has_upload_changes(&state, &export));
+        record_upload_success(&state, &export);
+        state.schedule_status.lock().unwrap().last_success_at = Some("2026-09-24T01:00:00Z".into());
+        assert!(!has_upload_changes(&state, &export));
+    }
+
+    #[test]
+    fn collector_attempt_tracks_first_run_failures_and_no_change_retries() {
+        let state = AppState::default();
+        assert!(
+            state
+                .schedule_status
+                .lock()
+                .unwrap()
+                .last_attempt_at
+                .is_none()
+        );
+
+        begin_collector_attempt(&state);
+        let first_attempt = {
+            let status = state.schedule_status.lock().unwrap();
+            assert!(status.running);
+            let attempt = status.last_attempt_at.clone().unwrap();
+            assert!(chrono::DateTime::parse_from_rfc3339(&attempt).is_ok());
+            attempt
+        };
+        finish_collector_attempt::<()>(&state, &Err(internal_error()));
+        {
+            let mut status = state.schedule_status.lock().unwrap();
+            assert!(!status.running);
+            assert!(status.last_error.is_some());
+            assert_eq!(
+                status.last_attempt_at.as_deref(),
+                Some(first_attempt.as_str())
+            );
+            status.last_success_at = Some("2026-09-24T10:00:00Z".into());
+        }
+
+        begin_collector_attempt(&state);
+        // A scan without new messages still counts as an execution, while the
+        // successful-upload timestamp continues to describe the last upload.
+        finish_collector_attempt(&state, &Ok(UploadResult { message_count: 0 }));
+        let status = state.schedule_status.lock().unwrap();
+        assert!(!status.running);
+        assert!(status.last_attempt_at.is_some());
+        assert!(status.last_error.is_none());
+        assert_eq!(
+            status.last_success_at.as_deref(),
+            Some("2026-09-24T10:00:00Z")
+        );
+    }
+
+    #[test]
+    fn custom_source_root_rejects_drive_roots_and_normalizes_explorer_paste() {
+        assert_eq!(normalize_source_root("   "), None);
+        assert_eq!(normalize_source_root("WXWork"), None);
+        assert_eq!(normalize_source_root("D:\\"), None);
+        assert_eq!(
+            normalize_source_root("  \"D:/WXWork/\"  "),
+            Some(PathBuf::from(r"D:\WXWork"))
+        );
+    }
+
+    #[test]
+    fn custom_source_root_limits_collection_to_the_explicit_directory() {
+        let roots = collection_roots(
+            Some("D:/WXWork/"),
+            &[PathBuf::from(r"E:\WXWork"), PathBuf::from(r"D:\WXWork")],
+            &[
+                PathBuf::from(r"C:\Users\mia\Documents\WXWork"),
+                PathBuf::from(r"D:\WXWork"),
+            ],
+        );
+        assert_eq!(roots, vec![PathBuf::from(r"D:\WXWork")]);
+        assert!(collection_roots(Some(r"D:\"), &roots, &roots).is_empty());
+    }
+
+    #[test]
+    fn invalid_explicit_roots_return_a_retry_error_before_automatic_discovery() {
+        for raw in [r"C:\", "relative", r"\\server\share\WXWork"] {
+            assert_eq!(
+                collect_local_export(false, false, Some(raw.to_owned())).unwrap_err(),
+                "数据目录无效或无法访问，请填写本机磁盘上的企业微信存储目录（不能是盘符根目录）。"
+            );
+        }
+    }
     use rusqlite::Connection;
 
     struct TestDirectory(PathBuf);
@@ -3909,6 +4244,106 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn remembered_source_roots_survive_reload_and_discover_non_default_data() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("source-roots.dpapi");
+        let roots = (0..4)
+            .map(|index| directory.0.join(format!("custom-{index}")))
+            .collect::<Vec<_>>();
+        for root in &roots {
+            fs::create_dir_all(root).unwrap();
+            remember_source_root(&config, root).unwrap();
+        }
+        remember_source_root(&config, &roots[2]).unwrap();
+        let reloaded = load_remembered_source_roots(&config);
+        assert_eq!(
+            reloaded,
+            vec![roots[2].clone(), roots[3].clone(), roots[1].clone()]
+        );
+        for name in ["message.db", "session.db", "user.db"] {
+            let mut header = [0_u8; 100];
+            header[..16].copy_from_slice(b"SQLite format 3\0");
+            fs::write(roots[2].join(name), header).unwrap();
+        }
+        let candidates = source_windows::discover_roots(&collection_roots(None, &reloaded, &[]));
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].root_path, roots[2]);
+        fs::remove_dir(&roots[1]).unwrap();
+        assert_eq!(
+            load_remembered_source_roots(&config),
+            vec![roots[2].clone(), roots[3].clone()]
+        );
+    }
+
+    #[test]
+    fn invalid_remembered_source_roots_fall_back_to_detected_roots() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("source-roots.dpapi");
+        let detected = vec![directory.0.join("automatic")];
+        assert!(load_remembered_source_roots(&config).is_empty());
+        fs::write(&config, b"damaged DPAPI fixture").unwrap();
+        assert_eq!(
+            collection_roots(None, &load_remembered_source_roots(&config), &detected),
+            detected
+        );
+        source_windows::dpapi::store_current_user(&config, b"invalid JSON fixture").unwrap();
+        assert!(load_remembered_source_roots(&config).is_empty());
+        let payload = serde_json::to_vec(&RememberedSourceRoots {
+            schema_version: REMEMBERED_SOURCE_ROOTS_SCHEMA + 1,
+            roots: vec![directory.0.clone()],
+        })
+        .unwrap();
+        source_windows::dpapi::store_current_user(&config, &payload).unwrap();
+        assert_eq!(
+            collection_roots(None, &load_remembered_source_roots(&config), &detected),
+            detected
+        );
+    }
+
+    #[test]
+    fn concurrent_source_root_saves_keep_a_readable_bounded_config() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("source-roots.dpapi");
+        let handles = (0..4)
+            .map(|index| {
+                let root = directory.0.join(format!("fixture-{index}"));
+                fs::create_dir_all(&root).unwrap();
+                let path = config.clone();
+                std::thread::spawn(move || remember_source_root(&path, &root))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(
+            load_remembered_source_roots(&config).len(),
+            MAX_REMEMBERED_SOURCE_ROOTS
+        );
+        assert!(!config.with_extension("dpapi.partial").exists());
+    }
+
+    #[test]
+    fn remembered_roots_revalidate_paths_before_directory_access() {
+        let directory = TestDirectory::new();
+        let config = directory.0.join("source-roots.dpapi");
+        let payload = serde_json::to_vec(&RememberedSourceRoots {
+            schema_version: REMEMBERED_SOURCE_ROOTS_SCHEMA,
+            roots: vec![
+                PathBuf::from(r"C:\"),
+                PathBuf::from(r"\\server\share\WXWork"),
+                PathBuf::from("relative"),
+                directory.0.clone(),
+            ],
+        })
+        .unwrap();
+        source_windows::dpapi::store_current_user(&config, &payload).unwrap();
+        assert_eq!(
+            load_remembered_source_roots(&config),
+            vec![directory.0.clone()]
+        );
     }
 
     fn authorization() -> CollectionAuthorization {
@@ -4633,7 +5068,7 @@ mod tests {
     #[test]
     #[ignore = "requires the user's explicit authorization and a running trusted WXWork.exe"]
     fn authorized_real_collection_includes_group_metadata_without_exposing_content() {
-        let export = collect_local_export(false, false).unwrap();
+        let export = collect_local_export(false, false, None).unwrap();
         let message_count = export
             .batches
             .iter()
@@ -4668,6 +5103,7 @@ mod tests {
         let export = collect_local_export_internal(
             true,
             false,
+            None,
             None,
             std::sync::Arc::new(|_, _, _| {}),
             Some(&media_sink),

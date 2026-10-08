@@ -7,6 +7,10 @@ pub mod dialog;
 pub mod dpapi;
 #[cfg(windows)]
 pub mod probe;
+#[cfg(windows)]
+mod registry;
+#[cfg(windows)]
+pub mod roots;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -44,11 +48,7 @@ impl SourceAdapter for WindowsSourceAdapter {
             Some(root) => vec![root],
             None => default_roots(),
         };
-        Ok(roots
-            .into_iter()
-            .filter(|root| root.is_dir())
-            .flat_map(|root| discover_under(&root))
-            .collect())
+        Ok(discover_roots(&roots))
     }
 
     fn snapshot(
@@ -58,6 +58,43 @@ impl SourceAdapter for WindowsSourceAdapter {
     ) -> Result<SnapshotReceipt, DomainError> {
         create_consistent_snapshot(candidate, &work_root, SnapshotOptions::default())
     }
+}
+
+/// Discover candidates below all trusted roots using one global ordering.
+///
+/// Roots may overlap when a user-selected directory is also covered by an
+/// automatic root, so candidates are de-duplicated by their stable source ID.
+pub fn discover_roots(roots: &[PathBuf]) -> Vec<SourceCandidate> {
+    #[cfg(windows)]
+    let roots = roots
+        .iter()
+        .filter_map(|root| roots::resolve_source_root(root))
+        .collect::<BTreeSet<_>>();
+    let mut unique: BTreeMap<String, SourceCandidate> = BTreeMap::new();
+    for candidate in roots
+        .iter()
+        .filter(|root| root.is_dir())
+        .flat_map(|root| discover_under(root))
+    {
+        // A narrower root may omit sibling media. Keep all authorized media
+        // roots when the same database is discovered through another root.
+        if let Some(existing) = unique.get_mut(&candidate.source_id) {
+            existing.media_roots.extend(candidate.media_roots);
+            existing.media_roots.sort();
+            existing.media_roots.dedup();
+        } else {
+            unique.insert(candidate.source_id.clone(), candidate);
+        }
+    }
+    let mut candidates = unique.into_values().collect::<Vec<_>>();
+    candidates.sort_by_cached_key(|candidate| {
+        (
+            is_backup_source(candidate),
+            std::cmp::Reverse(message_database_size(candidate)),
+            candidate.source_id.clone(),
+        )
+    });
+    candidates
 }
 
 fn discover_under(root: &Path) -> Vec<SourceCandidate> {
@@ -91,7 +128,7 @@ fn discover_under(root: &Path) -> Vec<SourceCandidate> {
         });
     }
 
-    let mut candidates = grouped
+    grouped
         .into_iter()
         .filter(|(_, databases)| databases.iter().any(|database| database.kind == "message"))
         .map(|(data_root, mut databases)| {
@@ -118,13 +155,7 @@ fn discover_under(root: &Path) -> Vec<SourceCandidate> {
                 capability,
             }
         })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| {
-        message_database_size(right)
-            .cmp(&message_database_size(left))
-            .then_with(|| left.source_id.cmp(&right.source_id))
-    });
-    candidates
+        .collect()
 }
 
 fn discover_media_roots(data_root: &Path, discovery_root: &Path) -> Vec<PathBuf> {
@@ -172,6 +203,23 @@ fn message_database_size(candidate: &SourceCandidate) -> u64 {
         .find(|database| database.kind == "message")
         .and_then(|database| database.path.metadata().ok())
         .map_or(0, |metadata| metadata.len())
+}
+
+fn is_backup_source(candidate: &SourceCandidate) -> bool {
+    // WeCom keeps historical databases below account/Backup/<timestamp>/Data.
+    // Retain these as fallback sources, but don't let a larger backup outrank
+    // current account data during automatic collection.
+    let named = |path: &Path, expected: &str| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+    };
+    named(&candidate.root_path, "Data")
+        && candidate
+            .root_path
+            .ancestors()
+            .nth(2)
+            .is_some_and(|path| named(path, "Backup"))
 }
 
 #[derive(Debug)]
@@ -223,8 +271,13 @@ fn path_fingerprint(path: &Path) -> String {
     format!("src-{}", &hex::encode(digest)[..20])
 }
 
-fn default_roots() -> Vec<PathBuf> {
+/// The automatic locations used when the user has not selected a directory.
+pub fn default_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    #[cfg(windows)]
+    if let Some(configured) = registry::configured_data_root() {
+        roots.push(configured);
+    }
     if let Some(app_data) = std::env::var_os("APPDATA") {
         roots.push(PathBuf::from(app_data).join("Tencent").join("WXWork"));
     }
@@ -241,6 +294,77 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    fn write_account_databases(root: &Path, message_bytes: usize) {
+        fs::create_dir_all(root).unwrap();
+        for (name, size) in [
+            ("message.db", message_bytes),
+            ("session.db", 48),
+            ("user.db", 48),
+        ] {
+            let mut bytes = vec![0_u8; size];
+            bytes[..16].copy_from_slice(b"SQLite format 3\0");
+            bytes[16..18].copy_from_slice(&4096_u16.to_be_bytes());
+            fs::write(root.join(name), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn discover_roots_orders_candidates_globally_and_deduplicates_overlap() {
+        let directory = tempdir().unwrap();
+        let small = directory.path().join("small").join("WXWork").join("1");
+        let large = directory.path().join("large").join("WXWork").join("2");
+        write_account_databases(&small, 64);
+        write_account_databases(&large, 4_096);
+
+        let candidates = discover_roots(&[
+            directory.path().join("small").join("WXWork"),
+            directory.path().join("large").join("WXWork"),
+            directory.path().join("large").join("WXWork"),
+        ]);
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].root_path, large);
+        assert_eq!(candidates[1].root_path, small);
+    }
+
+    #[test]
+    fn current_account_data_precedes_larger_backups_without_removing_backups() {
+        let directory = tempdir().unwrap();
+        let account = directory.path().join("WXWork").join("fixture-account");
+        let current = account.join("Data");
+        let backup = account
+            .join("bAcKuP")
+            .join("fixture-timestamp")
+            .join("Data");
+        write_account_databases(&current, 100);
+        write_account_databases(&backup, 4096);
+        let candidates = discover_roots(std::slice::from_ref(&account));
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].root_path, current);
+        assert_eq!(candidates[1].root_path, backup);
+        let explicit_backup = discover_roots(std::slice::from_ref(&backup));
+        assert_eq!(explicit_backup.len(), 1);
+        assert_eq!(explicit_backup[0].root_path, backup);
+    }
+
+    #[test]
+    fn overlapping_roots_keep_sibling_media_when_a_database_directory_is_selected() {
+        let directory = tempdir().unwrap();
+        let account = directory.path().join("WXWork").join("fixture-account");
+        let data = account.join("Data");
+        let media = account.join("FileStorage");
+        write_account_databases(&data, 100);
+        fs::create_dir_all(&media).unwrap();
+        for roots in [
+            vec![data.clone(), account.clone()],
+            vec![account.clone(), data.clone()],
+        ] {
+            let candidates = discover_roots(&roots);
+            assert_eq!(candidates.len(), 1);
+            assert!(candidates[0].media_roots.contains(&media));
+        }
+    }
 
     #[test]
     fn discovers_split_database_layout() {

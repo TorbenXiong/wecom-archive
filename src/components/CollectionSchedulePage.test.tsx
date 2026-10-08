@@ -110,7 +110,7 @@ it("shows the remote plan on three rows and aligns both editors with shared cont
   expect(screen.getByText(/实例标识：collector-1/)).toBeInTheDocument();
   const summary = container.querySelector(".collector-target-summary");
   expect(summary?.children).toHaveLength(3);
-  expect(summary?.children[1]).toHaveTextContent("最近执行：");
+  expect(summary?.children[1]).toHaveTextContent("最近成功：");
   expect(summary?.children[1]).toHaveTextContent("下次执行：");
   expect(screen.queryByText(/配置 1\/1/)).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("switch", { name: "编辑模式" }));
@@ -118,4 +118,47 @@ it("shows the remote plan on three rows and aligns both editors with shared cont
   expect(screen.queryByRole("dialog", { name: "编辑采集端" })).not.toBeInTheDocument();
   expect(screen.getByText("采集计划", { selector: ".collector-inline-plan > span" })).toBeInTheDocument();
   expect(screen.getByLabelText("间隔（分钟）").parentElement).toHaveTextContent("分钟");
+});
+
+it("only shows a successful upload after enabling the plan and ignores collection attempts", async () => {
+  const uploadedAt = "2026-09-24T10:00:00Z";
+  const attemptedAt = "2026-09-24T09:00:00Z";
+  let lastRunAt: string | undefined = attemptedAt;
+  let lastUploadAt: string | undefined;
+  let schedule: { mode: "disabled" | "interval"; intervalMinutes: number; dailyTime: string } = { mode: "disabled", intervalMinutes: 50, dailyTime: "02:00" };
+  let poll: (() => Promise<void>) | undefined;
+  vi.spyOn(window, "setInterval").mockImplementation((callback, delay) => {
+    if (delay === 5000) poll = callback as () => Promise<void>;
+    return 1;
+  });
+  const fetchTargets = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    if (init?.method === "PUT") {
+      schedule = JSON.parse(String(init.body)).schedule as typeof schedule;
+      return Response.json({ status: "updated" });
+    }
+    return Response.json({ targets: [{
+    targetId: "collector-first-run", kind: "collector", displayName: "测试采集端", status: "online",
+    plans: [{ id: "collector-first-run", name: "测试计划", includeMedia: false,
+      schedule,
+      lastRunAt, lastUploadAt,
+    }],
+  }] });
+  });
+  vi.stubGlobal("fetch", fetchTargets);
+  render(<CollectionSchedulePage token="test-token" />);
+  expect(await screen.findByText(/最近成功：尚未成功/)).toBeInTheDocument();
+  expect(screen.queryByText(/最近执行：/)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("switch", { name: "编辑模式" }));
+  fireEvent.click(screen.getByLabelText("按间隔"));
+  fireEvent.click(screen.getByRole("button", { name: "保存" }));
+  expect(await screen.findByText(/采集计划：每 50 分钟执行.*最近成功：尚未成功/)).toBeInTheDocument();
+  expect(fetchTargets).toHaveBeenCalledWith(expect.stringContaining("/collectors/collector-first-run"), expect.objectContaining({ method: "PUT", body: expect.stringContaining('"mode":"interval"') }));
+  lastUploadAt = uploadedAt;
+  await act(async () => { await poll?.(); });
+  const uploadTime = new Date(uploadedAt).toLocaleString("zh-CN", { hour12: false });
+  expect(await screen.findByText(`采集计划：每 50 分钟执行 最近成功：${uploadTime} 下次执行：尚未执行`, { exact: false })).toBeInTheDocument();
+
+  lastRunAt = "2026-09-24T11:30:00Z";
+  await act(async () => { await poll?.(); });
+  expect(await screen.findByText(`采集计划：每 50 分钟执行 最近成功：${uploadTime} 下次执行：尚未执行`, { exact: false })).toBeInTheDocument();
 });
