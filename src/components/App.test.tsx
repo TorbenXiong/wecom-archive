@@ -355,6 +355,64 @@ describe("archive workspace", () => {
     expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/collections/local?include_media=true"))).toBe(true);
   });
 
+  it.each(["collection", "export"] as const)("preserves the custom directory across failed %s retries and sends it to the API", async (mode) => {
+    installApiMock();
+    const fallback = vi.mocked(fetch).getMockImplementation()!;
+    const roots: Array<string | undefined> = [];
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (mode === "export" ? url.endsWith("/exports/local") : url.includes("/collections/local?") && init?.method === "POST") {
+        roots.push(mode === "export" ? JSON.parse(String(init?.body)).sourceRoot : new URL(url, "http://localhost").searchParams.get("source_root") ?? undefined);
+        if (roots.length <= 2) return Response.json({ code: "LOCAL_SOURCE_NOT_FOUND", message: `未发现数据源（第 ${roots.length} 次）` }, { status: 422 });
+      }
+      return fallback(input, init);
+    });
+    render(<App />);
+    await connect();
+    if (mode === "export") {
+      fireEvent.click(screen.getByRole("button", { name: "本机" }));
+      fireEvent.click(screen.getByRole("button", { name: "开始导出" }));
+    } else {
+      fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
+      fireEvent.click(await screen.findByRole("button", { name: "包含全内容" }));
+    }
+    fireEvent.change(await screen.findByLabelText("企业微信数据目录"), { target: { value: "D:\\FixtureWXWork" } });
+    fireEvent.click(screen.getByRole("button", { name: "用这个目录重试" }));
+    expect(await screen.findByLabelText("企业微信数据目录")).toHaveValue("D:\\FixtureWXWork");
+    expect(screen.getByRole("dialog", { name: "没有找到企业微信数据" })).toHaveTextContent("未发现数据源（第 2 次）");
+    fireEvent.click(screen.getByRole("button", { name: "用这个目录重试" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "没有找到企业微信数据" })).not.toBeInTheDocument());
+    expect(await screen.findByText(mode === "export" ? /本机导出完成：local-export.csv/ : /本机采集完成：新增 3 条/)).toBeInTheDocument();
+    expect(roots).toEqual([undefined, "D:\\FixtureWXWork", "D:\\FixtureWXWork"]);
+  });
+
+  it.each(["collection", "export"] as const)("does not reopen the directory dialog after a %s retry fails for another reason", async (mode) => {
+    installApiMock();
+    const fallback = vi.mocked(fetch).getMockImplementation()!;
+    let attempts = 0;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (mode === "export" ? url.endsWith("/exports/local") : url.includes("/collections/local?") && init?.method === "POST") {
+        attempts += 1;
+        return Response.json(attempts === 1 ? { code: "LOCAL_SOURCE_NOT_FOUND", message: "未发现数据源" } : { code: "LOCAL_COLLECTION_FAILED", message: "读取授权失败。" }, { status: 422 });
+      }
+      return fallback(input, init);
+    });
+    render(<App />);
+    await connect();
+    if (mode === "export") {
+      fireEvent.click(screen.getByRole("button", { name: "本机" }));
+      fireEvent.click(screen.getByRole("button", { name: "开始导出" }));
+    } else {
+      fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
+      fireEvent.click(await screen.findByRole("button", { name: "仅采集文本" }));
+    }
+    fireEvent.change(await screen.findByLabelText("企业微信数据目录"), { target: { value: "D:\\FixtureWXWork" } });
+    fireEvent.click(screen.getByRole("button", { name: "用这个目录重试" }));
+    expect(await screen.findByText("读取授权失败。")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "没有找到企业微信数据" })).not.toBeInTheDocument();
+  });
+
   it("keeps a fast local export flow with format and redaction controls", async () => {
     installApiMock();
     render(<App />);

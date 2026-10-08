@@ -436,12 +436,14 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .collector-card { flex-shrink: 0; width: min(370px,100%); margin: auto; padding: 18px 22px; display: grid; justify-items: center; text-align: center; border: 1px solid #dce3ed; border-radius: 13px; background: #fff; box-shadow: 0 13px 36px rgba(29,48,79,.10); }
 .collector-state-icon { width: 48px; height: 48px; display: grid; place-items: center; color: var(--blue); border-radius: 13px; background: var(--blue-soft); }.collector-state-icon svg { width: 23px; height: 23px; }
 .collector-card.ready .collector-state-icon { color: #148658; background: #e9f8f1; }.collector-card.failed .collector-state-icon { color: #a86312; background: #fff5df; }
-.collector-card h1 { margin: 12px 0 4px; font-size: 21px; letter-spacing: -.03em; }.collector-card > p { min-height: 30px; margin: 0; color: #68758a; font-size: 10px; line-height: 1.65; word-break: break-word; }
-.collector-result { margin-top: 4px; display: flex; flex-wrap: wrap; justify-content: center; align-items: baseline; gap: 5px; color: #6c788b; font-size: 10px; }.collector-result strong { color: #14243c; font-size: 19px; }.collector-result i { width: 1px; height: 12px; margin: 0 4px; background: #dce2ea; }
+.collector-card h1 { margin: 12px 0 4px; font-size: 21px; letter-spacing: -.03em; }
+.collector-status-list { width: 100%; margin: 8px 0 0; display: grid; gap: 4px; text-align: left; font-size: 12px; line-height: 1.6; }
+.collector-status-list > div { display: grid; grid-template-columns: 72px minmax(0, 1fr); }
+.collector-status-list dt { color: #68758a; }.collector-status-list dd { margin: 0; overflow-wrap: anywhere; }.collector-status-list strong { font-weight: 600; }
+.collector-error { width: 100%; margin: 10px 0 0; color: #a86312; text-align: left; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .collector-main-button { width: 100%; height: 40px; margin-top: 17px; justify-content: center; }
 .collector-action-grid { width: 100%; margin-top: 17px; display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
 .collector-action-grid.single { grid-template-columns: 1fr; }
-.collector-schedule-status { display: block; margin-top: 8px; color: #7a8698; font-size: 11px; }
 .collector-action-grid .collector-main-button { margin-top: 0; padding-inline: 8px; font-size: 11px; }
 .spin { animation: client-spin .9s linear infinite; } @keyframes client-spin { to { transform: rotate(360deg); } }
 

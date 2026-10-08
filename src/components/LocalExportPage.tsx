@@ -1,10 +1,11 @@
 import { Check, Download, FileDown, LoaderCircle } from "lucide-react";
 import { useState } from "react";
 import type { ExportFormat } from "../domain/types";
-import { createLocalExport, type ExportOrder, type ServerExportResult } from "../lib/server-api";
+import { createLocalExport, ServerApiError, type ExportOrder, type ServerExportResult } from "../lib/server-api";
 import { ExportPresentationOptions } from "./ExportPresentationOptions";
 import { ExportOrderOptions } from "./ExportOrderOptions";
 import { ExportDirectoryButton } from "./ExportDirectoryButton";
+import { CustomSourceRootDialog } from "./Overlays";
 
 interface LocalExportPageProps {
   token: string;
@@ -20,14 +21,21 @@ export function LocalExportPage({ token, onCompleted, onFailed }: LocalExportPag
   const [conversationOrder, setConversationOrder] = useState<ExportOrder>("descending");
   const [messageOrder, setMessageOrder] = useState<ExportOrder>("descending");
   const [busy, setBusy] = useState(false);
+  const [customRootIssue, setCustomRootIssue] = useState<{ message: string; attemptedRoot?: string } | null>(null);
 
-  const submit = async () => {
+  const submit = async (sourceRoot?: string) => {
     if (busy) return;
     setBusy(true);
     try {
-      onCompleted(await createLocalExport(token, { format, dataRedaction, simplify, pretty, conversationOrder, messageOrder }));
+      onCompleted(await createLocalExport(token, { format, sourceRoot, dataRedaction, simplify, pretty, conversationOrder, messageOrder }));
+      setCustomRootIssue(null);
     } catch (error) {
       onFailed(error);
+      if (error instanceof ServerApiError && error.code === "LOCAL_SOURCE_NOT_FOUND") {
+        setCustomRootIssue({ message: error.message, attemptedRoot: sourceRoot });
+      } else {
+        setCustomRootIssue(null);
+      }
     } finally {
       setBusy(false);
     }
@@ -45,5 +53,6 @@ export function LocalExportPage({ token, onCompleted, onFailed }: LocalExportPag
       </div>
       <div className="local-export-actions"><p><Download size={15} />文件将保存到服务端默认导出目录，可在完成提示中直接打开。</p><button className="primary-button" type="button" disabled={busy} onClick={() => void submit()}>{busy ? <><LoaderCircle className="spin" size={17} />正在读取并导出…</> : <><Download size={17} />开始导出</>}</button></div>
     </section>
+    {customRootIssue && !busy && <CustomSourceRootDialog message={customRootIssue.message} initialRoot={customRootIssue.attemptedRoot ?? ""} onClose={() => setCustomRootIssue(null)} onRetry={(sourceRoot) => { void submit(sourceRoot); }} />}
   </main>;
 }

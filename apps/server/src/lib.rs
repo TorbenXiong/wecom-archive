@@ -193,6 +193,7 @@ type LocalCollector = Arc<
             bool,
             bool,
             Option<i64>,
+            Option<String>,
             LocalCollectionProgressReporter,
             LocalCollectionMediaSink,
         ) -> Result<ClientExportV1, String>
@@ -774,6 +775,7 @@ struct PageQuery {
 #[derive(Debug, Deserialize)]
 struct LocalCollectionQuery {
     include_media: Option<bool>,
+    source_root: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -884,6 +886,8 @@ fn parse_export_date(
 struct LocalExportRequest {
     format: ExportFormat,
     #[serde(default)]
+    source_root: Option<String>,
+    #[serde(default)]
     data_redaction: bool,
     #[serde(default)]
     simplify: bool,
@@ -982,6 +986,7 @@ where
             bool,
             bool,
             Option<i64>,
+            Option<String>,
             LocalCollectionProgressReporter,
             LocalCollectionMediaSink,
         ) -> Result<ClientExportV1, String>
@@ -3048,6 +3053,7 @@ async fn collect_local(
         (config.server_include_media, config.data_redaction)
     };
     let include_media = query.include_media.unwrap_or(configured_include_media);
+    let source_root = query.source_root;
     set_local_collection_progress(&state, true, 3, "准备采集", "正在初始化本机采集任务。");
     let progress = Arc::clone(&state.local_collection_progress);
     let reporter: LocalCollectionProgressReporter = Arc::new(move |percent, stage, detail| {
@@ -3067,14 +3073,21 @@ async fn collect_local(
                 .map_err(|_| "媒体文件写入归档失败。".to_owned())
         });
     let export = match tokio::task::spawn_blocking(move || {
-        collector(include_media, data_redaction, None, reporter, media_sink)
+        collector(
+            include_media,
+            data_redaction,
+            None,
+            source_root,
+            reporter,
+            media_sink,
+        )
     })
     .await
     {
         Ok(Ok(export)) => export,
         Ok(Err(message)) => {
             set_local_collection_progress(&state, false, 0, "采集失败", &message);
-            return Err(ApiError::local_collection_failed(message));
+            return Err(local_collection_error(message));
         }
         Err(_) => {
             let message = "本机采集进程异常结束，请重试。".to_owned();
@@ -3252,6 +3265,7 @@ async fn run_local_collection_once(
             include_media,
             data_redaction,
             since_unix_ms,
+            None,
             reporter,
             media_sink,
         )
@@ -3803,6 +3817,7 @@ async fn create_local_export(
     let export_directory = data_root.join("exports").display().to_string();
     let format = request.format;
     let data_redaction = request.data_redaction;
+    let source_root = request.source_root;
     let conversation_order_ascending = request.conversation_order.is_ascending();
     let message_order_ascending = request.message_order.is_ascending();
     let result = tokio::task::spawn_blocking(move || {
@@ -3813,8 +3828,15 @@ async fn create_local_export(
                 persist_local_media_file(&media_root, source, expected_hash, expected_size)
                     .map_err(|_| "媒体文件写入归档失败。".to_owned())
             });
-        let mut export = collector(include_media, data_redaction, None, reporter, media_sink)
-            .map_err(ApiError::local_collection_failed)?;
+        let mut export = collector(
+            include_media,
+            data_redaction,
+            None,
+            source_root,
+            reporter,
+            media_sink,
+        )
+        .map_err(local_collection_error)?;
         let export_id = export.export_id;
         let export_root = data_root.join("exports");
         std::fs::create_dir_all(&export_root).map_err(|_| ApiError::store())?;
@@ -4220,6 +4242,21 @@ struct ApiError {
     body: ErrorResponse,
 }
 
+fn is_local_source_not_found(message: &str) -> bool {
+    message == "未发现可支持的本机企业微信数据，请确认客户端已登录。"
+        || message == "这个文件夹里没找到企业微信数据库，请填企业微信实际存放聊天记录的那一层目录。"
+        || message
+            == "数据目录无效或无法访问，请填写本机磁盘上的企业微信存储目录（不能是盘符根目录）。"
+}
+
+fn local_collection_error(message: String) -> ApiError {
+    if is_local_source_not_found(&message) {
+        ApiError::local_source_not_found(message)
+    } else {
+        ApiError::local_collection_failed(message)
+    }
+}
+
 impl ApiError {
     fn forbidden() -> Self {
         Self {
@@ -4320,6 +4357,17 @@ impl ApiError {
         }
     }
 
+    fn local_source_not_found(message: String) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            body: ErrorResponse {
+                code: "LOCAL_SOURCE_NOT_FOUND",
+                message,
+                recoverable: true,
+            },
+        }
+    }
+
     fn store() -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -4388,6 +4436,26 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_source_discovery_failures_offer_a_custom_root_retry() {
+        assert!(is_local_source_not_found(
+            "未发现可支持的本机企业微信数据，请确认客户端已登录。"
+        ));
+        assert!(is_local_source_not_found(
+            "这个文件夹里没找到企业微信数据库，请填企业微信实际存放聊天记录的那一层目录。"
+        ));
+        assert!(!is_local_source_not_found("读取授权失败。"));
+        assert_eq!(
+            local_collection_error(
+                "数据目录无效或无法访问，请填写本机磁盘上的企业微信存储目录（不能是盘符根目录）。"
+                    .to_owned()
+            )
+            .body
+            .code,
+            "LOCAL_SOURCE_NOT_FOUND"
+        );
+    }
     use archive_domain::{
         ArchiveBatchV1, BATCH_SCHEMA_VERSION, CollectionScope, ConversationV1,
         EmployeeNoticeEvidence, ExternalContactConsent, LifecycleState, MESSAGE_SCHEMA_VERSION,
@@ -4853,23 +4921,32 @@ mod tests {
             "local-collection",
         ))
         .unwrap();
-        app_state.local_collector = Some(Arc::new(move |include_media, _, _, reporter, _| {
-            captured_modes.lock().unwrap().push(include_media);
-            reporter(55, "解析消息", "正在解析测试消息。");
-            Ok(export.clone())
-        }));
+        app_state.local_collector = Some(Arc::new(
+            move |include_media, _, _, source_root, reporter, _| {
+                captured_modes
+                    .lock()
+                    .unwrap()
+                    .push((include_media, source_root));
+                reporter(55, "解析消息", "正在解析测试消息。");
+                Ok(export.clone())
+            },
+        ));
 
         let _ = collect_local(
             State(app_state.clone()),
             authorized_headers(),
             Query(LocalCollectionQuery {
                 include_media: Some(true),
+                source_root: Some(r"D:\FixtureWXWork".to_owned()),
             }),
         )
         .await
         .unwrap();
 
-        assert_eq!(*selected_modes.lock().unwrap(), vec![true]);
+        assert_eq!(
+            *selected_modes.lock().unwrap(),
+            vec![(true, Some(r"D:\FixtureWXWork".to_owned()))]
+        );
         let progress = app_state.local_collection_progress.lock().unwrap().clone();
         assert!(!progress.running);
         assert_eq!(progress.percent, 100);
@@ -5285,7 +5362,10 @@ mod tests {
         enable_super_admin(&app_state);
         let bytes = export_bytes("普通消息\n第二行", Uuid::new_v4(), "fixture");
         let export: ClientExportV1 = serde_json::from_slice(&bytes).unwrap();
-        app_state.local_collector = Some(Arc::new(move |_, _, _, _, _| {
+        let selected_roots = Arc::new(Mutex::new(Vec::new()));
+        let captured_roots = Arc::clone(&selected_roots);
+        app_state.local_collector = Some(Arc::new(move |_, _, _, source_root, _, _| {
+            captured_roots.lock().unwrap().push(source_root);
             let mut snapshot = export.clone();
             snapshot.export_id = Uuid::new_v4();
             Ok(snapshot)
@@ -5300,7 +5380,10 @@ mod tests {
         for simplify in [false, true] {
             for pretty in [false, true] {
                 for local in [false, true] {
-                    let payload = json!({"scope": "entire_archive", "format": "json", "simplify": simplify, "pretty": pretty});
+                    let mut payload = json!({"scope": "entire_archive", "format": "json", "simplify": simplify, "pretty": pretty});
+                    if local {
+                        payload["sourceRoot"] = json!(r"D:\FixtureWXWork");
+                    }
                     let response = if local {
                         create_local_export(
                             State(app_state.clone()),
@@ -5346,6 +5429,10 @@ mod tests {
                 }
             }
         }
+        assert_eq!(
+            *selected_roots.lock().unwrap(),
+            vec![Some(r"D:\FixtureWXWork".to_owned()); 4]
+        );
     }
 
     #[test]
@@ -5470,6 +5557,16 @@ mod tests {
             Local::now(),
         );
         assert_eq!(after_connection.targets.len(), 2);
+        assert_eq!(
+            after_connection.targets[1].plans[0].last_run_at.as_deref(),
+            Some("2026-09-23T01:00:00Z")
+        );
+        assert_eq!(
+            after_connection.targets[1].plans[0]
+                .last_upload_at
+                .as_deref(),
+            Some("2026-09-23T01:01:00Z")
+        );
         assert_eq!(
             after_connection.targets[1].client_ip.as_deref(),
             Some("192.0.2.10")

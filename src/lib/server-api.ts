@@ -272,6 +272,7 @@ export interface ServerExportResult {
 
 export interface LocalExportRequest {
   format: "json" | "csv" | "html" | "md";
+  sourceRoot?: string;
   dataRedaction: boolean;
   simplify?: boolean;
   pretty?: boolean;
@@ -285,7 +286,7 @@ interface ServerError {
 }
 
 export class ServerApiError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly code?: string) {
     super(message);
     this.name = "ServerApiError";
   }
@@ -301,7 +302,7 @@ async function request<T>(path: string, token: string, init?: RequestInit): Prom
   });
   if (!response.ok) {
     const detail = await response.json().catch(() => ({})) as ServerError;
-    throw new ServerApiError(detail.message || `服务端请求失败（${response.status}）`, response.status);
+    throw new ServerApiError(detail.message || `服务端请求失败（${response.status}）`, response.status, detail.code);
   }
   return response.json() as Promise<T>;
 }
@@ -322,8 +323,9 @@ export function getCollectedUsers(token: string, signal?: AbortSignal): Promise<
   return request<CollectedUser[]>("/api/v1/archive/collected-users", token, { signal });
 }
 
-export function collectLocalArchive(token: string, includeMedia: boolean): Promise<ServerImportResult> {
+export function collectLocalArchive(token: string, includeMedia: boolean, sourceRoot?: string): Promise<ServerImportResult> {
   const parameters = new URLSearchParams({ include_media: String(includeMedia) });
+  if (sourceRoot) parameters.set("source_root", sourceRoot);
   return request<ServerImportResult>(`/api/v1/collections/local?${parameters}`, token, { method: "POST" });
 }
 

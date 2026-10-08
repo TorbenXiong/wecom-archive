@@ -39,6 +39,8 @@ export interface CollectorScheduleStatus {
   lastError?: string;
   lastMessageCount?: number;
   lastMediaCount?: number;
+  uploadedCount?: number;
+  nextRunAt?: string;
 }
 
 /**
