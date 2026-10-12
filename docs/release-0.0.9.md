@@ -16,7 +16,7 @@
 
 ## 杂项
 
-- 未新增第三方依赖；Cargo 锁文件仅记录已有 workspace `source-windows` 路径依赖。
+- 未新增第三方依赖；Cargo 锁文件仅同步工作区包版本和已有 `source-windows` 路径依赖。
 - 构建和依赖解析使用 `--locked --offline`，发布包为 Windows x64 单文件 EXE；当前安装包未进行 Authenticode 签名。
 - 正文包含匹配用于补足 FTS 的片段语义，大归档中的高频词搜索可能比纯索引命中更慢。
 
@@ -29,8 +29,8 @@
 
 ## 验证
 
-- `cargo test -p archive-store -p wecom-archive-server --locked --offline`：archive-store 13 项、server 30 项通过。
-- 受影响前端测试 35 项通过；前端全套单 worker 63 项通过。并发运行时有 1 项已有分页测试触及 5 秒超时，未修改测试断言或超时。
+- `cargo test --workspace --locked --offline`：123 项通过，4 项需真实数据授权的测试保持忽略。
+- `pnpm exec vitest run --maxWorkers 1`：11 个测试文件、64 项全部通过；未修改测试断言或超时。
 - TypeScript、client/server 构建、`cargo fmt --all` 和 Windows x64 Release 构建通过。
 
 ## 下载
