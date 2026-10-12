@@ -11,6 +11,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod streaming;
+pub use streaming::{ExportSource, ExportStatistics, export_streamed};
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
@@ -159,78 +162,18 @@ fn write_json(
     package: &ExportPackage,
     cancelled: &AtomicBool,
 ) -> Result<(), ExportError> {
-    let mut output = BufWriter::new(File::create(target)?);
+    let mut output = streaming::JsonStream::new(File::create(target)?, package.pretty)?;
     let names = ExportNames::new(package);
-    let conversations = selected_conversations(package);
-    for _ in &conversations {
+    for conversation in selected_conversations(package) {
         check_cancelled(cancelled)?;
+        output.begin_conversation(package, &names, conversation.conversation_id)?;
+        for message in conversation.messages {
+            check_cancelled(cancelled)?;
+            output.message(package, &names, message)?;
+        }
+        output.end_conversation(package.pretty)?;
     }
-    if package.simplify {
-        let document = GroupedJson {
-            conversations: conversations
-                .iter()
-                .map(|conversation| SimplifiedConversation {
-                    conversation: names.conversation_id(conversation.conversation_id),
-                    messages: conversation
-                        .messages
-                        .iter()
-                        .map(|message| SimplifiedMessage {
-                            sender: names.sender(message),
-                            content: message.body_text.as_deref(),
-                            media: message
-                                .media
-                                .iter()
-                                .map(|media| media.original_name.as_deref().unwrap_or("未命名附件"))
-                                .collect(),
-                            message_type: &message.message_type,
-                            sent_at: format_export_time(&message.sent_at),
-                        })
-                        .collect(),
-                })
-                .collect(),
-        };
-        write_json_document(&mut output, &document, package.pretty)?;
-    } else {
-        let document = GroupedJson {
-            conversations: conversations
-                .iter()
-                .map(|conversation| {
-                    Ok::<_, ExportError>(CompleteConversation {
-                        conversation_id: conversation.conversation_id,
-                        conversation_name: names
-                            .conversation_name(conversation.conversation_id)
-                            .unwrap_or("未命名会话"),
-                        messages: conversation
-                            .messages
-                            .iter()
-                            .map(|message| complete_message_value(message))
-                            .collect::<Result<Vec<_>, _>>()?,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        write_json_document(&mut output, &document, package.pretty)?;
-    }
-    output.flush()?;
-    Ok(())
-}
-
-#[derive(Serialize)]
-struct GroupedJson<T> {
-    conversations: Vec<T>,
-}
-
-#[derive(Serialize)]
-struct SimplifiedConversation<'a> {
-    conversation: &'a str,
-    messages: Vec<SimplifiedMessage<'a>>,
-}
-
-#[derive(Serialize)]
-struct CompleteConversation<'a> {
-    conversation_id: &'a str,
-    conversation_name: &'a str,
-    messages: Vec<serde_json::Value>,
+    output.finish(package.pretty)
 }
 
 #[derive(Serialize)]
@@ -251,20 +194,6 @@ fn complete_message_value(message: &MessageV1) -> Result<serde_json::Value, Expo
         );
     }
     Ok(value)
-}
-
-fn write_json_document<T: Serialize>(
-    output: &mut impl Write,
-    value: &T,
-    pretty: bool,
-) -> Result<(), ExportError> {
-    if pretty {
-        serde_json::to_writer_pretty(&mut *output, value)?;
-        output.write_all(b"\n")?;
-    } else {
-        serde_json::to_writer(output, value)?;
-    }
-    Ok(())
 }
 
 struct SelectedConversation<'a> {
@@ -400,8 +329,109 @@ fn write_csv(
     package: &ExportPackage,
     cancelled: &AtomicBool,
 ) -> Result<(), ExportError> {
-    let mut messages = csv_writer(target)?;
+    let mut output = csv_writer(target)?;
     let names = ExportNames::new(package);
+    csv_header(&mut output, package)?;
+    for conversation in selected_conversations(package) {
+        check_cancelled(cancelled)?;
+        for message in conversation.messages {
+            check_cancelled(cancelled)?;
+            csv_message(&mut output, package, &names, message)?;
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
+fn csv_writer(path: &Path) -> Result<csv::Writer<File>, ExportError> {
+    let mut file = File::create(path)?;
+    file.write_all(&[0xEF, 0xBB, 0xBF])?;
+    Ok(csv::WriterBuilder::new().from_writer(file))
+}
+
+fn safe_csv(value: &str) -> String {
+    if value
+        .trim_start_matches([' ', '\t', '\r', '\n'])
+        .starts_with(['=', '+', '-', '@'])
+    {
+        format!("'{value}")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn write_html(
+    target: &Path,
+    package: &ExportPackage,
+    cancelled: &AtomicBool,
+    for_print: bool,
+) -> Result<(), ExportError> {
+    let mut output = BufWriter::new(File::create(target)?);
+    let names = ExportNames::new(package);
+    let conversations = selected_conversations(package);
+    html_header(
+        &mut output,
+        package,
+        for_print,
+        conversations.iter().map(|c| c.messages.len() as u64).sum(),
+        package.media.len() as u64,
+    )?;
+    for conversation in conversations {
+        check_cancelled(cancelled)?;
+        html_conversation(&mut output, package, &names, conversation.conversation_id)?;
+        for message in conversation.messages {
+            check_cancelled(cancelled)?;
+            html_message(&mut output, package, &names, message)?;
+        }
+        output.write_all(b"</section>")?;
+    }
+    output.write_all(b"</main></body></html>")?;
+    output.flush()?;
+    Ok(())
+}
+
+fn html_document_start(title: &str, for_print: bool, pretty: bool) -> String {
+    let print_style = if for_print {
+        "@page{size:A4;margin:18mm 16mm 20mm}@media print{a{color:inherit;text-decoration:none}.message{break-inside:avoid}}"
+    } else {
+        ""
+    };
+    let style = if pretty { BASE_CSS } else { COMPACT_CSS };
+    format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>{style}{print_style}</style></head><body><main><h1>{title}</h1>"
+    )
+}
+
+fn write_markdown(
+    target: &Path,
+    package: &ExportPackage,
+    cancelled: &AtomicBool,
+) -> Result<(), ExportError> {
+    let mut output = BufWriter::new(File::create(target)?);
+    let names = ExportNames::new(package);
+    let conversations = selected_conversations(package);
+    markdown_header(
+        &mut output,
+        package,
+        conversations.iter().map(|c| c.messages.len() as u64).sum(),
+    )?;
+    for conversation in conversations {
+        check_cancelled(cancelled)?;
+        markdown_conversation(&mut output, package, &names, conversation.conversation_id)?;
+        for message in conversation.messages {
+            check_cancelled(cancelled)?;
+            markdown_message(&mut output, package, &names, message)?;
+        }
+    }
+    output.flush()?;
+    Ok(())
+}
+
+// Shared record renderers keep streamed and in-memory exports identical.
+fn csv_header(
+    messages: &mut csv::Writer<File>,
+    package: &ExportPackage,
+) -> Result<(), ExportError> {
     let headers = [
         "stable_message_id",
         "conversation_id",
@@ -445,79 +475,60 @@ fn write_csv(
         (false, true) => &pretty_headers[..],
         (false, false) => &headers[..],
     })?;
-    for conversation in selected_conversations(package) {
-        check_cancelled(cancelled)?;
-        for message in conversation.messages {
-            check_cancelled(cancelled)?;
-            let media_names = message
-                .media
-                .iter()
-                .filter_map(|media| media.original_name.as_deref())
-                .collect::<Vec<_>>()
-                .join(" | ");
-            if package.simplify {
-                messages.write_record([
-                    safe_csv(names.conversation(message)),
-                    safe_csv(names.sender(message)),
-                    safe_csv(message.body_text.as_deref().unwrap_or_default()),
-                    safe_csv(&media_names),
-                    display_message_type(message, package.pretty)?,
-                    display_time(message, package.pretty),
-                ])?;
-                continue;
-            }
-            let media_hashes = message
-                .media
-                .iter()
-                .filter_map(|media| media.content_hash.as_deref())
-                .collect::<Vec<_>>()
-                .join(" | ");
-            messages.write_record([
-                safe_csv(&message.stable_message_id),
-                safe_csv(&message.conversation_id),
-                safe_csv(message.sender_id.as_deref().unwrap_or_default()),
-                display_time(message, package.pretty),
-                enum_text(&message.direction)?,
-                display_message_type(message, package.pretty)?,
-                safe_csv(message.body_text.as_deref().unwrap_or_default()),
-                enum_text(&message.lifecycle)?,
-                safe_csv(message.quoted_message_id.as_deref().unwrap_or_default()),
-                safe_csv(&message.raw_type),
-                safe_csv(&media_names),
-                safe_csv(&media_hashes),
-            ])?;
-        }
-    }
-    messages.flush()?;
     Ok(())
 }
-
-fn csv_writer(path: &Path) -> Result<csv::Writer<File>, ExportError> {
-    let mut file = File::create(path)?;
-    file.write_all(&[0xEF, 0xBB, 0xBF])?;
-    Ok(csv::WriterBuilder::new().from_writer(file))
-}
-
-fn safe_csv(value: &str) -> String {
-    if value
-        .trim_start_matches([' ', '\t', '\r', '\n'])
-        .starts_with(['=', '+', '-', '@'])
-    {
-        format!("'{value}")
-    } else {
-        value.to_owned()
-    }
-}
-
-fn write_html(
-    target: &Path,
+fn csv_message(
+    messages: &mut csv::Writer<File>,
     package: &ExportPackage,
-    cancelled: &AtomicBool,
-    for_print: bool,
+    names: &ExportNames<'_>,
+    message: &MessageV1,
 ) -> Result<(), ExportError> {
-    let mut output = BufWriter::new(File::create(target)?);
-    let names = ExportNames::new(package);
-    let conversations = selected_conversations(package);
+    let media_names = message
+        .media
+        .iter()
+        .filter_map(|media| media.original_name.as_deref())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if package.simplify {
+        messages.write_record([
+            safe_csv(names.conversation(message)),
+            safe_csv(names.sender(message)),
+            safe_csv(message.body_text.as_deref().unwrap_or_default()),
+            safe_csv(&media_names),
+            display_message_type(message, package.pretty)?,
+            display_time(message, package.pretty),
+        ])?;
+        return Ok(());
+    }
+    let media_hashes = message
+        .media
+        .iter()
+        .filter_map(|media| media.content_hash.as_deref())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    messages.write_record([
+        safe_csv(&message.stable_message_id),
+        safe_csv(&message.conversation_id),
+        safe_csv(message.sender_id.as_deref().unwrap_or_default()),
+        display_time(message, package.pretty),
+        enum_text(&message.direction)?,
+        display_message_type(message, package.pretty)?,
+        safe_csv(message.body_text.as_deref().unwrap_or_default()),
+        enum_text(&message.lifecycle)?,
+        safe_csv(message.quoted_message_id.as_deref().unwrap_or_default()),
+        safe_csv(&message.raw_type),
+        safe_csv(&media_names),
+        safe_csv(&media_hashes),
+    ])?;
+    Ok(())
+}
+fn html_header(
+    output: &mut impl Write,
+    package: &ExportPackage,
+    for_print: bool,
+    message_count: u64,
+    media_count: u64,
+) -> Result<(), ExportError> {
     output.write_all(html_document_start("归档导出", for_print, package.pretty).as_bytes())?;
     let summary_details = if package.simplify {
         String::new()
@@ -525,160 +536,150 @@ fn write_html(
         format!(
             " · {} 位参与人 · {} 个媒体记录",
             package.participants.len(),
-            package.media.len()
+            media_count
         )
     };
     write!(
         output,
         "<section class=\"summary\"><p>{} 条消息{summary_details}</p></section>",
-        conversations
-            .iter()
-            .map(|conversation| conversation.messages.len())
-            .sum::<usize>(),
+        message_count,
     )?;
-    for conversation_group in conversations {
-        check_cancelled(cancelled)?;
-        let conversation_title = if package.simplify {
-            names
-                .conversation_id(conversation_group.conversation_id)
-                .to_owned()
-        } else if package.pretty {
-            names
-                .conversation_name(conversation_group.conversation_id)
-                .map(|name| format!("{name} ({})", conversation_group.conversation_id))
-                .unwrap_or_else(|| conversation_group.conversation_id.to_owned())
-        } else {
-            conversation_group.conversation_id.to_owned()
-        };
-        writeln!(
-            output,
-            "<section class=\"conversation\"><h2>{}</h2>",
-            html_escape(&conversation_title)
-        )?;
-        for message in conversation_group.messages {
-            check_cancelled(cancelled)?;
-            let sender = if package.simplify {
-                html_escape(names.sender(message))
-            } else if package.pretty {
-                html_escape(&format!(
-                    "{} ({})",
-                    names.sender(message),
-                    message.sender_id.as_deref().unwrap_or("系统")
-                ))
-            } else {
-                html_escape(message.sender_id.as_deref().unwrap_or("系统"))
-            };
-            let body = html_escape(message.body_text.as_deref().unwrap_or("[不支持的消息类型]"));
-            let media = message
-                .media
-                .iter()
-                .filter_map(|item| item.original_name.as_deref())
-                .map(html_escape)
-                .collect::<Vec<_>>()
-                .join(" · ");
-            write!(
-                output,
-                "<article class=\"message\"><header><time>{}</time><strong>{sender}</strong><span>{}</span></header><p>{body}</p>{}</article>",
-                html_escape(&display_time(message, package.pretty)),
-                html_escape(&display_message_type(message, package.pretty)?),
-                if media.is_empty() {
-                    String::new()
-                } else {
-                    format!("<small class=\"media\">附件：{media}</small>")
-                },
-            )?;
-        }
-        output.write_all(b"</section>")?;
-    }
-    output.write_all(b"</main></body></html>")?;
-    output.flush()?;
     Ok(())
 }
-
-fn html_document_start(title: &str, for_print: bool, pretty: bool) -> String {
-    let print_style = if for_print {
-        "@page{size:A4;margin:18mm 16mm 20mm}@media print{a{color:inherit;text-decoration:none}.message{break-inside:avoid}}"
-    } else {
-        ""
-    };
-    let style = if pretty { BASE_CSS } else { COMPACT_CSS };
-    format!(
-        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>{style}{print_style}</style></head><body><main><h1>{title}</h1>"
-    )
-}
-
-fn write_markdown(
-    target: &Path,
+fn html_conversation(
+    output: &mut impl Write,
     package: &ExportPackage,
-    cancelled: &AtomicBool,
+    names: &ExportNames<'_>,
+    conversation_id: &str,
 ) -> Result<(), ExportError> {
-    let mut output = BufWriter::new(File::create(target)?);
-    let names = ExportNames::new(package);
-    let conversations = selected_conversations(package);
+    let conversation_title = if package.simplify {
+        names.conversation_id(conversation_id).to_owned()
+    } else if package.pretty {
+        names
+            .conversation_name(conversation_id)
+            .map(|name| format!("{name} ({})", conversation_id))
+            .unwrap_or_else(|| conversation_id.to_owned())
+    } else {
+        conversation_id.to_owned()
+    };
+    writeln!(
+        output,
+        "<section class=\"conversation\"><h2>{}</h2>",
+        html_escape(&conversation_title)
+    )?;
+    Ok(())
+}
+fn html_message(
+    output: &mut impl Write,
+    package: &ExportPackage,
+    names: &ExportNames<'_>,
+    message: &MessageV1,
+) -> Result<(), ExportError> {
+    let sender = if package.simplify {
+        html_escape(names.sender(message))
+    } else if package.pretty {
+        html_escape(&format!(
+            "{} ({})",
+            names.sender(message),
+            message.sender_id.as_deref().unwrap_or("系统")
+        ))
+    } else {
+        html_escape(message.sender_id.as_deref().unwrap_or("系统"))
+    };
+    let body = html_escape(message.body_text.as_deref().unwrap_or("[不支持的消息类型]"));
+    let media = message
+        .media
+        .iter()
+        .filter_map(|item| item.original_name.as_deref())
+        .map(html_escape)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    write!(
+        output,
+        "<article class=\"message\"><header><time>{}</time><strong>{sender}</strong><span>{}</span></header><p>{body}</p>{}</article>",
+        html_escape(&display_time(message, package.pretty)),
+        html_escape(&display_message_type(message, package.pretty)?),
+        if media.is_empty() {
+            String::new()
+        } else {
+            format!("<small class=\"media\">附件：{media}</small>")
+        },
+    )?;
+    Ok(())
+}
+fn markdown_header(
+    output: &mut impl Write,
+    package: &ExportPackage,
+    message_count: u64,
+) -> Result<(), ExportError> {
     writeln!(output, "# {}\n", markdown_escape("归档导出"))?;
     writeln!(
         output,
         "导出时间：{} · 消息：{}\n",
         markdown_escape(&format_export_time(&package.generated_at)),
-        conversations
-            .iter()
-            .map(|conversation| conversation.messages.len())
-            .sum::<usize>(),
+        message_count,
     )?;
-    for conversation_group in conversations {
-        check_cancelled(cancelled)?;
-        let conversation_title = if package.simplify {
-            names
-                .conversation_id(conversation_group.conversation_id)
-                .to_owned()
-        } else if package.pretty {
-            names
-                .conversation_name(conversation_group.conversation_id)
-                .map(|name| format!("{name} ({})", conversation_group.conversation_id))
-                .unwrap_or_else(|| conversation_group.conversation_id.to_owned())
-        } else {
-            conversation_group.conversation_id.to_owned()
-        };
-        writeln!(output, "## {}\n", markdown_escape(&conversation_title))?;
-        for message in conversation_group.messages {
-            check_cancelled(cancelled)?;
-            let sender = if package.simplify {
-                names.sender(message).to_owned()
-            } else if package.pretty {
-                format!(
-                    "{} ({})",
-                    names.sender(message),
-                    message.sender_id.as_deref().unwrap_or("系统")
-                )
-            } else {
-                message.sender_id.as_deref().unwrap_or("系统").to_owned()
-            };
-            let body = message.body_text.as_deref().unwrap_or("[不支持的消息类型]");
-            writeln!(
-                output,
-                "### {} · {} · {}\n",
-                markdown_escape(&display_time(message, package.pretty)),
-                markdown_escape(&sender),
-                markdown_escape(&display_message_type(message, package.pretty)?),
-            )?;
-            for line in body.split('\n') {
-                writeln!(output, "    {}", markdown_escape(line))?;
-            }
-            let media = message
-                .media
-                .iter()
-                .filter_map(|item| item.original_name.as_deref())
-                .collect::<Vec<_>>();
-            if !media.is_empty() {
-                writeln!(output, "\n**附件**")?;
-                for name in media {
-                    writeln!(output, "- {}", markdown_escape(name))?;
-                }
-            }
-            writeln!(output)?;
+    Ok(())
+}
+fn markdown_conversation(
+    output: &mut impl Write,
+    package: &ExportPackage,
+    names: &ExportNames<'_>,
+    conversation_id: &str,
+) -> Result<(), ExportError> {
+    let conversation_title = if package.simplify {
+        names.conversation_id(conversation_id).to_owned()
+    } else if package.pretty {
+        names
+            .conversation_name(conversation_id)
+            .map(|name| format!("{name} ({})", conversation_id))
+            .unwrap_or_else(|| conversation_id.to_owned())
+    } else {
+        conversation_id.to_owned()
+    };
+    writeln!(output, "## {}\n", markdown_escape(&conversation_title))?;
+    Ok(())
+}
+fn markdown_message(
+    output: &mut impl Write,
+    package: &ExportPackage,
+    names: &ExportNames<'_>,
+    message: &MessageV1,
+) -> Result<(), ExportError> {
+    let sender = if package.simplify {
+        names.sender(message).to_owned()
+    } else if package.pretty {
+        format!(
+            "{} ({})",
+            names.sender(message),
+            message.sender_id.as_deref().unwrap_or("系统")
+        )
+    } else {
+        message.sender_id.as_deref().unwrap_or("系统").to_owned()
+    };
+    let body = message.body_text.as_deref().unwrap_or("[不支持的消息类型]");
+    writeln!(
+        output,
+        "### {} · {} · {}\n",
+        markdown_escape(&display_time(message, package.pretty)),
+        markdown_escape(&sender),
+        markdown_escape(&display_message_type(message, package.pretty)?),
+    )?;
+    for line in body.split('\n') {
+        writeln!(output, "    {}", markdown_escape(line))?;
+    }
+    let media = message
+        .media
+        .iter()
+        .filter_map(|item| item.original_name.as_deref())
+        .collect::<Vec<_>>();
+    if !media.is_empty() {
+        writeln!(output, "\n**附件**")?;
+        for name in media {
+            writeln!(output, "- {}", markdown_escape(name))?;
         }
     }
-    output.flush()?;
+    writeln!(output)?;
     Ok(())
 }
 
@@ -807,7 +808,7 @@ a{color:#1959d1}.message{padding:14px 0;border-bottom:1px solid #e5eaf2}.message
 mod tests {
     use super::*;
 
-    fn fixture(format: ExportFormat, simplify: bool, pretty: bool) -> ExportPackage {
+    pub(super) fn fixture(format: ExportFormat, simplify: bool, pretty: bool) -> ExportPackage {
         let sent_at = "2026-09-16T08:30:00Z".parse::<DateTime<Utc>>().unwrap();
         let message = MessageV1 {
             schema_version: archive_domain::MESSAGE_SCHEMA_VERSION.into(),

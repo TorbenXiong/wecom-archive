@@ -103,6 +103,63 @@ describe("global message search", () => {
     expect(onOpenLocalCollection).toHaveBeenCalledOnce();
   });
 
+  it("loads more global search results beyond the first page", async () => {
+    const firstPage = Array.from({ length: 50 }, (_, index) => ({
+      stable_message_id: `message-${index}`,
+      conversation_id: "conversation-1",
+      sender_id: "participant-1",
+      sender_name: "成员一",
+      sent_at: "2026-09-15T10:20:30Z",
+      direction: "incoming",
+      message_type: "text",
+      body_text: `搜索结果 ${index}`,
+      lifecycle: "active",
+      media: [],
+      raw_type: "text",
+      offset_in_conversation: index,
+    }));
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.searchParams.get("q") === "更换关键词") {
+        return Response.json([{ ...firstPage[0], stable_message_id: "new-search", body_text: "新关键词结果" }]);
+      }
+      return Response.json(Number(url.searchParams.get("offset")) === 50
+        ? [{ ...firstPage[0], stable_message_id: "message-50", body_text: "搜索结果 50" }]
+        : firstPage);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <ConversationList
+        token="test-token"
+        conversations={conversations}
+        selectedId="conversation-1"
+        onSelect={vi.fn()}
+        onOpenSearchResult={vi.fn()}
+        onExport={vi.fn()}
+        localCollectionAvailable={false}
+        collectingLocal={false}
+        onOpenLocalCollection={vi.fn()}
+        importing={false}
+        onImport={vi.fn()}
+      />,
+    );
+
+    fireEvent.focus(screen.getByRole("textbox", { name: "打开全局搜索" }));
+    fireEvent.click(screen.getByRole("button", { name: /全局搜索/ }));
+    fireEvent.change(screen.getByRole("textbox", { name: "全局搜索聊天记录" }), { target: { value: "搜索" } });
+    expect(await screen.findByText("搜索结果 0")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "加载更多结果" }));
+    expect(await screen.findByText("搜索结果 50")).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([input]) => new URL(String(input), "http://localhost").searchParams.get("offset") === "50")).toBe(true);
+    expect(screen.getByText("搜索结果 0")).toBeInTheDocument();
+    fireEvent.change(screen.getByRole("textbox", { name: "全局搜索聊天记录" }), { target: { value: "更换关键词" } });
+    expect(await screen.findByText("新关键词结果")).toBeInTheDocument();
+    expect(screen.queryByText("搜索结果 0")).not.toBeInTheDocument();
+    expect(screen.queryByText("搜索结果 50")).not.toBeInTheDocument();
+    const lastUrl = new URL(String(fetchMock.mock.calls.at(-1)![0]), "http://localhost");
+    expect(lastUrl.searchParams.get("offset")).toBe("0");
+  });
+
   it("keeps directory statistics visible while hiding content actions without super admin", () => {
     render(
       <ConversationList

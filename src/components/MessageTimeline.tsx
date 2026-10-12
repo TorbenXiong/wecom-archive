@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, FileText, Image, Megaphone, MoreVertical, Search, SlidersHorizontal, X } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, FileText, Image, Megaphone, MoreVertical, SlidersHorizontal, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ConversationSummary, MessageItem, ParticipantItem } from "../domain/types";
 import { getMediaObjectUrl, openMediaFile } from "../lib/server-api";
@@ -43,7 +43,6 @@ export function MessageTimeline({
   sortAscending = false,
   onSortChange,
 }: MessageTimelineProps) {
-  const [messageSearch, setMessageSearch] = useState("");
   const [selectedParticipant, setSelectedParticipant] = useState<ParticipantItem>();
   const [highlightedMessageId, setHighlightedMessageId] = useState<string>();
   const [showTopJump, setShowTopJump] = useState(false);
@@ -54,13 +53,9 @@ export function MessageTimeline({
     setPageInput(String(Math.min(pageIndex + 1, totalPages)));
   }, [pageIndex, totalPages]);
   const ordered = useMemo(() => {
-    const normalizedSearch = messageSearch.trim().toLocaleLowerCase("zh-CN");
-    const filtered = messages.filter((message) => {
-      if (message.direction === "system" && isOpaqueSystemIdentifier(message.body)) return false;
-      return !normalizedSearch || `${message.senderName} ${message.body || ""} ${message.attachment?.name || ""}`.toLocaleLowerCase("zh-CN").includes(normalizedSearch);
-    });
-    return !onSortChange && sortAscending ? [...filtered].reverse() : filtered;
-  }, [messages, messageSearch, onSortChange, sortAscending]);
+    const visible = messages.filter((message) => !(message.direction === "system" && isOpaqueSystemIdentifier(message.body)));
+    return !onSortChange && sortAscending ? [...visible].reverse() : visible;
+  }, [messages, onSortChange, sortAscending]);
   const participantsById = useMemo(() => new Map(participants.map((participant) => [participant.id, participant])), [participants]);
   const boundaryDate = ordered[0]?.sentAt ? new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(ordered[0].sentAt)) : "";
 
@@ -120,7 +115,7 @@ export function MessageTimeline({
   return (
     <section className="timeline-pane" aria-label="消息时间线">
       <header className="timeline-header">
-        <div className="timeline-heading"><h1>{conversation.title}</h1><em className="conversation-kind-badge">{conversation.isGroup ? "群会话" : "私人会话"}</em><label className="message-search"><Search size={16} /><input value={messageSearch} onChange={(event) => setMessageSearch(event.target.value)} placeholder="搜索当前会话消息…" /></label></div>
+        <div className="timeline-heading"><h1>{conversation.title}</h1><em className="conversation-kind-badge">{conversation.isGroup ? "群会话" : "私人会话"}</em></div>
         <div className="timeline-actions">
           <button type="button" onClick={() => onSortChange?.(!sortAscending)}><SlidersHorizontal size={15} />按时间{sortAscending ? "升序" : "降序"}</button>
           <button className="icon-button" type="button" aria-label="更多操作"><MoreVertical size={18} /></button>
