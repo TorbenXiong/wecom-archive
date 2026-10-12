@@ -80,6 +80,7 @@ describe("message timeline", () => {
         [...container.querySelectorAll("[data-message-id]")].map((item) => item.getAttribute("data-message-id")),
       ).toEqual(["newer-message", "older-message"]);
       expect(screen.getByRole("button", { name: "按时间降序" })).toBeInTheDocument();
+      expect(screen.queryByPlaceholderText("搜索当前会话消息…")).not.toBeInTheDocument();
 
       expect(screen.getByRole("button", { name: "到最上面" })).toBeInTheDocument();
       const jumpButton = screen.getByRole("button", { name: "到最下面" });

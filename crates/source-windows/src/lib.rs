@@ -1,6 +1,9 @@
 pub mod enterprise_crypto;
+pub mod secrets;
 mod snapshot;
 
+#[cfg(windows)]
+pub mod desktop;
 #[cfg(windows)]
 pub mod dialog;
 #[cfg(windows)]

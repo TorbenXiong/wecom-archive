@@ -41,6 +41,8 @@ crates/export/        JSON/CSV/HTML/Markdown 导出
 
 详细设计见 [`docs/architecture.md`](docs/architecture.md)，安全边界见 [`docs/privacy-security.md`](docs/privacy-security.md)，当前能力见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，验证状态见 [`docs/implementation-status.md`](docs/implementation-status.md)。
 
+合成数据性能基准见 [`docs/benchmarks.md`](docs/benchmarks.md)，使用 PowerShell 运行 `./scripts/benchmark-archive.ps1`。
+
 ## 开发
 
 工具链：Rust `1.98.1`、Node.js `>=24`、pnpm `10.30.3`。版本与来源见 [`docs/dependency-plan.md`](docs/dependency-plan.md)。

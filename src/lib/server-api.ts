@@ -378,8 +378,8 @@ export function countMessages(token: string, query: Omit<MessageQuery, "limit" |
   return request<{ total: number }>(`/api/v1/messages/count?${parameters}`, token, { signal });
 }
 
-export function searchMessages(token: string, text: string, signal?: AbortSignal, sort: "asc" | "desc" = "desc"): Promise<GlobalSearchResult[]> {
-  const parameters = new URLSearchParams({ q: text, limit: "50", sort });
+export function searchMessages(token: string, text: string, signal?: AbortSignal, sort: "asc" | "desc" = "desc", offset = 0): Promise<GlobalSearchResult[]> {
+  const parameters = new URLSearchParams({ q: text, limit: "50", offset: String(offset), sort });
   return request<GlobalSearchResult[]>(`/api/v1/search/messages?${parameters}`, token, { signal });
 }
 

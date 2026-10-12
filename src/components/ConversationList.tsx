@@ -1,5 +1,5 @@
 import { ArrowRight, Download, HardDriveDownload, LoaderCircle, MessageSquareText, Search, Upload, Users, X } from "lucide-react";
-import { useDeferredValue, useEffect, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type { ConversationSummary } from "../domain/types";
 import { searchMessages, type CollectedUser, type GlobalSearchResult } from "../lib/server-api";
 
@@ -42,9 +42,12 @@ export function ConversationList({
   const [showSearchMenu, setShowSearchMenu] = useState(false);
   const deferredSearch = useDeferredValue(search.trim());
   const [results, setResults] = useState<GlobalSearchResult[]>([]);
+  const [searchOffset, setSearchOffset] = useState(0);
+  const [hasMoreResults, setHasMoreResults] = useState(false);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [showCollectedUsers, setShowCollectedUsers] = useState(false);
+  const searchKey = useRef("");
 
   useEffect(() => {
     const openFromShortcut = (event: KeyboardEvent) => {
@@ -64,19 +67,42 @@ export function ConversationList({
   }, [superAdminEnabled]);
 
   useEffect(() => {
+    const key = `${token}\u0000${deferredSearch}\u0000${messageSortAscending ? "asc" : "desc"}`;
+    const isNewSearch = searchKey.current !== key;
+    searchKey.current = key;
     if (!superAdminEnabled || !searchOpen || !deferredSearch) {
       setResults([]);
+      setSearchOffset(0);
+      setHasMoreResults(false);
       setSearching(false);
       setSearchError("");
       return;
     }
+    if (isNewSearch && searchOffset !== 0) {
+      setResults([]);
+      setSearchOffset(0);
+      setHasMoreResults(false);
+      return;
+    }
     const controller = new AbortController();
     setSearching(true);
-    setSearchError("");
-    searchMessages(token, deferredSearch, controller.signal, messageSortAscending ? "asc" : "desc")
-      .then(setResults)
+    if (searchOffset === 0) {
+      setResults([]);
+      setHasMoreResults(false);
+      setSearchError("");
+    }
+    searchMessages(token, deferredSearch, controller.signal, messageSortAscending ? "asc" : "desc", searchOffset)
+      .then((next) => {
+        if (controller.signal.aborted) return;
+        setResults((current) => {
+          if (searchOffset === 0) return next;
+          const existing = new Set(current.map((item) => item.stable_message_id));
+          return [...current, ...next.filter((item) => !existing.has(item.stable_message_id))];
+        });
+        setHasMoreResults(next.length === 50);
+      })
       .catch((error) => {
-        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
         setResults([]);
         setSearchError(error instanceof Error ? error.message : "搜索失败");
       })
@@ -84,7 +110,7 @@ export function ConversationList({
         if (!controller.signal.aborted) setSearching(false);
       });
     return () => controller.abort();
-  }, [deferredSearch, messageSortAscending, searchOpen, superAdminEnabled, token]);
+  }, [deferredSearch, messageSortAscending, searchOffset, searchOpen, superAdminEnabled, token]);
 
   const conversationNames = useMemo(
     () => new Map(conversations.map((conversation) => [conversation.id, conversation.title])),
@@ -177,12 +203,12 @@ export function ConversationList({
           <button className={searchTab === "messages" ? "active" : undefined} type="button" onClick={() => setSearchTab("messages")}>聊天记录</button>
         </nav>
         <div className="global-search-content">
-          {!deferredSearch ? <div className="global-search-empty"><span><Search size={20} /></span><strong>搜索全部归档</strong><p>输入名称、发送人或消息内容开始搜索</p></div>
+          {!deferredSearch ? <div className="global-search-empty"><span><Search size={20} /></span><strong>搜索全部归档</strong><p>输入消息内容或附件名称开始搜索</p></div>
             : searching ? <div className="search-state"><LoaderCircle className="spin" size={18} />正在搜索…</div>
               : searchError ? <div className="search-state error">{searchError}</div>
                 : results.length === 0 ? <div className="global-search-empty"><span><Search size={20} /></span><strong>没有找到相关记录</strong><p>请尝试更换关键词</p></div>
                   : <div className="global-search-result-group">
-                    <div className="global-search-summary"><strong>聊天记录</strong><span>{results.length} 条结果</span></div>
+                    <div className="global-search-summary"><strong>聊天记录</strong><span>{results.length} 条结果{hasMoreResults ? "（可继续加载）" : ""}</span></div>
                     {results.map((result) => (
                       <button
                         className="global-search-item"
@@ -204,6 +230,7 @@ export function ConversationList({
                         </span>
                       </button>
                     ))}
+                    {hasMoreResults && <button className="global-search-load-more" type="button" disabled={searching} onClick={() => setSearchOffset((offset) => offset + 50)}>{searching ? "正在加载…" : "加载更多结果"}</button>}
                   </div>}
         </div>
         <footer className="global-search-footer"><span>↑↓ 选择</span><span>Enter 打开</span><span>Esc 关闭</span></footer>

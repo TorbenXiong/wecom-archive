@@ -12,6 +12,7 @@ archive-domain.workspace = true
 archive-export.workspace = true
 archive-store.workspace = true
 archive-transfer.workspace = true
+source-windows.workspace = true
 axum = { workspace = true, features = ["http1", "json", "tokio"] }
 chrono.workspace = true
 futures-util.workspace = true

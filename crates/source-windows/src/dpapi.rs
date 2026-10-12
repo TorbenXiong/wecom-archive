@@ -52,7 +52,7 @@ pub fn clear(path: &Path) -> Result<(), DpapiError> {
     Ok(())
 }
 
-fn protect(plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
+pub(crate) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
     let input = blob(plaintext);
     let mut output = CRYPT_INTEGER_BLOB::default();
     unsafe {
@@ -70,7 +70,7 @@ fn protect(plaintext: &[u8]) -> Result<Vec<u8>, DpapiError> {
     }
 }
 
-fn unprotect(protected: &[u8]) -> Result<Zeroizing<Vec<u8>>, DpapiError> {
+pub(crate) fn unprotect(protected: &[u8]) -> Result<Zeroizing<Vec<u8>>, DpapiError> {
     let input = blob(protected);
     let mut output = CRYPT_INTEGER_BLOB::default();
     unsafe {

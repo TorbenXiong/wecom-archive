@@ -145,6 +145,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .global-search-item-head time { flex: none; color: #7b8799; font-size: 10px; }
 .global-search-sender { color: #4674b8; font-size: 10px; }
 .global-search-snippet { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #5f6d82; font-size: 11px; }
+.global-search-load-more { width: 100%; height: 36px; margin-top: 10px; border: 1px solid #cbd9ed; border-radius: 7px; color: #316dc5; background: #f6f9ff; font-size: 11px; cursor: pointer; }
+.global-search-load-more:hover { background: #eaf2ff; }
+.global-search-load-more:disabled { opacity: .6; cursor: wait; }
 .global-search-footer { padding: 0 18px; display: flex; align-items: center; gap: 20px; color: #7a879a; border-top: 1px solid var(--line-soft); background: #fff; font-size: 9px; }
 
 .timeline-pane { min-width: 0; min-height: 0; display: grid; grid-template-rows: 66px 31px minmax(0, 1fr) 54px; background: #fff; }
@@ -268,8 +271,6 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .empty-state { height: 100%; display: grid; place-content: center; justify-items: center; gap: 18px; color: #7a8699; font-size: 13px; }
 .empty-state .primary-button { min-width: 178px; }
 .timeline-footer { display: flex; gap: 14px; align-items: center; justify-content: space-between; min-height: 56px; padding: 0 20px; border-top: 1px solid var(--line); background: #fff; }
-.message-search { height: 32px; width: min(270px, 30vw); min-width: 0; flex: 0 1 270px; display: flex; align-items: center; gap: 8px; padding: 0 10px; color: #7a8698; border: 1px solid #d4dce7; border-radius: 6px; background: #fff; }
-.message-search input { min-width: 0; width: 100%; border: 0; outline: 0; font-size: 11px; }
 .pagination { display: flex; align-items: center; gap: 9px; color: #4f5e73; font-size: 11px; white-space: nowrap; }
 .pagination button { width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid #d3dae5; border-radius: 5px; background: #fff; cursor: pointer; }
 .pagination button:disabled { color: #b3bcc9; background: #f5f7fa; }
