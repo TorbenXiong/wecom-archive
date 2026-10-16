@@ -286,6 +286,10 @@ pub(crate) async fn generate_collector(
     let key_id = config.key_id.clone();
     let now = Utc::now();
     let record = EnterpriseCollectorRecord {
+        update_capable: false,
+        software_update_request: None,
+        software_update_version: None,
+        software_update_error: None,
         collector_id: collector_id.clone(),
         key_id: key_id.clone(),
         created_at: now.to_rfc3339(),
@@ -519,6 +523,15 @@ pub(crate) async fn collector_heartbeat(
         collector.last_seen_at = Some(Utc::now().to_rfc3339());
         collector.last_client_ip = Some(client_ip.clone());
         collector.client_version = request.client_version;
+        collector.update_capable = request.update_capable;
+        collector.software_update_error = request
+            .software_update_error
+            .filter(|value| value == "UPDATE_FAILED")
+            .map(|_| "升级失败；原程序和绑定保留，可重试升级。".into());
+        if collector.software_update_version.as_deref() == collector.client_version.as_deref() {
+            collector.software_update_request = None;
+            collector.software_update_error = None;
+        }
         collector.last_applied_revision = request
             .last_applied_revision
             .unwrap_or(collector.last_applied_revision);
@@ -529,12 +542,12 @@ pub(crate) async fn collector_heartbeat(
         if let Some(last_success) = request.last_success_at {
             collector.last_upload_at = Some(last_success);
         }
-        if let Some(completed_id) = request.last_manual_collection_request_id {
-            if collector.manual_collection_request_id.as_deref() == Some(completed_id.as_str()) {
-                collector.last_manual_collection_request_id = Some(completed_id);
-                collector.manual_collection_request_id = None;
-                collector.config_revision = collector.config_revision.saturating_add(1);
-            }
+        if let Some(completed_id) = request.last_manual_collection_request_id
+            && collector.manual_collection_request_id.as_deref() == Some(completed_id.as_str())
+        {
+            collector.last_manual_collection_request_id = Some(completed_id);
+            collector.manual_collection_request_id = None;
+            collector.config_revision = collector.config_revision.saturating_add(1);
         }
         collector.clone()
     };
@@ -571,6 +584,7 @@ pub(crate) async fn collector_heartbeat(
         ),
     );
     Ok(Json(CollectorHeartbeatResponse {
+        software_update: crate::signed_software_update(&config, &snapshot)?,
         status: if snapshot.enabled {
             "ok".into()
         } else {

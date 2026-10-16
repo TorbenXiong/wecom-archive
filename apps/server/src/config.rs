@@ -165,6 +165,14 @@ pub(super) struct EnterpriseKeyRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct EnterpriseCollectorRecord {
+    #[serde(default)]
+    pub(super) update_capable: bool,
+    #[serde(default)]
+    pub(super) software_update_request: Option<String>,
+    #[serde(default)]
+    pub(super) software_update_version: Option<String>,
+    #[serde(default)]
+    pub(super) software_update_error: Option<String>,
     pub(super) collector_id: String,
     pub(super) key_id: String,
     pub(super) created_at: String,
@@ -360,13 +368,9 @@ pub(super) fn normalize_upload_url(value: &str) -> Result<String, ApiError> {
 /// cause the desktop service to bind broadly without an explicit override.
 pub(super) fn configured_private_listen_address(upload_url: &str) -> Option<SocketAddr> {
     let trimmed = upload_url.trim();
-    let authority = if let Some(value) = trimmed.strip_prefix("http://") {
-        value
-    } else if let Some(value) = trimmed.strip_prefix("https://") {
-        value
-    } else {
-        return None;
-    };
+    let authority = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))?;
     let authority = authority.split(['/', '?', '#']).next()?.trim();
     let authority = authority.rsplit('@').next()?.trim();
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {

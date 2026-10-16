@@ -65,9 +65,11 @@ cargo build --release --locked --offline --bin WeComArchive
 - 手动填写目录重试时只扫描该目录，避免默认目录中的其他账号被误选。目录须是本机磁盘上的子目录；不接受整盘根目录、网络路径或父目录跳转。目录配置缺失、损坏或失效时，自动发现仍可回退到默认目录。
 - 手动确认过的目录以当前 Windows 用户的 DPAPI 保护，保存在 exe 同级 `source-roots.dpapi`，最多保存 3 条；移动程序时需一并保留此文件，换 Windows 用户或电脑后需重新填写。
 - 工作台使用 exe 同级 `serverData/` 保存配置、归档、媒体、采集端和导出文件；采集端使用 exe 同级 `collectorData/` 保存运行配置和离线导出。
-- 本机和采集端在 `collectorData/work/<run-id>/` 处理只读快照，任务完成或失败后清理。采集端尾部携带签名绑定配置，最新有效配置以 DPAPI 保护保存在 `collectorData/instances/<collectorId>/`。
+- 工作台本机采集和快速导出在 `serverData/work/<run-id>/` 处理只读快照；配置 `WECOM_ARCHIVE_SERVER_DATA` 时使用该服务端数据目录。采集端使用 `collectorData/work/<run-id>/`，任务完成或失败后清理。仅使用工作台不会创建 `collectorData/`。采集端尾部携带签名绑定配置，最新有效配置以 DPAPI 保护保存在 `collectorData/instances/<collectorId>/`。
 
 日志默认关闭，可在“生成默认配置”和“采集端管理”中启用采集端日志；环境变量 `WECOM_ARCHIVE_COLLECTOR_LOG`、`WECOM_ARCHIVE_SERVER_LOG` 可设置启动默认值。日志按日期分文件，时间格式为 `yyyy-MM-dd HH:mm:ss.SSS`。
+
+升级说明和人工验收步骤见 [`docs/update-test-plan.md`](docs/update-test-plan.md)。工作台仅在“设置 → 关于”手动检查 HTTPS Release；采集端由管理员在“采集端管理”发起签名升级。两条路径都会校验版本、SHA-256 和 Windows x64 EXE，并保留数据与采集端绑定配置；默认不会后台联网。
 
 | 日志 | exe 同级目录 |
 | --- | --- |

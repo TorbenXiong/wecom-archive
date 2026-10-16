@@ -237,6 +237,11 @@ pub(crate) fn collection_target_response(
         })
         .collect();
     let mut targets = vec![CollectionTargetResponse {
+        update_capable: false,
+        update_available: false,
+        update_version: None,
+        update_pending: false,
+        update_error: None,
         target_id: "server".into(),
         kind: "server".into(),
         display_name: if config.organization_name.is_empty() {
@@ -296,6 +301,14 @@ pub(crate) fn collection_target_response(
             ),
         };
         targets.push(CollectionTargetResponse {
+            update_capable: collector.update_capable,
+            update_available: collector.update_capable
+                && collector.client_version.as_deref().is_some_and(|current| {
+                    archive_transfer::software_update::newer(current, env!("CARGO_PKG_VERSION"))
+                }),
+            update_version: Some(env!("CARGO_PKG_VERSION").into()),
+            update_pending: collector.software_update_request.is_some(),
+            update_error: collector.software_update_error.clone(),
             target_id: collector.collector_id.clone(),
             kind: "collector".into(),
             display_name: collector_display_name(collector),

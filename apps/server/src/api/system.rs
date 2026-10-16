@@ -20,6 +20,8 @@ pub(crate) async fn health(State(state): State<AppState>) -> Json<HealthResponse
         status: "ok",
         schema: "server-api.v1",
         network_mode: state.network_mode,
+        listen_address: state.listen_address.clone(),
+        version: env!("CARGO_PKG_VERSION"),
     })
 }
 

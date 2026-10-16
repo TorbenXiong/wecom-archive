@@ -1816,21 +1816,21 @@ fn normalize_export_timestamps(value: &mut serde_json::Value, for_output: bool) 
     match value {
         serde_json::Value::Object(object) => {
             for (key, child) in object.iter_mut() {
-                if EXPORT_TIMESTAMP_FIELDS.contains(&key.as_str()) {
-                    if let serde_json::Value::String(text) = child {
-                        if for_output {
-                            if let Ok(parsed) = DateTime::parse_from_rfc3339(text) {
-                                *text = parsed
-                                    .with_timezone(&Utc)
-                                    .format("%Y-%m-%d %H:%M:%S")
-                                    .to_string();
-                            }
-                        } else if let Ok(parsed) =
-                            NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
-                        {
-                            *text = DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc)
-                                .to_rfc3339();
+                if EXPORT_TIMESTAMP_FIELDS.contains(&key.as_str())
+                    && let serde_json::Value::String(text) = child
+                {
+                    if for_output {
+                        if let Ok(parsed) = DateTime::parse_from_rfc3339(text) {
+                            *text = parsed
+                                .with_timezone(&Utc)
+                                .format("%Y-%m-%d %H:%M:%S")
+                                .to_string();
                         }
+                    } else if let Ok(parsed) =
+                        NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+                    {
+                        *text =
+                            DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc).to_rfc3339();
                     }
                 }
                 normalize_export_timestamps(child, for_output);
@@ -2554,3 +2554,4 @@ mod tests {
         assert!(!directory.path().join("export.txt.partial").exists());
     }
 }
+pub mod software_update;

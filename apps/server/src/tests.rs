@@ -1,5 +1,6 @@
 use archive_domain::ClientExportV1;
 use archive_export::{ExportFormat, ExportScope};
+use archive_store::ArchiveStore;
 use archive_transfer::read_json;
 use axum::Json;
 use axum::body::Body;
@@ -108,6 +109,8 @@ fn state(directory: &TestDirectory) -> AppState {
         local_collection_running: Arc::new(AtomicBool::new(false)),
         archive_update: watch::channel(0).0,
         network_mode: "loopback_only",
+        listen_address: "127.0.0.1:9812".into(),
+        export_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }
 }
 
@@ -122,6 +125,183 @@ fn authorized_headers() -> HeaderMap {
 
 fn enable_super_admin(state: &AppState) {
     state.enterprise_config.lock().unwrap().super_admin_enabled = true;
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn background_export_confirms_cleanup_and_cannot_cancel_a_completed_file() {
+    let directory = TestDirectory::new();
+    let app_state = state(&directory);
+    let data: ClientExportV1 =
+        serde_json::from_slice(&export_bytes("合成导出测试", Uuid::new_v4(), "synthetic")).unwrap();
+    let mut store = ArchiveStore::open(&app_state.archive_path).unwrap();
+    store.ingest_batch(&data.batches[0]).unwrap();
+    drop(store);
+    let export_request = || {
+        serde_json::from_value::<ExportRequest>(
+            json!({ "scope": "entire_archive", "format": "json" }),
+        )
+        .unwrap()
+    };
+    // Queue behind a writer, request cancellation, and ensure we only acknowledge
+    // cleanup after the worker exits. Uses synthetic data and the actual handlers.
+    let guard = EXPORT_FILE_LOCK.lock().unwrap();
+    let started = start_export_job(
+        State(app_state.clone()),
+        authorized_headers(),
+        Json(export_request()),
+    )
+    .await
+    .unwrap()
+    .0;
+    let cancelling = cancel_export(
+        State(app_state.clone()),
+        authorized_headers(),
+        AxumPath(started.task_id.clone()),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(cancelling.status, "cancelling");
+    drop(guard);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let progress = export_status(
+            State(app_state.clone()),
+            authorized_headers(),
+            AxumPath(started.task_id.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        if progress.status == "cancelled" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "synthetic cancellation deadline exceeded"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!directory.0.join("exports").exists());
+    let completed = start_export_job(
+        State(app_state.clone()),
+        authorized_headers(),
+        Json(export_request()),
+    )
+    .await
+    .unwrap()
+    .0;
+    let response = loop {
+        let progress = export_status(
+            State(app_state.clone()),
+            authorized_headers(),
+            AxumPath(completed.task_id.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        if progress.status == "completed" {
+            break progress.result.unwrap();
+        }
+        assert_ne!(progress.status, "failed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "synthetic export deadline exceeded"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(response.message_count, 1);
+    let after_cancel = cancel_export(
+        State(app_state.clone()),
+        authorized_headers(),
+        AxumPath(completed.task_id),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(after_cancel.status, "completed");
+    assert!(
+        directory
+            .0
+            .join("exports")
+            .join(response.file_name)
+            .is_file()
+    );
+    assert!(
+        std::fs::read_dir(directory.0.join("exports"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".partial"))
+    );
+}
+
+#[tokio::test]
+async fn lightweight_search_combines_filters_and_locates_the_selected_message() {
+    let directory = TestDirectory::new();
+    let app_state = state(&directory);
+    let data: ClientExportV1 =
+        serde_json::from_slice(&export_bytes("项目合成记录", Uuid::new_v4(), "synthetic")).unwrap();
+    let mut store = ArchiveStore::open(&app_state.archive_path).unwrap();
+    store.ingest_batch(&data.batches[0]).unwrap();
+    drop(store);
+    for text in ["项目", ""] {
+        let response = search_messages(
+            State(app_state.clone()),
+            authorized_headers(),
+            Query(GlobalSearchQuery {
+                q: text.into(),
+                locate: Some(false),
+                conversation_id: Some("conversation-fixture".into()),
+                participant_id: Some("participant-fixture".into()),
+                message_type: Some("text".into()),
+                starts_at: Some("2026-01-01T00:00:00Z".into()),
+                ends_at: Some("2026-01-03T00:00:00Z".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].offset_in_conversation, None);
+        assert!(
+            serde_json::to_value(&response[0])
+                .unwrap()
+                .get("offset_in_conversation")
+                .is_none()
+        );
+    }
+    let position = message_position(
+        State(app_state.clone()),
+        authorized_headers(),
+        AxumPath("stable-message-1".into()),
+        Query(PositionQuery {
+            sort: Some("desc".into()),
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    let serialized = serde_json::to_value(position).unwrap();
+    assert_eq!(serialized["conversation_id"], "conversation-fixture");
+    assert_eq!(serialized["offset_in_conversation"], 0);
+    let invalid = search_messages(
+        State(app_state.clone()),
+        authorized_headers(),
+        Query(GlobalSearchQuery {
+            q: "项目".into(),
+            starts_at: Some("2026-01-03T00:00:00Z".into()),
+            ends_at: Some("2026-01-01T00:00:00Z".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -503,6 +683,7 @@ async fn global_search_pages_cjk_matches_and_keeps_message_locations() {
                     limit: Some(50),
                     offset: Some(offset),
                     sort: Some(if ascending { "asc" } else { "desc" }.into()),
+                    ..Default::default()
                 }),
             )
             .await
@@ -510,7 +691,7 @@ async fn global_search_pages_cjk_matches_and_keeps_message_locations() {
             .0;
             assert_eq!(response.len(), if offset == 0 { 50 } else { 5 });
             for (index, result) in response.into_iter().enumerate() {
-                assert_eq!(result.offset_in_conversation, offset + index as u64);
+                assert_eq!(result.offset_in_conversation, Some(offset + index as u64));
                 ids.push(result.message.message.stable_message_id);
             }
         }
@@ -1467,6 +1648,8 @@ async fn generated_collector_heartbeat_update_and_revoke_flow() {
         ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42310))),
         device_headers(&device_token),
         Json(CollectorHeartbeatRequest {
+            update_capable: false,
+            software_update_error: None,
             client_version: Some("1.2.4".into()),
             current_config_revision: Some(0),
             last_applied_revision: Some(0),
@@ -1535,6 +1718,8 @@ async fn generated_collector_heartbeat_update_and_revoke_flow() {
         ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42311))),
         device_headers(&device_token),
         Json(CollectorHeartbeatRequest {
+            update_capable: false,
+            software_update_error: None,
             client_version: Some("1.2.4".into()),
             current_config_revision: Some(1),
             last_applied_revision: Some(1),
@@ -1608,6 +1793,8 @@ async fn generated_collector_heartbeat_update_and_revoke_flow() {
         ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42312))),
         device_headers(&device_token),
         Json(CollectorHeartbeatRequest {
+            update_capable: false,
+            software_update_error: None,
             client_version: Some("0.0.5".into()),
             current_config_revision: Some(3),
             last_applied_revision: Some(3),
@@ -1635,6 +1822,8 @@ async fn generated_collector_heartbeat_update_and_revoke_flow() {
         ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42313))),
         device_headers(&device_token),
         Json(CollectorHeartbeatRequest {
+            update_capable: false,
+            software_update_error: None,
             client_version: Some("0.0.5".into()),
             current_config_revision: Some(4),
             last_applied_revision: Some(4),
@@ -1670,6 +1859,8 @@ async fn generated_collector_heartbeat_update_and_revoke_flow() {
         ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42314))),
         device_headers(&device_token),
         Json(CollectorHeartbeatRequest {
+            update_capable: false,
+            software_update_error: None,
             client_version: None,
             current_config_revision: Some(3),
             last_applied_revision: Some(3),
@@ -1713,6 +1904,8 @@ async fn new_collector_replaces_online_collector_on_same_device() {
         ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42310))),
         device_headers(&first_token),
         Json(CollectorHeartbeatRequest {
+            update_capable: false,
+            software_update_error: None,
             client_version: Some("1.2.4".into()),
             current_config_revision: Some(0),
             last_applied_revision: Some(0),
@@ -1734,6 +1927,8 @@ async fn new_collector_replaces_online_collector_on_same_device() {
         ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42311))),
         device_headers(&first_token),
         Json(CollectorHeartbeatRequest {
+            update_capable: false,
+            software_update_error: None,
             client_version: Some("1.2.4".into()),
             current_config_revision: Some(1),
             last_applied_revision: Some(1),
@@ -1761,6 +1956,8 @@ async fn new_collector_replaces_online_collector_on_same_device() {
         ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42312))),
         device_headers(&second_token),
         Json(CollectorHeartbeatRequest {
+            update_capable: false,
+            software_update_error: None,
             client_version: Some("1.2.4".into()),
             current_config_revision: Some(1),
             last_applied_revision: Some(0),

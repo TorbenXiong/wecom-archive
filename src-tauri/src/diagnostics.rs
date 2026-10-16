@@ -125,6 +125,11 @@ fn current_level() -> LogLevel {
 }
 
 fn configured_level() -> LogLevel {
+    // Only the collector entry point initializes this logger. Shared collection
+    // code in the workspace must not create collector logs, even with the env set.
+    if LOG_LEVEL.get().is_none() {
+        return LogLevel::Off;
+    }
     CONFIGURED_LEVEL
         .get()
         .and_then(|level| level.lock().ok().map(|level| *level))
@@ -171,6 +176,12 @@ struct LogFile {
 #[cfg(test)]
 mod tests {
     use super::{LogLevel, parse_log_level};
+
+    #[test]
+    fn collector_logging_stays_off_before_collector_initialization() {
+        assert!(super::LOG_LEVEL.get().is_none());
+        assert!(super::configured_level() == LogLevel::Off);
+    }
 
     #[test]
     fn collector_logging_is_off_without_an_explicit_enable_value() {

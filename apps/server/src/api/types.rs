@@ -137,6 +137,11 @@ pub(crate) struct CollectionTargetsResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CollectionTargetResponse {
+    pub(crate) update_capable: bool,
+    pub(crate) update_available: bool,
+    pub(crate) update_version: Option<String>,
+    pub(crate) update_pending: bool,
+    pub(crate) update_error: Option<String>,
     pub(crate) target_id: String,
     pub(crate) kind: String,
     pub(crate) display_name: String,
@@ -210,6 +215,10 @@ pub(crate) struct CollectorControlEnvelopeResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CollectorHeartbeatRequest {
+    #[serde(default)]
+    pub(crate) update_capable: bool,
+    #[serde(default)]
+    pub(crate) software_update_error: Option<String>,
     pub(crate) client_version: Option<String>,
     pub(crate) current_config_revision: Option<u64>,
     pub(crate) last_applied_revision: Option<u64>,
@@ -232,6 +241,7 @@ pub(crate) struct CollectorDiagnosticEvent {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CollectorHeartbeatResponse {
+    pub(crate) software_update: Option<archive_transfer::software_update::SignedSoftwareUpdate>,
     pub(crate) status: String,
     pub(crate) config: Option<CollectorDesiredConfigResponse>,
     pub(crate) control: Option<CollectorControlEnvelopeResponse>,
@@ -303,6 +313,8 @@ pub(crate) struct HealthResponse {
     pub(crate) status: &'static str,
     pub(crate) schema: &'static str,
     pub(crate) network_mode: &'static str,
+    pub(crate) listen_address: String,
+    pub(crate) version: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -373,11 +385,23 @@ pub(crate) struct MessagesQuery {
     pub(crate) sort: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub(crate) struct GlobalSearchQuery {
     pub(crate) q: String,
     pub(crate) limit: Option<u32>,
     pub(crate) offset: Option<u64>,
+    pub(crate) sort: Option<String>,
+    pub(crate) conversation_id: Option<String>,
+    pub(crate) participant_id: Option<String>,
+    pub(crate) message_type: Option<String>,
+    pub(crate) media_only: Option<bool>,
+    pub(crate) starts_at: Option<String>,
+    pub(crate) ends_at: Option<String>,
+    pub(crate) locate: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PositionQuery {
     pub(crate) sort: Option<String>,
 }
 
@@ -395,6 +419,13 @@ pub(crate) struct GlobalSearchResponse {
     #[serde(flatten)]
     pub(crate) message: MessageResponse,
     pub(crate) conversation_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) offset_in_conversation: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct MessagePositionResponse {
+    pub(crate) conversation_id: String,
     pub(crate) offset_in_conversation: u64,
 }
 
@@ -492,9 +523,13 @@ impl ExportOrder {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExportResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) status: Option<String>,
     pub(crate) export_id: String,
     pub(crate) file_name: String,
     pub(crate) directory: String,
@@ -502,6 +537,13 @@ pub(crate) struct ExportResponse {
     pub(crate) media_count: u64,
     pub(crate) missing_media_count: u64,
     pub(crate) manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExportStartResponse {
+    pub(crate) task_id: String,
+    pub(crate) status: String,
 }
 
 pub(crate) fn parse_message_type(value: &str) -> Result<MessageType, ApiError> {

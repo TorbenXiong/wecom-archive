@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConversationSummary } from "../domain/types";
 import { ConversationList } from "./ConversationList";
@@ -22,6 +22,29 @@ afterEach(() => {
 });
 
 describe("global message search", () => {
+  it("selects a sender by name, validates dates and keeps the dialog open after failed positioning", async () => {
+    const result = { stable_message_id: "synthetic-result", conversation_id: "conversation-1", sender_name: "测试成员", sent_at: "2026-10-13T00:00:00Z", message_type: "text", body_text: "合成搜索结果", media: [] };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => String(input).includes("/participants")
+      ? Response.json([{ participant_id: "synthetic-person", display_name: "测试成员" }]) : Response.json([result]));
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ConversationList token="test-token" conversations={conversations} selectedId="conversation-1" onSelect={vi.fn()} onOpenSearchResult={async () => { throw new Error("原消息暂时无法定位"); }} onExport={vi.fn()} localCollectionAvailable={false} collectingLocal={false} onOpenLocalCollection={vi.fn()} importing={false} onImport={vi.fn()} />);
+    fireEvent.focus(screen.getByLabelText("打开全局搜索")); fireEvent.click(screen.getByRole("button", { name: /全局搜索/ }));
+    expect(screen.getByLabelText("筛选发送人")).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("筛选会话"), { target: { value: "conversation-1" } });
+    await screen.findByRole("option", { name: "测试成员" });
+    fireEvent.change(screen.getByLabelText("筛选发送人"), { target: { value: "synthetic-person" } });
+    await screen.findByText("合成搜索结果");
+    await waitFor(() => expect(fetchMock.mock.calls.some(([input]) => new URL(String(input), "http://localhost").searchParams.get("participant_id") === "synthetic-person")).toBe(true));
+    fireEvent.click(screen.getByText("合成搜索结果"));
+    expect(await screen.findByText("原消息暂时无法定位")).toBeVisible();
+    expect(screen.getByRole("dialog", { name: "全局搜索" })).toBeVisible();
+    fireEvent.change(screen.getByLabelText("搜索开始日期"), { target: { value: "2026-10-14" } });
+    fireEvent.change(screen.getByLabelText("搜索结束日期"), { target: { value: "2026-10-13" } });
+    expect(await screen.findByText("开始日期不能晚于结束日期。")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "重置筛选" }));
+    expect(screen.getByLabelText("筛选会话")).toHaveValue("");
+    expect(screen.getByLabelText("搜索开始日期")).toHaveValue("");
+  });
   it("searches the complete archive and opens a selected message result", async () => {
     const result = {
       stable_message_id: "message-42",
@@ -73,7 +96,7 @@ describe("global message search", () => {
     expect(onOpenSearchResult).toHaveBeenCalledWith(expect.objectContaining({
       stable_message_id: "message-42",
       offset_in_conversation: 401,
-    }));
+    }), expect.any(AbortSignal));
     expect(screen.queryByText("需要定位的记录")).not.toBeInTheDocument();
     const footer = container.querySelector(".conversation-footer");
     expect(footer).toHaveTextContent("共 1 个会话");

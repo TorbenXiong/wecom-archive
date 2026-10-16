@@ -31,9 +31,14 @@ pub struct ArchiveExportSource<'a> {
 }
 
 impl<'a> ArchiveExportSource<'a> {
-    pub fn new(
+    pub fn new(store: &'a ArchiveStore, options: ArchiveExportOptions) -> Result<Self, StoreError> {
+        Self::new_cancellable(store, options, &std::sync::atomic::AtomicBool::new(false))
+    }
+
+    pub fn new_cancellable(
         store: &'a ArchiveStore,
         mut options: ArchiveExportOptions,
+        cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<Self, StoreError> {
         // Selected IDs override a single-conversation query consistently in
         // both the metadata scan and legacy-projection compatibility path.
@@ -64,6 +69,9 @@ impl<'a> ArchiveExportSource<'a> {
             store.visit_messages_with_projection::<StoreError>(
                 &query,
                 |message, projected_conversation, projected_time| {
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(StoreError::Invalid("EXPORT_CANCELLED".into()));
+                    }
                     let key = (message.sent_at, message.stable_message_id.clone());
                     if let Some(previous) =
                         previous_keys.insert(message.conversation_id.clone(), key.clone())
@@ -112,6 +120,9 @@ impl<'a> ArchiveExportSource<'a> {
         let mut directory = BTreeMap::new();
         let mut conversation_names = BTreeMap::new();
         for id in all_conversations {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(StoreError::Invalid("EXPORT_CANCELLED".into()));
+            }
             if let Some(name) = store.conversation_display_name(&id)? {
                 conversation_names.insert(id.clone(), name);
             }

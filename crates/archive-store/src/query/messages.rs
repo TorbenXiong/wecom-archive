@@ -147,6 +147,27 @@ impl ArchiveStore {
     }
 
     pub fn count_messages(&self, query: &MessageQuery) -> Result<u64, StoreError> {
+        if let Some(id) = &query.conversation_id
+            && query.participant_id.is_none()
+            && query
+                .text
+                .as_deref()
+                .is_none_or(|text| text.trim().is_empty())
+            && query.starts_at.is_none()
+            && query.ends_at.is_none()
+            && query.message_type.is_none()
+            && !query.media_only
+        {
+            let has_stats: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'archive_conversation_stats')",
+                [], |row| row.get(0))?;
+            if has_stats {
+                let count: Option<i64> = self.connection.query_row(
+                    "SELECT message_count FROM archive_conversation_stats WHERE conversation_id = ?1",
+                    [id], |row| row.get(0)).optional()?;
+                return Ok(count.unwrap_or(0).max(0) as u64);
+            }
+        }
         let (predicate, values) = message_predicate(query)?;
         let sql = format!("SELECT count(*) FROM messages m WHERE {predicate}");
         let count = self

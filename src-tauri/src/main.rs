@@ -5,7 +5,37 @@ use std::time::Duration;
 
 use libsqlite3_sys as _;
 
+#[tauri::command]
+async fn check_for_update() -> Result<Option<wecom_archive_desktop::UpdateInfo>, String> {
+    tauri::async_runtime::spawn_blocking(wecom_archive_desktop::check_for_update)
+        .await
+        .map_err(|_| "检查更新任务失败。")?
+}
+
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle, version: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || wecom_archive_desktop::install_update(&version))
+        .await
+        .map_err(|_| "升级任务失败。")??;
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        app.exit(0);
+    });
+    Ok(())
+}
+
 fn main() {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    if arguments.get(1).is_some_and(|a| a == "--apply-update") {
+        let result = arguments
+            .get(2)
+            .ok_or_else(|| "升级授权缺失。".to_owned())
+            .and_then(|token| wecom_archive_desktop::run_update_helper(token));
+        if let Err(message) = result {
+            exit_with_error(&message);
+        }
+        return;
+    }
     if std::env::args().any(|argument| argument == "--key-probe") {
         std::process::exit(wecom_archive_desktop::run_key_probe());
     }
@@ -55,9 +85,14 @@ fn main() {
                 }
                 app_handle.exit(0);
             });
+            wecom_archive_desktop::acknowledge_startup();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![exit_workspace])
+        .invoke_handler(tauri::generate_handler![
+            exit_workspace,
+            check_for_update,
+            install_update,
+        ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|_| exit_with_error("桌面工作台初始化失败。"))
         .run(move |_app, event| {

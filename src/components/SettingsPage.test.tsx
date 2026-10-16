@@ -10,6 +10,7 @@ afterEach(() => {
 it("persists the super admin switch immediately", async () => {
   const onChange = vi.fn();
   const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+    if (!init?.method) return Response.json({ status: "ok", schema: "server-api.v1", networkMode: "loopback_only", listenAddress: "127.0.0.1:9812", version: "0.0.9" });
     expect(init?.method).toBe("PUT");
     expect(JSON.parse(String(init?.body))).toEqual({ enabled: true });
     return Response.json({ superAdminEnabled: true });

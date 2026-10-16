@@ -12,6 +12,14 @@ export interface ArchiveUpdate {
   revision: number;
 }
 
+export interface ServerHealth {
+  status: string;
+  schema: string;
+  networkMode: "loopback_only" | "configured_remote" | string;
+  listenAddress: string;
+  version: string;
+}
+
 export interface ServerConversation {
   conversation_id: string;
   display_name?: string;
@@ -59,7 +67,16 @@ export interface ServerMessage {
 
 export interface GlobalSearchResult extends ServerMessage {
   conversation_name?: string;
-  offset_in_conversation: number;
+  offset_in_conversation?: number;
+}
+
+export interface GlobalSearchFilters {
+  conversationId?: string;
+  participantId?: string;
+  messageType?: MessageType;
+  mediaOnly?: boolean;
+  startsAt?: string;
+  endsAt?: string;
 }
 
 export interface ServerParticipant {
@@ -150,6 +167,11 @@ export interface CollectionPlan {
 }
 
 export interface CollectionTarget {
+  updateCapable?: boolean;
+  updateAvailable?: boolean;
+  updateVersion?: string;
+  updatePending?: boolean;
+  updateError?: string;
   targetId: string;
   kind: CollectionTargetKind;
   displayName: string;
@@ -171,6 +193,10 @@ export interface CollectionTarget {
 
 export interface CollectionTargetsResponse {
   targets: CollectionTarget[];
+}
+
+export function requestCollectorUpdate(token: string, collectorId: string): Promise<{ status: string; version: string }> {
+  return request(`/api/v1/collectors/${encodeURIComponent(collectorId)}/software-update`, token, { method: "POST" });
 }
 
 export interface CollectorDesiredConfig {
@@ -261,6 +287,8 @@ export interface ServerExportRequest {
 export type ExportOrder = "ascending" | "descending";
 
 export interface ServerExportResult {
+  taskId?: string;
+  status?: string;
   exportId: string;
   fileName: string;
   directory: string;
@@ -268,6 +296,17 @@ export interface ServerExportResult {
   mediaCount: number;
   missingMediaCount: number;
   manifestSha256: string;
+}
+
+export interface ExportTaskProgress {
+  status: "queued" | "running" | "cancelling" | "completed" | "cancelled" | "failed" | string;
+  percent: number;
+  stage: string;
+  result?: ServerExportResult;
+  error?: string;
+  errorCode?: string;
+  processedMessages?: number;
+  totalMessages?: number;
 }
 
 export interface LocalExportRequest {
@@ -309,6 +348,13 @@ async function request<T>(path: string, token: string, init?: RequestInit): Prom
 
 export function getArchiveSummary(token: string): Promise<ServerArchiveSummary> {
   return request<ServerArchiveSummary>("/api/v1/archive/summary", token);
+}
+
+export function getServerHealth(signal?: AbortSignal): Promise<ServerHealth> {
+  return fetch("/api/v1/health", { signal }).then(async (response) => {
+    if (!response.ok) throw new Error("无法读取服务端状态。");
+    return await response.json() as ServerHealth;
+  });
 }
 
 export function waitForArchiveUpdate(token: string, since: number, signal: AbortSignal): Promise<ArchiveUpdate> {
@@ -378,9 +424,19 @@ export function countMessages(token: string, query: Omit<MessageQuery, "limit" |
   return request<{ total: number }>(`/api/v1/messages/count?${parameters}`, token, { signal });
 }
 
-export function searchMessages(token: string, text: string, signal?: AbortSignal, sort: "asc" | "desc" = "desc", offset = 0): Promise<GlobalSearchResult[]> {
-  const parameters = new URLSearchParams({ q: text, limit: "50", offset: String(offset), sort });
+export function searchMessages(token: string, text: string, signal?: AbortSignal, sort: "asc" | "desc" = "desc", offset = 0, filters: GlobalSearchFilters = {}): Promise<GlobalSearchResult[]> {
+  const parameters = new URLSearchParams({ q: text, limit: "50", offset: String(offset), sort, locate: "false" });
+  if (filters.conversationId) parameters.set("conversation_id", filters.conversationId);
+  if (filters.participantId) parameters.set("participant_id", filters.participantId);
+  if (filters.messageType) parameters.set("message_type", filters.messageType);
+  if (filters.mediaOnly) parameters.set("media_only", "true");
+  if (filters.startsAt) parameters.set("starts_at", filters.startsAt);
+  if (filters.endsAt) parameters.set("ends_at", filters.endsAt);
   return request<GlobalSearchResult[]>(`/api/v1/search/messages?${parameters}`, token, { signal });
+}
+
+export function getMessagePosition(token: string, stableMessageId: string, sort: "asc" | "desc" = "desc", signal?: AbortSignal): Promise<{ conversation_id: string; offset_in_conversation: number }> {
+  return request<{ conversation_id: string; offset_in_conversation: number }>(`/api/v1/messages/${encodeURIComponent(stableMessageId)}/position?sort=${sort}`, token, { signal });
 }
 
 export async function importClientJson(file: File, token: string): Promise<ServerImportResult> {
@@ -528,12 +584,41 @@ export function openMediaFile(token: string, contentHash: string, name: string):
   return request<{ opened: boolean }>(`/api/v1/media/${encodeURIComponent(contentHash)}/open?${parameters}`, token, { method: "POST" });
 }
 
-export function createServerExport(token: string, exportRequest: ServerExportRequest): Promise<ServerExportResult> {
-  return request<ServerExportResult>("/api/v1/exports", token, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(exportRequest),
-  });
+export async function createServerExport(token: string, exportRequest: ServerExportRequest, signal?: AbortSignal, onProgress?: (progress: ExportTaskProgress) => void): Promise<ServerExportResult> {
+  signal?.throwIfAborted();
+  let started: { taskId: string };
+  try {
+    started = await request<{ taskId: string }>("/api/v1/exports/start", token, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(exportRequest), signal: AbortSignal.timeout(30000),
+    });
+  } catch (error) {
+    if (error instanceof ServerApiError && error.status === 404) return request<ServerExportResult>("/api/v1/exports", token, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(exportRequest), signal,
+    });
+    throw error;
+  }
+  let cancelSent = false;
+  try {
+    while (true) {
+      if (signal?.aborted && !cancelSent) {
+        const cancelling = await cancelServerExport(token, started.taskId);
+        onProgress?.(cancelling);
+        cancelSent = true;
+      }
+      const progress = await request<ExportTaskProgress>(`/api/v1/exports/${encodeURIComponent(started.taskId)}`, token, { signal: AbortSignal.timeout(30000) });
+      onProgress?.(progress);
+      if (progress.status === "completed" && progress.result) return progress.result;
+      if (progress.status === "cancelled") throw new ServerApiError("导出已取消，未完成文件已清理。", 409, "EXPORT_CANCELLED");
+      if (progress.status === "failed") throw new ServerApiError(progress.error || "服务端导出失败。", 500, progress.errorCode);
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
+    }
+  } catch (error) {
+    throw error;
+  }
+}
+
+export function cancelServerExport(token: string, taskId: string): Promise<ExportTaskProgress> {
+  return request<ExportTaskProgress>(`/api/v1/exports/${encodeURIComponent(taskId)}/cancel`, token, { method: "POST", signal: AbortSignal.timeout(30000) });
 }
 
 export function createLocalExport(token: string, payload: LocalExportRequest): Promise<ServerExportResult> {

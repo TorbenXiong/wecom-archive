@@ -1,8 +1,8 @@
 use crate::{
     ApiError, AppState, ArchiveSummaryResponse, ArchiveUpdateQuery, ArchiveUpdateResponse,
-    GlobalSearchQuery, GlobalSearchResponse, MessageCountResponse, MessageResponse, MessagesQuery,
-    PageQuery, QuotedMessageResponse, authorize, parse_message_type, parse_sort_ascending,
-    require_super_admin,
+    GlobalSearchQuery, GlobalSearchResponse, MessageCountResponse, MessagePositionResponse,
+    MessageResponse, MessagesQuery, PageQuery, PositionQuery, QuotedMessageResponse, authorize,
+    parse_message_type, parse_sort_ascending, require_super_admin,
 };
 use archive_store::ArchiveStore;
 use archive_store::MessageQuery;
@@ -214,28 +214,65 @@ pub(crate) async fn search_messages(
     authorize(&headers, &state.token_sha256)?;
     require_super_admin(&state)?;
     let search_text = query.q.trim().to_owned();
-    if search_text.is_empty() || search_text.chars().count() > 200 {
+    let has_filters = query
+        .conversation_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+        || query
+            .participant_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+        || query.message_type.is_some()
+        || query.media_only.unwrap_or(false)
+        || query.starts_at.is_some()
+        || query.ends_at.is_some();
+    if (search_text.is_empty() && !has_filters) || search_text.chars().count() > 200 {
         return Err(ApiError::invalid_query());
     }
     let sort_ascending = parse_sort_ascending(query.sort.as_deref())?;
+    let message_type = query
+        .message_type
+        .as_deref()
+        .map(parse_message_type)
+        .transpose()?;
+    let parse_time =
+        |value: Option<&str>| -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {
+            value
+                .map(|value| {
+                    chrono::DateTime::parse_from_rfc3339(value)
+                        .map(|time| time.with_timezone(&chrono::Utc))
+                        .map_err(|_| ApiError::invalid_query())
+                })
+                .transpose()
+        };
+    let starts_at = parse_time(query.starts_at.as_deref())?;
+    let ends_at = parse_time(query.ends_at.as_deref())?;
+    if starts_at
+        .zip(ends_at)
+        .is_some_and(|(start, end)| start > end)
+    {
+        return Err(ApiError::invalid_query());
+    }
+    let locate = query.locate.unwrap_or(true);
     let archive_path = Arc::clone(&state.archive_path);
     let results = tokio::task::spawn_blocking(move || {
         let store = ArchiveStore::open_read_only(&archive_path).map_err(|_| ApiError::store())?;
         let messages = store
             .query_messages(&MessageQuery {
-                conversation_id: None,
-                participant_id: None,
+                conversation_id: query.conversation_id,
+                participant_id: query.participant_id,
                 text: Some(search_text),
-                starts_at: None,
-                ends_at: None,
-                message_type: None,
-                media_only: false,
+                starts_at,
+                ends_at,
+                message_type,
+                media_only: query.media_only.unwrap_or(false),
                 limit: query.limit.unwrap_or(50).clamp(1, 100),
                 offset: query.offset.unwrap_or(0),
                 sort_ascending,
             })
             .map_err(|_| ApiError::store())?;
         let mut participant_cache = std::collections::BTreeMap::new();
+        let mut conversation_cache = std::collections::BTreeMap::<String, Option<String>>::new();
         let mut results = Vec::with_capacity(messages.len());
         for message in messages {
             if !participant_cache.contains_key(&message.conversation_id) {
@@ -273,23 +310,36 @@ pub(crate) async fn search_messages(
                     body_text: quoted.body_text,
                     message_type: quoted.message_type,
                 });
-            let conversation_name = store
-                .conversation_display_name(&message.conversation_id)
-                .map_err(|_| ApiError::store())?
-                .or_else(|| {
-                    message.conversation_id.starts_with("S:").then(|| {
-                        participants
-                            .values()
-                            .filter_map(|item| item.display_name.clone())
-                            .collect::<Vec<_>>()
-                            .join("、")
-                    })
-                })
-                .filter(|name| !name.is_empty());
-            let offset_in_conversation = store
-                .message_offset_in_conversation(&message.stable_message_id, sort_ascending)
-                .map_err(|_| ApiError::store())?
-                .unwrap_or(0);
+            let conversation_name =
+                if let Some(name) = conversation_cache.get(&message.conversation_id) {
+                    name.clone()
+                } else {
+                    let name = store
+                        .conversation_display_name(&message.conversation_id)
+                        .map_err(|_| ApiError::store())?
+                        .or_else(|| {
+                            message.conversation_id.starts_with("S:").then(|| {
+                                participants
+                                    .values()
+                                    .filter_map(|item| item.display_name.clone())
+                                    .collect::<Vec<_>>()
+                                    .join("、")
+                            })
+                        })
+                        .filter(|name| !name.is_empty());
+                    conversation_cache.insert(message.conversation_id.clone(), name.clone());
+                    name
+                };
+            let offset_in_conversation = if locate {
+                Some(
+                    store
+                        .message_offset_in_conversation(&message.stable_message_id, sort_ascending)
+                        .map_err(|_| ApiError::store())?
+                        .unwrap_or(0),
+                )
+            } else {
+                None
+            };
             results.push(GlobalSearchResponse {
                 conversation_name,
                 offset_in_conversation,
@@ -306,6 +356,36 @@ pub(crate) async fn search_messages(
     .await
     .map_err(|_| ApiError::store())??;
     Ok(Json(results))
+}
+
+pub(crate) async fn message_position(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(stable_message_id): AxumPath<String>,
+    Query(query): Query<PositionQuery>,
+) -> Result<Json<MessagePositionResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    require_super_admin(&state)?;
+    let sort_ascending = parse_sort_ascending(query.sort.as_deref())?;
+    let archive_path = Arc::clone(&state.archive_path);
+    let response = tokio::task::spawn_blocking(move || {
+        let store = ArchiveStore::open_read_only(&archive_path).map_err(|_| ApiError::store())?;
+        let message = store
+            .get_message(&stable_message_id)
+            .map_err(|_| ApiError::store())?
+            .ok_or_else(ApiError::invalid_query)?;
+        let offset = store
+            .message_offset_in_conversation(&message.stable_message_id, sort_ascending)
+            .map_err(|_| ApiError::store())?
+            .unwrap_or(0);
+        Ok::<_, ApiError>(MessagePositionResponse {
+            conversation_id: message.conversation_id,
+            offset_in_conversation: offset,
+        })
+    })
+    .await
+    .map_err(|_| ApiError::store())??;
+    Ok(Json(response))
 }
 
 pub(crate) async fn list_conversation_participants(
