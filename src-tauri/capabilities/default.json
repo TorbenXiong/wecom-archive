@@ -7,6 +7,18 @@
   },
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "allow-exit-workspace",
+    "allow-check-for-update",
+    "allow-install-update",
+    "allow-bootstrap",
+    "allow-sync-collector-config",
+    "allow-get-collector-schedule-status",
+    "allow-hide-collector-window",
+    "allow-discover-sources",
+    "allow-collect-source",
+    "allow-upload-latest-enterprise",
+    "allow-export-latest-enterprise",
+    "allow-open-offline-export-directory"
   ]
 }

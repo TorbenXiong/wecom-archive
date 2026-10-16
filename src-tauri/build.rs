@@ -1,3 +1,18 @@
+const APP_COMMANDS: &[&str] = &[
+    "exit_workspace",
+    "check_for_update",
+    "install_update",
+    "bootstrap",
+    "sync_collector_config",
+    "get_collector_schedule_status",
+    "hide_collector_window",
+    "discover_sources",
+    "collect_source",
+    "upload_latest_enterprise",
+    "export_latest_enterprise",
+    "open_offline_export_directory",
+];
+
 fn main() {
     let frontend_dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -7,7 +22,11 @@ fn main() {
     if frontend_dist.is_dir() {
         watch_frontend_files(&frontend_dist);
     }
-    tauri_build::build();
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(APP_COMMANDS)),
+    )
+    .expect("failed to build Tauri application metadata");
     // Cargo test executables lack Tauri's application resources. The linker
     // generates a sidecar manifest so Wry can load Common Controls v6 in tests.
     // Keep it external to avoid duplicating the application's embedded manifest.
