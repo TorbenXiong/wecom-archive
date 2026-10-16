@@ -15,7 +15,7 @@ cargo build --release --locked --offline --bin WeComArchive
 
 本次结果：Rust 工作区测试全部通过（真实企业微信授权测试按设计忽略），前端 11 个测试文件、67 项通过，TypeScript、前端构建和 Release 构建通过。
 
-单文件启动验收使用全新临时目录复制 `WeComArchive-0.0.9.exe`：
+单文件启动验收使用全新临时目录复制 `WeComArchive.exe`（源码基线版本为 `0.0.9`）：
 
 1. 设置临时监听端口并启动 EXE。
 2. 请求 `/api/v1/health`，确认返回 `status=ok` 和 `version=0.0.9`。
