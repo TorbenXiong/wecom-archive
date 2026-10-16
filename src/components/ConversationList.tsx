@@ -1,7 +1,7 @@
 import { ArrowRight, Download, HardDriveDownload, LoaderCircle, MessageSquareText, Search, Upload, Users, X } from "lucide-react";
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { ConversationSummary } from "../domain/types";
-import { searchMessages, type CollectedUser, type GlobalSearchResult } from "../lib/server-api";
+import type { ConversationSummary, MessageType } from "../domain/types";
+import { listConversationParticipants, searchMessages, type CollectedUser, type GlobalSearchResult, type ServerParticipant } from "../lib/server-api";
 
 interface ConversationListProps {
   token: string;
@@ -11,7 +11,7 @@ interface ConversationListProps {
   superAdminEnabled?: boolean;
   collectedUsers?: CollectedUser[];
   onSelect: (id: string) => void;
-  onOpenSearchResult: (result: GlobalSearchResult) => void;
+  onOpenSearchResult: (result: GlobalSearchResult, signal?: AbortSignal) => void | Promise<void>;
   onExport: () => void;
   localCollectionAvailable: boolean;
   collectingLocal: boolean;
@@ -38,7 +38,6 @@ export function ConversationList({
 }: ConversationListProps) {
   const [search, setSearch] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
-  const [searchTab, setSearchTab] = useState<"all" | "messages">("all");
   const [showSearchMenu, setShowSearchMenu] = useState(false);
   const deferredSearch = useDeferredValue(search.trim());
   const [results, setResults] = useState<GlobalSearchResult[]>([]);
@@ -46,8 +45,35 @@ export function ConversationList({
   const [hasMoreResults, setHasMoreResults] = useState(false);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
+  const [searchConversation, setSearchConversation] = useState("");
+  const [searchParticipant, setSearchParticipant] = useState("");
+  const [searchType, setSearchType] = useState<MessageType | "">("");
+  const [searchMediaOnly, setSearchMediaOnly] = useState(false);
+  const [searchStartsAt, setSearchStartsAt] = useState("");
+  const [searchEndsAt, setSearchEndsAt] = useState("");
+  const [searchParticipants, setSearchParticipants] = useState<ServerParticipant[]>([]);
+  const [participantError, setParticipantError] = useState("");
+  const [locatingId, setLocatingId] = useState<string>();
+  const [locateError, setLocateError] = useState("");
+  const [retryVersion, setRetryVersion] = useState(0);
   const [showCollectedUsers, setShowCollectedUsers] = useState(false);
   const searchKey = useRef("");
+  const locateController = useRef<AbortController | undefined>(undefined);
+  const hasFilters = Boolean(searchConversation || searchParticipant || searchType || searchMediaOnly || searchStartsAt || searchEndsAt);
+  const hasCriteria = Boolean(deferredSearch || hasFilters);
+
+  useEffect(() => {
+    setSearchParticipants([]);
+    setParticipantError("");
+    if (!searchOpen || !searchConversation) return;
+    const controller = new AbortController();
+    void listConversationParticipants(token, searchConversation, controller.signal).then((rows) => {
+      if (!controller.signal.aborted) setSearchParticipants(rows);
+    }).catch(() => {
+      if (!controller.signal.aborted) setParticipantError("发送人列表读取失败，请重新选择会话。");
+    });
+    return () => controller.abort();
+  }, [searchConversation, searchOpen, token]);
 
   useEffect(() => {
     const openFromShortcut = (event: KeyboardEvent) => {
@@ -57,6 +83,7 @@ export function ConversationList({
         setSearchOpen(true);
       }
       if (event.key === "Escape") {
+        locateController.current?.abort();
         setSearchOpen(false);
         setShowSearchMenu(false);
         setSearch("");
@@ -67,15 +94,20 @@ export function ConversationList({
   }, [superAdminEnabled]);
 
   useEffect(() => {
-    const key = `${token}\u0000${deferredSearch}\u0000${messageSortAscending ? "asc" : "desc"}`;
+    const key = `${token}\u0000${deferredSearch}\u0000${messageSortAscending ? "asc" : "desc"}\u0000${searchConversation}\u0000${searchParticipant}\u0000${searchType}\u0000${searchMediaOnly}\u0000${searchStartsAt}\u0000${searchEndsAt}`;
     const isNewSearch = searchKey.current !== key;
     searchKey.current = key;
-    if (!superAdminEnabled || !searchOpen || !deferredSearch) {
+    if (!superAdminEnabled || !searchOpen || !hasCriteria) {
       setResults([]);
       setSearchOffset(0);
       setHasMoreResults(false);
       setSearching(false);
       setSearchError("");
+      return;
+    }
+    if (searchStartsAt && searchEndsAt && searchStartsAt > searchEndsAt) {
+      setResults([]); setHasMoreResults(false); setSearching(false);
+      setSearchError("开始日期不能晚于结束日期。");
       return;
     }
     if (isNewSearch && searchOffset !== 0) {
@@ -91,7 +123,14 @@ export function ConversationList({
       setHasMoreResults(false);
       setSearchError("");
     }
-    searchMessages(token, deferredSearch, controller.signal, messageSortAscending ? "asc" : "desc", searchOffset)
+    const timer = window.setTimeout(() => { void searchMessages(token, deferredSearch, controller.signal, messageSortAscending ? "asc" : "desc", searchOffset, {
+      conversationId: searchConversation || undefined,
+      participantId: searchParticipant.trim() || undefined,
+      messageType: searchType || undefined,
+      mediaOnly: searchMediaOnly,
+      startsAt: searchStartsAt ? localDateBoundary(searchStartsAt, false) : undefined,
+      endsAt: searchEndsAt ? localDateBoundary(searchEndsAt, true) : undefined,
+    })
       .then((next) => {
         if (controller.signal.aborted) return;
         setResults((current) => {
@@ -103,24 +142,47 @@ export function ConversationList({
       })
       .catch((error) => {
         if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
-        setResults([]);
         setSearchError(error instanceof Error ? error.message : "搜索失败");
       })
       .finally(() => {
         if (!controller.signal.aborted) setSearching(false);
-      });
-    return () => controller.abort();
-  }, [deferredSearch, messageSortAscending, searchOffset, searchOpen, superAdminEnabled, token]);
+      }); }, searchOffset === 0 ? 180 : 0);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [deferredSearch, hasCriteria, messageSortAscending, retryVersion, searchConversation, searchEndsAt, searchMediaOnly, searchOffset, searchOpen, searchParticipant, searchStartsAt, searchType, superAdminEnabled, token]);
 
   const conversationNames = useMemo(
     () => new Map(conversations.map((conversation) => [conversation.id, conversation.title])),
     [conversations],
   );
   const closeSearch = () => {
+    locateController.current?.abort();
     setSearchOpen(false);
     setShowSearchMenu(false);
     setSearch("");
+    setLocateError(""); setLocatingId(undefined);
   };
+  const resetFilters = () => {
+    setSearchConversation(""); setSearchParticipant(""); setSearchType("");
+    setSearchMediaOnly(false); setSearchStartsAt(""); setSearchEndsAt(""); setSearchOffset(0);
+  };
+  const openResult = (result: GlobalSearchResult) => {
+    if (locatingId) return;
+    setLocateError("");
+    try {
+      const controller = new AbortController();
+      locateController.current = controller;
+      const opened = onOpenSearchResult(result, controller.signal);
+      if (opened instanceof Promise) {
+        setLocatingId(result.stable_message_id);
+        const timer = window.setTimeout(() => controller.abort(), 30000);
+        void opened.then(() => { if (!controller.signal.aborted) closeSearch(); }).catch((error) => {
+          if (controller.signal.aborted) setLocateError("定位请求已中止，请重试。");
+          else setLocateError(error instanceof Error ? error.message : "无法定位消息，请重试。");
+        }).finally(() => { window.clearTimeout(timer); setLocatingId(undefined); });
+      } else closeSearch();
+    } catch (error) { setLocateError(error instanceof Error ? error.message : "无法定位消息，请重试。"); }
+  };
+  useEffect(() => () => locateController.current?.abort(), []);
   const updateSearch = (value: string) => {
     setSearch(value);
     setShowSearchMenu(false);
@@ -198,14 +260,31 @@ export function ConversationList({
           </label>
           <button className="global-search-close" type="button" aria-label="关闭全局搜索" onClick={closeSearch}><X size={20} /></button>
         </header>
-        <nav className="global-search-tabs" aria-label="搜索类别">
-          <button className={searchTab === "all" ? "active" : undefined} type="button" onClick={() => setSearchTab("all")}>全部</button>
-          <button className={searchTab === "messages" ? "active" : undefined} type="button" onClick={() => setSearchTab("messages")}>聊天记录</button>
-        </nav>
+        <div className="global-search-filters" aria-label="搜索筛选">
+          <label className="global-search-filter">会话<select aria-label="筛选会话" value={searchConversation} onChange={(event) => { setSearchConversation(event.target.value); setSearchParticipant(""); setSearchOffset(0); }}>
+            <option value="">全部会话</option>
+            {conversations.map((conversation) => <option key={conversation.id} value={conversation.id}>{conversation.title}</option>)}
+          </select></label>
+          <label className="global-search-filter">发送人<select aria-label="筛选发送人" value={searchParticipant} disabled={!searchConversation || searchParticipants.length === 0} onChange={(event) => { setSearchParticipant(event.target.value); setSearchOffset(0); }}>
+            <option value="">{!searchConversation ? "先选择会话" : "全部发送人"}</option>
+            {searchParticipants.map((participant, index) => <option key={participant.participant_id} value={participant.participant_id}>{participant.display_name?.trim() || `成员 ${index + 1}`}</option>)}
+          </select></label>
+          <label className="global-search-filter">消息类型<select aria-label="筛选消息类型" value={searchType} onChange={(event) => { setSearchType(event.target.value as MessageType | ""); setSearchOffset(0); }}>
+            <option value="">全部类型</option><option value="text">文本</option><option value="image">图片</option><option value="file">文件</option><option value="audio">语音</option><option value="video">视频</option><option value="link">链接</option><option value="reply">引用</option><option value="system">系统</option><option value="unsupported">暂不支持</option>
+          </select></label>
+          <div className="global-search-filter date-filter"><span>日期范围</span><div className="global-search-date-range">
+            <input aria-label="搜索开始日期" type="date" value={searchStartsAt} onChange={(event) => { setSearchStartsAt(event.target.value); setSearchOffset(0); }} /><span>至</span>
+            <input aria-label="搜索结束日期" type="date" value={searchEndsAt} onChange={(event) => { setSearchEndsAt(event.target.value); setSearchOffset(0); }} />
+          </div></div>
+          <div className="global-search-filter-actions"><label><input type="checkbox" checked={searchMediaOnly} onChange={(event) => { setSearchMediaOnly(event.target.checked); setSearchOffset(0); }} />仅含附件</label><button type="button" className="global-search-reset" disabled={!hasFilters} onClick={resetFilters}>重置筛选</button></div>
+        </div>
         <div className="global-search-content">
-          {!deferredSearch ? <div className="global-search-empty"><span><Search size={20} /></span><strong>搜索全部归档</strong><p>输入消息内容或附件名称开始搜索</p></div>
-            : searching ? <div className="search-state"><LoaderCircle className="spin" size={18} />正在搜索…</div>
-              : searchError ? <div className="search-state error">{searchError}</div>
+          {participantError && <div className="global-search-feedback error" role="alert">{participantError}</div>}
+          {locatingId && <div className="global-search-feedback" role="status"><LoaderCircle className="spin" size={16} />正在定位原消息…</div>}
+          {locateError && <div className="global-search-feedback error" role="alert">{locateError}</div>}
+          {!hasCriteria ? <div className="global-search-empty"><span><Search size={20} /></span><strong>搜索全部归档</strong><p>输入消息内容、附件名称，或选择筛选条件</p></div>
+            : searching && results.length === 0 ? <div className="search-state" role="status"><LoaderCircle className="spin" size={18} />正在搜索…</div>
+              : searchError && results.length === 0 ? <div className="global-search-feedback error" role="alert">{searchError}<button type="button" onClick={() => setRetryVersion((value) => value + 1)}>重试</button></div>
                 : results.length === 0 ? <div className="global-search-empty"><span><Search size={20} /></span><strong>没有找到相关记录</strong><p>请尝试更换关键词</p></div>
                   : <div className="global-search-result-group">
                     <div className="global-search-summary"><strong>聊天记录</strong><span>{results.length} 条结果{hasMoreResults ? "（可继续加载）" : ""}</span></div>
@@ -214,10 +293,8 @@ export function ConversationList({
                         className="global-search-item"
                         key={result.stable_message_id}
                         type="button"
-                        onClick={() => {
-                          onOpenSearchResult(result);
-                          closeSearch();
-                        }}
+                        disabled={Boolean(locatingId)}
+                        onClick={() => openResult(result)}
                       >
                         <span className="global-search-record-icon"><MessageSquareText size={17} /></span>
                         <span className="global-search-record-copy">
@@ -230,10 +307,11 @@ export function ConversationList({
                         </span>
                       </button>
                     ))}
+                    {searchError && <div className="global-search-feedback error" role="alert">{searchError}<button type="button" onClick={() => setRetryVersion((value) => value + 1)}>重试</button></div>}
                     {hasMoreResults && <button className="global-search-load-more" type="button" disabled={searching} onClick={() => setSearchOffset((offset) => offset + 50)}>{searching ? "正在加载…" : "加载更多结果"}</button>}
                   </div>}
         </div>
-        <footer className="global-search-footer"><span>↑↓ 选择</span><span>Enter 打开</span><span>Esc 关闭</span></footer>
+        <footer className="global-search-footer"><span>点击结果查看原消息</span><span>Tab 选择 · Enter 打开</span><span>Esc 关闭</span></footer>
       </section>}
       {showCollectedUsers && <section className="collected-users-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowCollectedUsers(false); }}>
         <div className="collected-users-dialog" role="dialog" aria-modal="true" aria-label="已收集用户">
@@ -244,6 +322,14 @@ export function ConversationList({
     </aside>
   );
 }
+
+function localDateBoundary(value: string, end: boolean): string {
+  const [year, month, day] = value.split("-").map(Number);
+  const date = end ? new Date(year, month - 1, day + 1) : new Date(year, month - 1, day);
+  if (end) date.setTime(date.getTime() - 1);
+  return date.toISOString();
+}
+
 
 function formatFullDateTime(value: string): string {
   const date = new Date(value);

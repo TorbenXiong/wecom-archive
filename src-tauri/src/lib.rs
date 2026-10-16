@@ -25,8 +25,21 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Emitter, Manager, State};
 use zeroize::{Zeroize, Zeroizing};
 
+mod collector_update;
 mod diagnostics;
 mod sqlite3mc;
+mod update;
+pub use update::UpdateInfo;
+
+pub fn check_for_update() -> Result<Option<update::UpdateInfo>, String> {
+    update::check()
+}
+
+pub fn install_update(version: &str) -> Result<(), String> {
+    update::install(version)
+}
+
+pub use update::{acknowledge_startup, run_helper as run_update_helper};
 
 const LOCAL_NOTICE_VERSION: &str = "client-notice.v1";
 const LOCAL_NOTICE_TEXT: &str = "加密传输本机企业微信聊天记录到服务端";
@@ -70,7 +83,15 @@ fn legacy_collector_runtime_config_path() -> Result<PathBuf, CommandError> {
 }
 
 fn collector_work_root(prefix: &str) -> Result<PathBuf, CommandError> {
-    let root = collector_data_root()?
+    create_work_root(&collector_data_root()?, prefix)
+}
+
+fn local_data_root(executable_directory: &Path, configured: Option<PathBuf>) -> PathBuf {
+    configured.unwrap_or_else(|| executable_directory.join("serverData"))
+}
+
+fn create_work_root(data_root: &Path, prefix: &str) -> Result<PathBuf, CommandError> {
+    let root = data_root
         .join("work")
         .join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).map_err(|_| internal_error())?;
@@ -438,6 +459,9 @@ struct OfflineExportResult {
 
 #[derive(Clone, Default)]
 struct AppState {
+    pending_update: Arc<Mutex<Option<archive_transfer::software_update::SignedSoftwareUpdate>>>,
+    update_attempt: Arc<Mutex<Option<String>>>,
+    software_update_error: Arc<Mutex<Option<String>>>,
     discovered_sources: Arc<Mutex<BTreeMap<String, SourceCandidate>>>,
     latest_export: Arc<Mutex<Option<ClientExportV1>>>,
     collection_running: Arc<AtomicBool>,
@@ -645,7 +669,7 @@ async fn collect_source(
             .databases
             .iter()
             .any(|database| database.encrypted);
-        let key = resolve_collection_key(&candidate, encrypted)?;
+        let key = resolve_collection_key(&candidate, encrypted, &collector_data_root()?)?;
         let root = collector_work_root("manual")?;
         let result = collect_candidate_with_options(
             candidate,
@@ -680,7 +704,7 @@ impl Drop for CollectionRunGuard {
 
 /// Collects the currently signed-in local WeCom profile for the embedded
 /// enterprise server. The snapshot and key-probe files only live under the
-/// system temporary directory and are removed before returning.
+/// server data directory and are removed before returning.
 pub fn collect_local_export(
     include_media: bool,
     data_redaction: bool,
@@ -751,12 +775,20 @@ fn collect_local_export_internal(
         });
     }
     progress(15, "读取授权", "已发现数据源，正在准备只读访问。");
-    let temporary_root = collector_work_root("local").map_err(|error| error.message)?;
+    let executable = std::env::current_exe().map_err(|_| internal_error().message)?;
+    let data_root = local_data_root(
+        executable
+            .parent()
+            .ok_or_else(|| internal_error().message)?,
+        std::env::var_os("WECOM_ARCHIVE_SERVER_DATA").map(PathBuf::from),
+    );
+    let temporary_root = create_work_root(&data_root, "local").map_err(|error| error.message)?;
     let result = (|| {
         let (candidate, key) = choose_collectable_source(candidates, &mut |source| {
             resolve_collection_key(
                 source,
                 source.databases.iter().any(|database| database.encrypted),
+                &data_root,
             )
         })?;
         progress(25, "创建快照", "正在只读复制数据库及一致性文件。");
@@ -1358,7 +1390,7 @@ fn sync_collector_config_with_status(
         0
     };
     let pending_diagnostics = diagnostics::take_events();
-    let body = serde_json::to_vec(&serde_json::json!({ "clientVersion": env!("CARGO_PKG_VERSION"), "currentConfigRevision": current_revision, "lastAppliedRevision": current.config_revision, "lastRunAt": status.as_ref().and_then(|value| value.last_attempt_at.clone()), "lastSuccessAt": status.as_ref().and_then(|value| value.last_success_at.clone()), "lastError": status.as_ref().and_then(|value| value.last_error.clone()), "lastManualCollectionRequestId": status.as_ref().and_then(|value| value.last_manual_collection_request_id.clone()), "diagnostics": pending_diagnostics.iter().map(|event| CollectorDiagnosticEvent { timestamp: event.timestamp, event: event.event.clone(), details: event.details.clone() }).collect::<Vec<_>>() })).map_err(|_| internal_error())?;
+    let body = serde_json::to_vec(&serde_json::json!({ "updateCapable": true, "softwareUpdateError": app_state.and_then(|state| state.software_update_error.lock().ok().and_then(|value| value.clone())), "clientVersion": env!("CARGO_PKG_VERSION"), "currentConfigRevision": current_revision, "lastAppliedRevision": current.config_revision, "lastRunAt": status.as_ref().and_then(|value| value.last_attempt_at.clone()), "lastSuccessAt": status.as_ref().and_then(|value| value.last_success_at.clone()), "lastError": status.as_ref().and_then(|value| value.last_error.clone()), "lastManualCollectionRequestId": status.as_ref().and_then(|value| value.last_manual_collection_request_id.clone()), "diagnostics": pending_diagnostics.iter().map(|event| CollectorDiagnosticEvent { timestamp: event.timestamp, event: event.event.clone(), details: event.details.clone() }).collect::<Vec<_>>() })).map_err(|_| internal_error())?;
     let mut child = Command::new("curl.exe")
         .args([
             "--fail-with-body",
@@ -1421,6 +1453,9 @@ fn sync_collector_config_with_status(
     }
     let response: serde_json::Value =
         serde_json::from_slice(&output.stdout).map_err(|_| internal_error())?;
+    if let (Some(value), Some(state)) = (response.get("softwareUpdate"), app_state) {
+        collector_update::receive(value, &current, state);
+    }
     let Some(control) = response.get("control") else {
         diagnostics::write("heartbeat_ok", "control=none");
         return Ok(());
@@ -1669,11 +1704,12 @@ fn store_candidates(
 fn resolve_collection_key(
     candidate: &SourceCandidate,
     encrypted: bool,
+    data_root: &Path,
 ) -> Result<Option<SourceKey>, CommandError> {
     if !encrypted {
         return Ok(None);
     }
-    let candidates = run_isolated_key_probe(candidate)?;
+    let candidates = run_isolated_key_probe(candidate, data_root)?;
     for key in candidates {
         if key_opens_candidate(candidate, &key) {
             return Ok(Some(key));
@@ -1751,14 +1787,17 @@ fn open_source_database(
 }
 
 #[cfg(windows)]
-fn run_isolated_key_probe(candidate: &SourceCandidate) -> Result<Vec<SourceKey>, CommandError> {
+fn run_isolated_key_probe(
+    candidate: &SourceCandidate,
+    data_root: &Path,
+) -> Result<Vec<SourceKey>, CommandError> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let token = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
     );
-    let validation_page_prefix_hex = validation_page_prefix(candidate);
+    let validation_page_prefix_hex = validation_page_prefix(candidate, data_root);
     let request = source_windows::probe::ProbeRequest {
         authorization_token: token.clone(),
         max_candidates: 640,
@@ -1852,7 +1891,7 @@ fn run_isolated_key_probe(candidate: &SourceCandidate) -> Result<Vec<SourceKey>,
 }
 
 #[cfg(windows)]
-fn validation_page_prefix(candidate: &SourceCandidate) -> Option<String> {
+fn validation_page_prefix(candidate: &SourceCandidate, data_root: &Path) -> Option<String> {
     let message_path = candidate
         .databases
         .iter()
@@ -1865,25 +1904,30 @@ fn validation_page_prefix(candidate: &SourceCandidate) -> Option<String> {
     {
         return Some(hex::encode(page_prefix));
     }
-    let work_root = collector_work_root("probe").ok()?;
-    let receipt = WindowsSourceAdapter
-        .snapshot(candidate, work_root.clone())
-        .ok()?;
-    let copied = receipt.copied_files.iter().find(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("message.db"))
-    })?;
-    let result = File::open(copied)
-        .and_then(|mut file| file.read_exact(&mut page_prefix))
-        .ok()
-        .map(|_| hex::encode(page_prefix));
-    cleanup_snapshot(&work_root, &receipt.snapshot_root);
+    let work_root = create_work_root(data_root, "probe").ok()?;
+    let result = (|| {
+        let receipt = WindowsSourceAdapter
+            .snapshot(candidate, work_root.clone())
+            .ok()?;
+        let copied = receipt.copied_files.iter().find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("message.db"))
+        })?;
+        File::open(copied)
+            .and_then(|mut file| file.read_exact(&mut page_prefix))
+            .ok()
+            .map(|_| hex::encode(page_prefix))
+    })();
+    let _ = fs::remove_dir_all(&work_root);
     result
 }
 
 #[cfg(not(windows))]
-fn run_isolated_key_probe() -> Result<Vec<SourceKey>, CommandError> {
+fn run_isolated_key_probe(
+    _candidate: &SourceCandidate,
+    _data_root: &Path,
+) -> Result<Vec<SourceKey>, CommandError> {
     Err(probe_error(
         "KEY_PROBE_UNAVAILABLE",
         "当前平台不支持 Windows 密钥探针。",
@@ -3630,6 +3674,7 @@ pub fn run() {
                 .name("wecom-archive-collector-scheduler".into())
                 .spawn(move || collector_scheduler(scheduler_state))
                 .map_err(|_| "无法创建采集端后台任务。")?;
+            update::acknowledge_startup();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3790,6 +3835,10 @@ fn collector_scheduler(state: AppState) {
             Ok(config) => config,
             Err(_) => continue,
         };
+        collector_update::run_pending(&state, &latest);
+        if state.scheduler_shutdown.load(Ordering::Acquire) {
+            return;
+        }
         if state
             .schedule_status
             .lock()
@@ -4004,6 +4053,7 @@ fn scheduled_collect_and_upload(
         resolve_collection_key(
             source,
             source.databases.iter().any(|database| database.encrypted),
+            &collector_data_root()?,
         )
     })?;
     let root = collector_work_root("scheduled")?;
@@ -4243,6 +4293,61 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn local_work_uses_server_data_without_creating_collector_data() {
+        let directory = TestDirectory::new();
+        let data_root = local_data_root(&directory.0, None);
+        assert_eq!(data_root, directory.0.join("serverData"));
+        assert!(!data_root.exists());
+        let work = create_work_root(&data_root, "local").unwrap();
+        assert_eq!(work.parent(), Some(data_root.join("work").as_path()));
+        assert!(work.is_dir());
+        assert!(!directory.0.join("collectorData").exists());
+    }
+
+    #[test]
+    fn local_work_respects_the_configured_server_data_directory() {
+        let directory = TestDirectory::new();
+        let configured = directory.0.join("custom-server-data");
+        let data_root = local_data_root(&directory.0, Some(configured.clone()));
+        let work = create_work_root(&data_root, "local").unwrap();
+        assert!(work.starts_with(configured.join("work")));
+        assert!(!directory.0.join("serverData").exists());
+        assert!(!directory.0.join("collectorData").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_probe_cleans_up_failed_snapshots_in_server_data() {
+        let directory = TestDirectory::new();
+        let data_root = local_data_root(&directory.0, None);
+        let candidate = SourceCandidate {
+            source_id: "synthetic-source".into(),
+            display_path: "synthetic-source".into(),
+            root_path: directory.0.clone(),
+            databases: vec![archive_domain::SourceDatabase {
+                kind: "message".into(),
+                path: directory.0.join("message.db"),
+                wal_path: None,
+                shm_path: None,
+                encrypted: true,
+                page_size_hint: Some(4096),
+            }],
+            media_roots: vec![],
+            client_version: None,
+            capability: SourceCapability::ProbeRequired,
+        };
+        // Missing and truncated files cover snapshot failure and prefix-read failure.
+        for truncated in [false, true] {
+            if truncated {
+                fs::write(&candidate.databases[0].path, b"short").unwrap();
+            }
+            assert!(validation_page_prefix(&candidate, &data_root).is_none());
+            assert_eq!(fs::read_dir(data_root.join("work")).unwrap().count(), 0);
+            assert!(!directory.0.join("collectorData").exists());
         }
     }
 
@@ -5033,7 +5138,8 @@ mod tests {
     fn authorized_real_probe_finds_a_key_without_exposing_it() {
         let sources = WindowsSourceAdapter.discover(None).unwrap();
         assert!(!sources.is_empty(), "no default data source was discovered");
-        let keys = run_isolated_key_probe(&sources[0]).unwrap();
+        let directory = TestDirectory::new();
+        let keys = run_isolated_key_probe(&sources[0], &directory.0).unwrap();
         let derived_count = keys
             .iter()
             .filter(|key| key.kind != SourceKeyKind::Passphrase)

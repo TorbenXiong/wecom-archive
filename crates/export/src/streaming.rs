@@ -35,6 +35,16 @@ pub fn export_streamed(
     target: &Path,
     cancelled: &AtomicBool,
 ) -> Result<ExportResult, ExportError> {
+    export_streamed_with_progress(package, source, target, cancelled, &mut |_, _, _| {})
+}
+
+pub fn export_streamed_with_progress(
+    package: &ExportPackage,
+    source: &dyn ExportSource,
+    target: &Path,
+    cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64, &str),
+) -> Result<ExportResult, ExportError> {
     if target.exists() {
         return Err(ExportError::TargetExists);
     }
@@ -63,6 +73,9 @@ pub fn export_streamed(
                 }
                 writer.message(package, &names, message)?;
                 actual.message_count += 1;
+                if actual.message_count % 128 == 0 {
+                    progress(actual.message_count, statistics.message_count, "writing");
+                }
                 actual.media_count += message.media.len() as u64;
                 actual.missing_media_count += message
                     .media
@@ -88,6 +101,7 @@ pub fn export_streamed(
             return Err(io::Error::other("export source counts changed").into());
         }
         writer.finish(package)?;
+        progress(actual.message_count, statistics.message_count, "finalizing");
         // Close the file before hashing and publishing (also required on Windows).
         drop(writer);
         check_cancelled(cancelled)?;

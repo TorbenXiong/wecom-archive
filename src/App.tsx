@@ -18,6 +18,7 @@ import {
   getCollectedUsers,
   getEnterpriseConfig,
   getLocalCollectionProgress,
+  getMessagePosition,
   importClientJson,
   importEnterprisePackage,
   listConversationParticipants,
@@ -329,7 +330,14 @@ export default function App() {
 
   const selectedConversation = conversations.find((item) => item.id === selectedId) ?? emptyConversation;
   const isFullPageSection = section === "server-config" || section === "settings" || section === "local-export";
-  const openSearchResult = (result: GlobalSearchResult) => {
+  const openSearchResult = async (result: GlobalSearchResult, signal?: AbortSignal) => {
+    if (!token) return;
+    const accessToken = token;
+    const offset = result.offset_in_conversation ?? (await getMessagePosition(
+      accessToken, result.stable_message_id, messageSortAscending ? "asc" : "desc", signal,
+    )).offset_in_conversation;
+    if (signal?.aborted) return;
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("无法定位原消息，请重试。");
     if (!conversations.some((conversation) => conversation.id === result.conversation_id)) {
       const conversation = mapSearchConversation(result);
       selectedConversationOverride.current = conversation;
@@ -337,7 +345,7 @@ export default function App() {
     }
     skipNextPageReset.current = result.conversation_id !== selectedId;
     setSelectedId(result.conversation_id);
-    setMessagePage(Math.floor(result.offset_in_conversation / messagePageSize));
+    setMessagePage(Math.floor(offset / messagePageSize));
     setTargetMessageId(result.stable_message_id);
   };
 
@@ -362,7 +370,7 @@ export default function App() {
       </>}
     </div>
     <footer className="status-bar"><span>已归档 {summary.message_count.toLocaleString("zh-CN")} 条消息 · {summary.media_count.toLocaleString("zh-CN")} 项媒体 · {summary.conversation_count.toLocaleString("zh-CN")} 个会话</span><span><i />受控访问 · 审计已启用</span></footer>
-     {showExport && superAdminEnabled && <ExportDialog token={token} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} conversations={conversations} selectedConversationId={selectedId} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" || scope === "date_range" ? summary.message_count : scope === "current_filter" ? messages.length : scope === "selected_conversations" ? 0 : selectedConversation.messageCount} mediaCount={scope === "entire_archive" || scope === "date_range" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async (selection: ExportSelection) => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, conversationIds: selection.conversationIds, startDate: selection.startDate, endDate: selection.endDate, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
+     {showExport && superAdminEnabled && <ExportDialog token={token} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} conversations={conversations} selectedConversationId={selectedId} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" || scope === "date_range" ? summary.message_count : scope === "current_filter" ? messages.length : scope === "selected_conversations" ? 0 : selectedConversation.messageCount} mediaCount={scope === "entire_archive" || scope === "date_range" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async (selection: ExportSelection, signal, onProgress) => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, conversationIds: selection.conversationIds, startDate: selection.startDate, endDate: selection.endDate, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }, signal, onProgress); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
     {showLocalCollectionSetup && !collectingLocal && <LocalCollectionSetupDialog onClose={() => setShowLocalCollectionSetup(false)} onCollect={(includeMedia) => { setShowLocalCollectionSetup(false); void collectLocal(includeMedia); }} />}
     {customRootIssue && !collectingLocal && <CustomSourceRootDialog message={customRootIssue.message} initialRoot={customRootIssue.attemptedRoot ?? ""} onClose={() => setCustomRootIssue(null)} onRetry={(root) => { void collectLocal(customRootIssue.includeMedia, root); }} />}
     {collectingLocal && <LocalCollectionDialog progress={collectionProgress} />}

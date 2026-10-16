@@ -143,10 +143,8 @@ pub(crate) async fn run_local_collection_scheduler(state: AppState) {
             let should_reset = next_runs
                 .get(&plan.id)
                 .is_none_or(|(schedule, _)| schedule != &plan.schedule);
-            if should_reset {
-                if let Some(next) = plan.schedule.next_after(now) {
-                    next_runs.insert(plan.id.clone(), (plan.schedule.clone(), next));
-                }
+            if should_reset && let Some(next) = plan.schedule.next_after(now) {
+                next_runs.insert(plan.id.clone(), (plan.schedule.clone(), next));
             }
         }
         for plan in plans {

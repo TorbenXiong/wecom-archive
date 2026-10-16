@@ -1,18 +1,18 @@
 use crate::{
     ACCESS_TOKEN_FILE, ALLOW_REMOTE_ENV, AppState, DATA_ROOT_ENV, DEFAULT_SERVER_PORT, LISTEN_ENV,
     LocalCollectionMediaSink, LocalCollectionProgress, LocalCollectionProgressReporter,
-    LocalCollector, archive_summary, archive_updates, collect_local, collected_users,
-    collector_heartbeat, configured_private_listen_address, count_messages, create_export_job,
-    create_local_collection_plan, create_local_export, default_data_root,
-    delete_local_collection_plan, diagnostics, embedded_web, find_collector_template,
-    generate_collector, get_collection_schedules, get_collection_targets, get_collector,
-    get_enterprise_config, get_media, health, import_enterprise, import_json, list_collectors,
-    list_conversation_participants, list_conversations, list_messages, load_enterprise_config,
-    load_or_generate_access_token, local_collection_progress, open_collector_directory,
-    open_export_directory, open_media, regenerate_access_token, request_collector_collection,
-    revoke_collector, rotate_enterprise_key, run_local_collection_scheduler, search_messages,
-    update_access_token, update_collector, update_enterprise_config, update_local_collection_plan,
-    update_super_admin,
+    LocalCollector, archive_summary, archive_updates, cancel_export, collect_local,
+    collected_users, collector_heartbeat, configured_private_listen_address, count_messages,
+    create_export_job, create_local_collection_plan, create_local_export, default_data_root,
+    delete_local_collection_plan, diagnostics, embedded_web, export_status,
+    find_collector_template, generate_collector, get_collection_schedules, get_collection_targets,
+    get_collector, get_enterprise_config, get_media, health, import_enterprise, import_json,
+    list_collectors, list_conversation_participants, list_conversations, list_messages,
+    load_enterprise_config, load_or_generate_access_token, local_collection_progress,
+    message_position, open_collector_directory, open_export_directory, open_media,
+    regenerate_access_token, request_collector_collection, revoke_collector, rotate_enterprise_key,
+    run_local_collection_scheduler, search_messages, start_export_job, update_access_token,
+    update_collector, update_enterprise_config, update_local_collection_plan, update_super_admin,
 };
 use archive_domain::ClientExportV1;
 use archive_store::ArchiveStore;
@@ -218,10 +218,20 @@ fn prepare_server(
         } else {
             "configured_remote"
         },
+        listen_address: address.to_string(),
+        export_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = Router::new()
         .route("/api/v1/health", get(health))
+        .route(
+            "/api/v1/collectors/{collector_id}/software-update",
+            post(crate::request_collector_update),
+        )
+        .route(
+            "/api/v1/collectors/{collector_id}/software-update/{request_id}",
+            get(crate::download_collector_update),
+        )
         .route("/api/v1/imports/json", post(import_json))
         .route("/api/v1/imports/enterprise", post(import_enterprise))
         .route("/api/v1/collections/local", post(collect_local))
@@ -290,8 +300,16 @@ fn prepare_server(
         .route("/api/v1/messages", get(list_messages))
         .route("/api/v1/search/messages", get(search_messages))
         .route(
+            "/api/v1/messages/{stable_message_id}/position",
+            get(message_position),
+        )
+        .route(
             "/api/v1/exports",
             post(create_export_job).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/v1/exports/start",
+            post(start_export_job).layer(DefaultBodyLimit::max(64 * 1024)),
         )
         .route(
             "/api/v1/exports/local",
@@ -301,6 +319,8 @@ fn prepare_server(
             "/api/v1/exports/open-directory",
             post(open_export_directory),
         )
+        .route("/api/v1/exports/{export_id}", get(export_status))
+        .route("/api/v1/exports/{export_id}/cancel", post(cancel_export))
         .layer(DefaultBodyLimit::disable())
         .with_state(state.clone())
         .fallback(embedded_web);

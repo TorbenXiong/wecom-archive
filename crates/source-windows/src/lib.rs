@@ -14,6 +14,7 @@ pub mod probe;
 mod registry;
 #[cfg(windows)]
 pub mod roots;
+pub mod updater;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;

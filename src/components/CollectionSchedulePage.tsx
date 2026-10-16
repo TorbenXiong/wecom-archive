@@ -1,6 +1,6 @@
 import { HardDriveDownload, MonitorUp, Pencil, RotateCcw, Save, Search } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { createLocalCollectionPlan, getCollectionTargets, getEnterpriseConfig, requestCollectorCollection, updateCollector, updateEnterpriseConfig, updateLocalCollectionPlan, type CollectionSchedule, type CollectionTarget } from "../lib/server-api";
+import { createLocalCollectionPlan, getCollectionTargets, getEnterpriseConfig, requestCollectorCollection, requestCollectorUpdate, updateCollector, updateEnterpriseConfig, updateLocalCollectionPlan, type CollectionSchedule, type CollectionTarget } from "../lib/server-api";
 import { CollectionScheduleFields, DEFAULT_COLLECTION_SCHEDULE } from "./CollectionScheduleFields";
 
 function formatTime(value: string | undefined, fallback = "尚未执行"): string {
@@ -193,6 +193,16 @@ export function CollectionSchedulePage({ token, localCollectionAvailable = false
     }
   };
 
+  const upgradeRemote = async (target: CollectionTarget) => {
+    try {
+      const result = await requestCollectorUpdate(token, target.targetId);
+      setTargets((current) => current.map((item) => item.targetId === target.targetId ? { ...item, updatePending: true, updateError: undefined } : item));
+      setError(`已向“${target.displayName}”下发 ${result.version} 升级请求，将在采集空闲时下载并重启。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "升级请求发送失败。");
+    }
+  };
+
   const content = <>
     <section className="settings-section schedule-workspace">
       <div className="schedule-list-tools collector-list-tools">
@@ -205,7 +215,7 @@ export function CollectionSchedulePage({ token, localCollectionAvailable = false
       {error ? <p className="schedule-page-error">{error}</p> : null}
       <div className="schedule-target-list" aria-busy={loading}>
         {visibleTargets.filter((target) => target.kind === "server").map((target) => <TargetSection key={target.targetId} target={target} draft={editMode ? drafts[target.targetId] : undefined} onDraftChange={(patch) => updateDraft(target.targetId, patch)} onCollect={onOpenLocalCollection} collectDisabled={!localCollectionAvailable || collectingLocal || editMode} collecting={collectingLocal} />)}
-        {visibleTargets.filter((target) => target.kind === "collector").map((target) => <TargetSection key={target.targetId} target={target} draft={editMode ? drafts[target.targetId] : undefined} onDraftChange={(patch) => updateDraft(target.targetId, patch)} onCollect={() => void collectRemote(target)} collectDisabled={editMode} />)}
+        {visibleTargets.filter((target) => target.kind === "collector").map((target) => <TargetSection key={target.targetId} target={target} draft={editMode ? drafts[target.targetId] : undefined} onDraftChange={(patch) => updateDraft(target.targetId, patch)} onCollect={() => void collectRemote(target)} onUpdate={() => void upgradeRemote(target)} collectDisabled={editMode} />)}
         {!loading && visibleTargets.length === 0 ? <div className="schedule-empty">{normalizedSearch ? "没有匹配的采集端或计划。" : "暂无采集节点。"}</div> : null}
       </div>
     </section>
@@ -213,7 +223,7 @@ export function CollectionSchedulePage({ token, localCollectionAvailable = false
   return <div className="collector-management-panel">{content}</div>;
 }
 
-function TargetSection({ target, draft, onDraftChange, onCollect, collectDisabled, collecting }: { target: CollectionTarget; draft?: CollectorDraft; onDraftChange: (patch: Partial<CollectorDraft>) => void; onCollect?: () => void; collectDisabled?: boolean; collecting?: boolean }) {
+function TargetSection({ target, draft, onDraftChange, onCollect, onUpdate, collectDisabled, collecting }: { target: CollectionTarget; draft?: CollectorDraft; onDraftChange: (patch: Partial<CollectorDraft>) => void; onCollect?: () => void; onUpdate?: () => void; collectDisabled?: boolean; collecting?: boolean }) {
   const statusLabel = target.status === "online" ? "在线" : target.status === "offline" ? "离线" : target.status === "disabled" ? "已停用" : "已吊销";
   const plan = target.plans[0];
   const scheduleText = scheduleExecutionLabel(plan?.schedule);
@@ -224,12 +234,12 @@ function TargetSection({ target, draft, onDraftChange, onCollect, collectDisable
         <div className="collector-target-identity">
           {draft && target.kind === "collector" ? <input className="collector-inline-name" aria-label={`名称：${targetDisplayName(target)}`} maxLength={80} value={draft.displayName} onChange={(event) => onDraftChange({ displayName: event.target.value })} /> : <strong>{targetDisplayName(target)}</strong>}
           {draft ? <div className="collector-inline-options"><label><input type="checkbox" aria-label={`含文件和图片：${targetDisplayName(target)}`} checked={draft.includeMedia} onChange={(event) => onDraftChange({ includeMedia: event.target.checked })} />含文件和图片</label><label><input type="checkbox" aria-label={`数据脱敏：${targetDisplayName(target)}`} checked={draft.dataRedaction} onChange={(event) => onDraftChange({ dataRedaction: event.target.checked })} />数据脱敏</label>{target.kind === "collector" && <><label><input type="checkbox" aria-label={`支持离线导出：${targetDisplayName(target)}`} checked={draft.offlineExportEnabled} onChange={(event) => onDraftChange({ offlineExportEnabled: event.target.checked })} />支持离线导出</label><label><input type="checkbox" aria-label={`隐藏式采集端：${targetDisplayName(target)}`} checked={draft.hiddenModeEnabled} onChange={(event) => onDraftChange({ hiddenModeEnabled: event.target.checked })} />隐藏式采集端</label><label><input type="checkbox" aria-label={`开启采集端日志：${targetDisplayName(target)}`} checked={draft.collectorLoggingEnabled} onChange={(event) => onDraftChange({ collectorLoggingEnabled: event.target.checked })} />开启采集端日志</label></>}</div> : <div className="collector-target-summary"><small>{target.kind === "collector" ? <>IP：{target.clientIp || "未知"}　心跳：{formatTime(target.lastSeenAt)}{target.clientVersion ? `　版本：${target.clientVersion}` : ""}　</> : null}{(plan?.includeMedia ?? target.includeMedia) ? "全内容" : "仅文本"}　{target.dataRedaction ? "脱敏" : "不脱敏"}{target.kind === "collector" ? <>　{target.offlineExportEnabled ? "支持" : "不支持"}离线导出　{target.hiddenModeEnabled ? "隐藏运行" : "显示运行"}　日志：{target.collectorLogLevel && target.collectorLogLevel !== "off" ? "已开启" : "未开启"}</> : null}</small><small>采集计划：{scheduleText ?? "已停用"}　最近成功：{formatTime(target.kind === "collector" ? plan?.lastUploadAt : plan?.lastRunAt, "尚未成功")}　下次执行：{formatTime(plan?.nextRunAt)}</small>{target.kind === "collector" ? <small>实例标识：{target.targetId}{target.logDirectory ? `　服务端日志目录：${target.logDirectory}/日期.log` : ""}</small> : null}</div>}
-          {target.lastError ? <small className="schedule-error-detail">最近错误：{target.lastError}</small> : null}
+          {target.updateError ? <small className="schedule-error-detail">{target.updateError}</small> : null}{target.lastError ? <small className="schedule-error-detail">最近错误：{target.lastError}</small> : null}
         </div>
         {draft ? <div className="collector-inline-plan"><span>采集计划</span><CollectionScheduleFields idPrefix={`inline-${target.targetId}`} schedule={draft.schedule} onChange={(schedule) => onDraftChange({ schedule })} /></div> : null}
       </div>
       <span className={`collector-status ${target.status}`}>{statusLabel}</span>
-      <div className="schedule-target-actions"><button className="primary-button" type="button" onClick={onCollect} disabled={!onCollect || collectDisabled}><HardDriveDownload size={15} />{collecting ? "采集中…" : "采集"}</button></div>
+      <div className="schedule-target-actions">{target.kind === "collector" && !draft && <button className="secondary-button compact" type="button" onClick={onUpdate} disabled={!target.updateAvailable || collectDisabled || (target.updatePending && !target.updateError)} title={!target.updateCapable ? "此版本尚不支持在线升级，需先手动替换一次" : target.updateVersion ? `升级到服务端版本 ${target.updateVersion}` : "请先升级工作台"}>{target.updateError ? "重试升级" : target.updatePending ? "等待升级" : "升级"}</button>}<button className="primary-button" type="button" onClick={onCollect} disabled={!onCollect || collectDisabled}><HardDriveDownload size={15} />{collecting ? "采集中…" : "采集"}</button></div>
     </header>
   </section>;
 }

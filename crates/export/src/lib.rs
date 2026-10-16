@@ -12,7 +12,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod streaming;
-pub use streaming::{ExportSource, ExportStatistics, export_streamed};
+pub use streaming::{
+    ExportSource, ExportStatistics, export_streamed, export_streamed_with_progress,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

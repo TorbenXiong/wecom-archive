@@ -27,10 +27,10 @@ pub fn init(data_root: &Path) {
 }
 
 pub fn set_level(value: &str) {
-    if let Some(level) = CONFIGURED_LEVEL.get() {
-        if let Ok(mut level) = level.lock() {
-            *level = parse_log_level(value);
-        }
+    if let Some(level) = CONFIGURED_LEVEL.get()
+        && let Ok(mut level) = level.lock()
+    {
+        *level = parse_log_level(value);
     }
 }
 
