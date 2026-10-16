@@ -29,8 +29,8 @@ cargo build --release --locked --offline --bin WeComArchive
 
 准备当前版本 EXE 和下一个版本 EXE，分别放在两个独立目录。Release 需要包含：
 
-- `WeComArchive-x.y.z.exe`
-- `WeComArchive-x.y.z.exe.sha256`，内容为 64 位 SHA-256 和文件名
+- `WeComArchive.exe`（后续发布使用稳定文件名；客户端仍兼容旧的带版本号文件名）
+- GitHub Release 资产提供 SHA-256 digest；GitLab 或未提供 digest 的服务仍需提供同名 `.sha256` 校验附件
 - GitHub Release API，或 GitLab Release API/asset links
 
 在旧版本工作台的“设置 → 关于”中点击“检查更新”：
@@ -41,6 +41,7 @@ cargo build --release --locked --offline --bin WeComArchive
 4. 重复检查更新，确认当前版本已是最新版本。
 5. 用错误 SHA-256 发布测试附件，确认升级失败且旧 EXE 仍可启动。
 6. 关闭程序后锁定 EXE 或模拟替换失败，确认旧文件未丢失。
+7. 确认升级后保留原 EXE 文件名，新版本正常启动后自动清理本次 `.wecom-update-<UUID>/`；失败时仍保留恢复所需文件。
 
 ### 采集端升级
 
@@ -65,9 +66,9 @@ cargo build --release --locked --offline --bin WeComArchive
 
 升级目标 Release 单文件：
 
-- `artifacts/0.0.10/WeComArchive-0.0.10.exe`
-- `artifacts/0.0.10/WeComArchive-0.0.10.exe.sha256`
+- `WeComArchive.exe`；版本以 Release 标签和程序“关于”页面为准，文件名不带版本号。
+- GitHub Release API 的资产 `digest` 提供当前构建的 SHA-256，不额外发布校验文件。
 
-升级目标 EXE SHA-256：`4d568ea6000955967734b3292bb4cc942fa7221d2c4561395cfc7fa80d6524de`
+升级会保留本机原文件名。之前下载的带版本号文件，可在完全退出工作台后手动改为 `WeComArchive.exe`，此后升级沿用该名称。
 
 该 EXE 未进行 Authenticode 签名，发布到 GitHub/GitLab 前应按组织发布流程签名或补充可信发布渠道。

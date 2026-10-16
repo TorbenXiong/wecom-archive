@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const DEFAULT_API: &str = "https://api.github.com/repos/TorbenXiong/wecom-archive/releases/latest";
+const RELEASE_ASSET_NAME: &str = "WeComArchive.exe";
 const READY_ENV: &str = "WECOM_ARCHIVE_UPDATE_READY";
 static CHECKED: Mutex<Option<UpdateInfo>> = Mutex::new(None);
 static INSTALLING: Mutex<bool> = Mutex::new(false);
@@ -146,19 +147,34 @@ fn release_info(value: &serde_json::Value, current: &str) -> Result<Option<Updat
     if !newer(current, version) {
         return Ok(None);
     }
-    let expected = format!("WeComArchive-{version}.exe");
     let assets = value["assets"]
         .as_array()
         .or_else(|| value["assets"]["links"].as_array())
         .ok_or("Release 缺少附件。")?;
-    let matched = assets
-        .iter()
-        .filter(|a| a["name"].as_str() == Some(expected.as_str()))
-        .collect::<Vec<_>>();
-    if matched.len() != 1 {
-        return Err(format!("Release 必须包含唯一附件 {expected}。"));
-    }
-    let asset = matched[0];
+    let legacy_asset_name = format!("WeComArchive-{version}.exe");
+    let (asset_name, asset) = {
+        let stable = assets
+            .iter()
+            .filter(|a| a["name"].as_str() == Some(RELEASE_ASSET_NAME))
+            .collect::<Vec<_>>();
+        if !stable.is_empty() {
+            if stable.len() != 1 {
+                return Err(format!("Release 必须包含唯一附件 {RELEASE_ASSET_NAME}。"));
+            }
+            (RELEASE_ASSET_NAME.to_owned(), stable[0])
+        } else {
+            let legacy = assets
+                .iter()
+                .filter(|a| a["name"].as_str() == Some(legacy_asset_name.as_str()))
+                .collect::<Vec<_>>();
+            if legacy.len() != 1 {
+                return Err(format!(
+                    "Release 必须包含唯一附件 {RELEASE_ASSET_NAME}（兼容旧版时可使用 {legacy_asset_name}）。"
+                ));
+            }
+            (legacy_asset_name, legacy[0])
+        }
+    };
     let url = asset["browser_download_url"]
         .as_str()
         .or_else(|| asset["direct_asset_url"].as_str())
@@ -182,7 +198,7 @@ fn release_info(value: &serde_json::Value, current: &str) -> Result<Option<Updat
         current_version: current.into(),
         latest_version: version.into(),
         release_url: release_url.into(),
-        asset_name: expected,
+        asset_name,
         download_url: url.into(),
         sha256: digest,
     }))
@@ -409,7 +425,11 @@ pub fn run_helper(token: &str) -> Result<(), String> {
     let backup = directory.join("previous.exe");
     replace_with_backup(&target, &next, &backup)?;
     let ready_path = directory.join("started");
-    let mut child = match Command::new(&target).env(READY_ENV, &ready_path).spawn() {
+    let mut child = match Command::new(&target)
+        .current_dir(target.parent().ok_or("程序目录无效。")?)
+        .env(READY_ENV, &ready_path)
+        .spawn()
+    {
         Ok(child) => child,
         Err(_) => {
             rollback(&target, &backup, &next)?;
@@ -474,14 +494,39 @@ pub fn acknowledge_startup() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    if path.file_name().is_some_and(|n| n == "started")
-        && path.parent().and_then(Path::parent) == exe.parent()
-        && path
-            .parent()
-            .is_some_and(|dir| target_path(dir, "test.exe").is_ok())
-    {
-        let _ = fs::write(path, b"ready");
+    let Some(directory) = path
+        .parent()
+        .filter(|dir| dir.parent() == exe.parent() && target_path(dir, "test.exe").is_ok())
+    else {
+        return;
+    };
+    if path.file_name().is_some_and(|n| n == "started") && fs::write(&path, b"ready").is_ok() {
+        let directory = directory.to_path_buf();
+        std::thread::spawn(move || {
+            for _ in 0..120 {
+                if cleanup_completed_update(&directory).unwrap_or(false) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        });
     }
+}
+
+fn cleanup_completed_update(directory: &Path) -> std::io::Result<bool> {
+    // The helper removes the plan only after it accepts our startup acknowledgement.
+    if directory.join("plan.json").try_exists()? {
+        return Ok(false);
+    }
+    // On Windows the running helper is locked. Delete it first so that a partial
+    // recursive deletion cannot remove the rollback backup while it is still running.
+    match fs::remove_file(directory.join("helper.exe")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::remove_dir_all(directory)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -508,6 +553,13 @@ mod tests {
         let mut invalid = release;
         invalid["assets"][0]["browser_download_url"] = "http://example.org/evil.exe".into();
         assert!(release_info(&invalid, "0.0.10").is_err());
+    }
+
+    #[test]
+    fn release_prefers_the_stable_asset_name() {
+        let release = serde_json::json!({"tag_name":"0.0.11", "html_url":"https://github.com/example/app/releases/0.0.11", "assets":[{"name":"WeComArchive.exe","browser_download_url":"https://github.com/example/app/update.exe", "digest":format!("sha256:{}", "a".repeat(64))}]});
+        let update = release_info(&release, "0.0.10").unwrap().unwrap();
+        assert_eq!(update.asset_name, "WeComArchive.exe");
     }
 
     #[test]
@@ -542,5 +594,29 @@ mod tests {
             assert!(target_path(&directory, name).is_err());
         }
         assert!(target_path(Path::new("other"), "app.exe").is_err());
+    }
+
+    #[test]
+    fn cleanup_waits_for_helper_success_and_preserves_sibling_data() {
+        let root = std::env::temp_dir().join(format!("update-test-{}", uuid::Uuid::new_v4()));
+        let directory = root.join(format!(".wecom-update-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(root.join("archive.db"), b"data").unwrap();
+        for name in ["plan.json", "helper.exe", "previous.exe", "started"] {
+            fs::write(directory.join(name), b"test").unwrap();
+        }
+        assert!(!cleanup_completed_update(&directory).unwrap());
+        assert!(directory.join("previous.exe").is_file());
+        fs::remove_file(directory.join("plan.json")).unwrap();
+        fs::remove_file(directory.join("helper.exe")).unwrap();
+        fs::create_dir(directory.join("helper.exe")).unwrap();
+        assert!(cleanup_completed_update(&directory).is_err());
+        assert!(directory.join("previous.exe").is_file());
+        fs::remove_dir(directory.join("helper.exe")).unwrap();
+        fs::write(directory.join("helper.exe"), b"test").unwrap();
+        assert!(cleanup_completed_update(&directory).unwrap());
+        assert!(!directory.exists());
+        assert_eq!(fs::read(root.join("archive.db")).unwrap(), b"data");
+        fs::remove_dir_all(root).unwrap();
     }
 }
