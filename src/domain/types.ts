@@ -23,6 +23,7 @@ export interface ConversationSummary {
   mediaCount: number;
   participantCount: number;
   isGroup: boolean;
+  kind?: "document" | "application" | "assistant" | "temporary" | "system";
 }
 
 export interface MessageItem {
@@ -37,6 +38,7 @@ export interface MessageItem {
   type: MessageType;
   rawType?: string;
   body?: string;
+  richSegments?: Array<{ kind: "text" | "emoji"; text: string }>;
   quote?: {
     id: string;
     sender: string;
@@ -56,6 +58,22 @@ export interface ParticipantItem {
   id: string;
   name: string;
   kind?: string;
+  profile?: ParticipantProfile;
+}
+
+export interface ParticipantProfile {
+  [key: string]: string | undefined;
+  mobile?: string;
+  phone?: string;
+  office_phone?: string;
+  email?: string;
+  employee_no?: string;
+  department?: string;
+  organization?: string;
+  position?: string;
+  address?: string;
+  english_name?: string;
+  signature?: string;
 }
 
 export interface SourceCandidate {

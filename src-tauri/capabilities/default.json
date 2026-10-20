@@ -1,16 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "Minimal capabilities for the local archive workspace.",
-  "remote": {
-    "urls": ["http://127.0.0.1:9812/*"]
-  },
+  "description": "Minimal capabilities for the collector's embedded page.",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "allow-exit-workspace",
-    "allow-check-for-update",
-    "allow-install-update",
     "allow-bootstrap",
     "allow-sync-collector-config",
     "allow-get-collector-schedule-status",

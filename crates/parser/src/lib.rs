@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const PARSER_VERSION: &str = "windows-message-parser/0.0.2";
+pub const PARSER_VERSION: &str = "windows-message-parser/0.0.3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawMessageRow {
@@ -103,7 +103,7 @@ fn classify(raw_type: &str, payload: &Value) -> MessageType {
         "3" | "4" | "14" | "29" | "image" | "img" => MessageType::Image,
         "34" | "voice" | "audio" => MessageType::Audio,
         "43" | "video" => MessageType::Video,
-        "15" | "16" | "49:file" | "file" | "attachment" => MessageType::File,
+        "15" | "16" | "20" | "49:file" | "file" | "attachment" => MessageType::File,
         "13" | "49:link" | "link" | "url" => MessageType::Link,
         "49:quote" | "reply" | "quote" => MessageType::Reply,
         "38" | "40" | "501" | "503" | "671" | "10000" | "1001" | "1002" | "1004" | "1006"
@@ -125,6 +125,14 @@ fn extract_text(message_type: MessageType, payload: &Value) -> Option<String> {
         MessageType::Text | MessageType::Reply | MessageType::System | MessageType::Unsupported => {
             &["text", "content", "title", "description"]
         }
+        MessageType::Audio => &[
+            "transcription",
+            "transcript",
+            "voice_text",
+            "recognition",
+            "text",
+            "content",
+        ],
         MessageType::Link => &["title", "description", "url"],
         MessageType::File => &["name", "filename"],
         _ => &[],
@@ -264,5 +272,16 @@ mod tests {
         )
         .unwrap();
         assert!(text.media.is_empty());
+    }
+
+    #[test]
+    fn keeps_audio_transcription_when_present() {
+        let message = normalize(
+            row("audio", json!({"transcription": "这是语音转文字"})),
+            Uuid::nil(),
+        )
+        .unwrap();
+        assert_eq!(message.message_type, MessageType::Audio);
+        assert_eq!(message.body_text.as_deref(), Some("这是语音转文字"));
     }
 }

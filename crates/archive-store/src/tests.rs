@@ -9,6 +9,150 @@ use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
 
+#[test]
+fn application_conversations_ignore_stale_group_types_and_keep_document_metadata() {
+    let directory = tempdir().unwrap();
+    let store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+    store.connection.execute("INSERT INTO conversations (conversation_id, display_name, conversation_type, last_message_at) VALUES ('M:12345', NULL, 'group', '2026-01-01T00:00:00Z'), ('M:67890', '测试文档', 'document', '2026-01-01T00:00:00Z')", []).unwrap();
+    let rows = store.list_conversations(20, 0).unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.conversation_id == "M:12345")
+            .unwrap()
+            .conversation_type
+            .as_deref(),
+        Some("application")
+    );
+    let document = rows
+        .iter()
+        .find(|row| row.conversation_id == "M:67890")
+        .unwrap();
+    assert_eq!(document.conversation_type.as_deref(), Some("document"));
+    assert_eq!(document.display_name.as_deref(), Some("测试文档"));
+    assert!(document.participant_names.is_empty());
+}
+
+#[test]
+fn names_message_assistant_conversations_for_the_employee() {
+    let directory = tempdir().unwrap();
+    let store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO conversations (conversation_id, display_name, conversation_type, last_message_at)
+             VALUES ('O:assistant', '打卡助手', 'direct', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute_batch(
+            "INSERT INTO participants (participant_id, display_name, participant_kind)
+             VALUES ('employee', '员工甲', 'employee'), ('O:assistant', '打卡助手', 'bot');
+             INSERT INTO conversation_participants VALUES ('O:assistant', 'employee');
+             INSERT INTO conversation_participants VALUES ('O:assistant', 'O:assistant');",
+        )
+        .unwrap();
+    let row = store.list_conversations(20, 0).unwrap().pop().unwrap();
+    assert_eq!(row.conversation_type.as_deref(), Some("assistant"));
+    assert_eq!(row.display_name.as_deref(), Some("打卡助手-员工甲"));
+}
+
+#[test]
+fn classifies_opaque_session_ids_without_exposing_their_short_ids() {
+    let directory = tempdir().unwrap();
+    let store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO conversations (conversation_id, display_name, conversation_type, last_message_at)
+             VALUES ('R:opaque', NULL, NULL, '2026-01-01T00:00:00Z'),
+                    ('T:opaque', NULL, 'direct', '2026-01-01T00:00:00Z'),
+                    ('Y:10024', NULL, NULL, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute_batch(
+            "INSERT INTO participants (participant_id, display_name) VALUES ('a', '成员甲'), ('b', '成员乙');
+             INSERT INTO conversation_participants VALUES ('R:opaque', 'a');
+             INSERT INTO conversation_participants VALUES ('R:opaque', 'b');",
+        )
+        .unwrap();
+    let rows = store.list_conversations(20, 0).unwrap();
+    let group = rows
+        .iter()
+        .find(|row| row.conversation_id == "R:opaque")
+        .unwrap();
+    assert_eq!(
+        group.display_name.as_deref(),
+        Some("群聊：成员甲、成员乙（2人）")
+    );
+    assert_eq!(group.conversation_type.as_deref(), Some("group"));
+    let temporary = rows
+        .iter()
+        .find(|row| row.conversation_id == "T:opaque")
+        .unwrap();
+    assert_eq!(temporary.display_name.as_deref(), Some("临时会话"));
+    assert_eq!(temporary.conversation_type.as_deref(), Some("temporary"));
+    let system = rows
+        .iter()
+        .find(|row| row.conversation_id == "Y:10024")
+        .unwrap();
+    assert_eq!(system.display_name.as_deref(), Some("系统通知"));
+    assert_eq!(system.conversation_type.as_deref(), Some("system"));
+}
+
+#[test]
+fn stores_directory_profiles_and_preserves_full_message_round_trip() {
+    let directory = tempdir().unwrap();
+    let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+    let mut input = batch("profile");
+    input.messages[0].raw_payload = json!({
+        "text": "profile",
+        "participant_profiles": {
+            "participant": {"mobile": "13800000000", "phone": "010-12345678", "office_phone": "1001", "department": "研发部", "custom:办公地点": "测试楼A栋", "unknown": "ignored", "email": {"malformed": true}},
+            "silent-member": {"office_phone": "010-00000000"}
+        }
+    });
+    store.ingest_batch(&input).unwrap();
+    let participant = store
+        .list_conversation_participants("conversation")
+        .unwrap()
+        .pop()
+        .unwrap();
+    let profile = participant.profile.unwrap();
+    assert_eq!(profile["mobile"], "13800000000");
+    assert_eq!(profile["phone"], "010-12345678");
+    assert_eq!(profile["office_phone"], "1001");
+    assert_eq!(profile["custom:办公地点"], "测试楼A栋");
+    assert!(!profile.contains_key("email"));
+    assert!(!profile.contains_key("unknown"));
+    let silent_profile: String = store
+        .connection
+        .query_row(
+            "SELECT metadata_json FROM participants WHERE participant_id = 'silent-member'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&silent_profile).unwrap()["office_phone"],
+        "010-00000000"
+    );
+    let message = store
+        .query_messages(&MessageQuery {
+            conversation_id: Some("conversation".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(message.raw_payload, input.messages[0].raw_payload);
+}
+
 fn batch(body: &str) -> ArchiveBatchV1 {
     let batch_id = Uuid::new_v4();
     let message_time = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
@@ -334,6 +478,51 @@ fn ingest_is_idempotent_and_records_revision() {
 }
 
 #[test]
+fn repeated_revision_content_keeps_history_and_commits_the_whole_batch() {
+    let directory = tempdir().unwrap();
+    let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+    for body in ["first", "second", "first"] {
+        store.ingest_batch(&batch(body)).unwrap();
+    }
+    let mut input = batch("second");
+    let mut added = input.messages[0].clone();
+    added.source_message_id = "two".into();
+    added.stable_message_id = "stable-two".into();
+    input.messages.push(added);
+    let result = store.ingest_batch(&input).unwrap();
+    assert_eq!(result.revised, 1);
+    assert_eq!(result.inserted, 1);
+    assert_eq!(
+        store
+            .get_message("stable-one")
+            .unwrap()
+            .unwrap()
+            .body_text
+            .as_deref(),
+        Some("second")
+    );
+    let histories: i64 = store
+        .connection
+        .query_row(
+            "SELECT count(*) FROM message_revisions WHERE stable_message_id = 'stable-one'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(histories, 2);
+    assert_eq!(store.summary().unwrap().revision, 4);
+    assert_eq!(
+        store
+            .count_messages(&MessageQuery {
+                text: Some("second".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
 fn locates_message_offset_in_descending_conversation_order() {
     let directory = tempdir().unwrap();
     let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
@@ -505,6 +694,58 @@ fn migrates_version_one_media_schema() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, 2);
+}
+
+#[test]
+fn recollection_retains_verified_images_but_replaces_changed_media_identity() {
+    let directory = tempdir().unwrap();
+    let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+    let mut full = batch("image");
+    full.messages[0].message_type = archive_domain::MessageType::Image;
+    full.messages[0].raw_payload =
+        json!({"name": "synthetic.bin", "media_lookup_hints": ["original-hint"]});
+    full.messages[0].media = vec![shared_media("a")];
+    store.ingest_batch(&full).unwrap();
+    let mut text_only = full.clone();
+    text_only.batch_id = Uuid::new_v4();
+    text_only.content_sha256 = "text-only-fixture".into();
+    text_only.messages[0].collection_batch_id = text_only.batch_id;
+    let media = &mut text_only.messages[0].media[0];
+    media.content_hash = None;
+    media.integrity = MediaIntegrity::Missing;
+    media.source_locator = "unavailable".into();
+    media.missing_reason = Some("metadata_only".into());
+    store.ingest_batch(&text_only).unwrap();
+    let read = |store: &ArchiveStore| -> MessageV1 {
+        let payload: String = store
+            .connection
+            .query_row(
+                "SELECT payload_json FROM messages WHERE stable_message_id = 'stable-one'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&payload).unwrap()
+    };
+    assert_eq!(read(&store).media[0].content_hash.as_deref(), Some("a"));
+    let projected_hash: String = store.connection.query_row("SELECT m.content_sha256 FROM media m JOIN message_media mm ON m.media_id = mm.media_id WHERE mm.stable_message_id = 'stable-one'", [], |row| row.get(0)).unwrap();
+    assert_eq!(projected_hash, "a");
+
+    let mut changed = text_only.clone();
+    changed.batch_id = Uuid::new_v4();
+    changed.content_sha256 = "changed-fixture".into();
+    changed.messages[0].raw_payload["media_lookup_hints"] = json!(["replacement-hint"]);
+    store.ingest_batch(&changed).unwrap();
+    assert_eq!(read(&store).media[0].integrity, MediaIntegrity::Missing);
+    assert!(read(&store).media[0].content_hash.is_none());
+
+    // Newly collected bytes replace existing archived bytes normally.
+    let mut refreshed = full.clone();
+    refreshed.batch_id = Uuid::new_v4();
+    refreshed.content_sha256 = "refreshed-fixture".into();
+    refreshed.messages[0].media = vec![shared_media("b")];
+    store.ingest_batch(&refreshed).unwrap();
+    assert_eq!(read(&store).media[0].content_hash.as_deref(), Some("b"));
 }
 
 fn shared_media(hash: &str) -> MediaRefV1 {

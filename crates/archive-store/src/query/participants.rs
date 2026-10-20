@@ -22,7 +22,7 @@ impl ArchiveStore {
         conversation_id: &str,
     ) -> Result<Vec<ParticipantListItem>, StoreError> {
         let mut statement = self.connection.prepare(
-            "SELECT p.participant_id, p.display_name, p.participant_kind
+            "SELECT p.participant_id, p.display_name, p.participant_kind, p.metadata_json
              FROM conversation_participants cp
              JOIN participants p ON p.participant_id = cp.participant_id
              WHERE cp.conversation_id = ?1
@@ -33,6 +33,11 @@ impl ArchiveStore {
                 participant_id: row.get(0)?,
                 display_name: row.get(1)?,
                 participant_kind: row.get(2)?,
+                profile: row
+                    .get::<_, Option<String>>(3)?
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .map(|value| crate::participant_profile(&value))
+                    .filter(|profile| !profile.is_empty()),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()

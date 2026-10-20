@@ -170,9 +170,14 @@ fn discover_media_roots(data_root: &Path, discovery_root: &Path) -> Vec<PathBuf>
         "Files",
         "Image",
         "Images",
+        "Emotion",
         "Video",
         "Voice",
         "Media",
+        "Cache/Image",
+        "Cache/File",
+        "Cache/Video",
+        "Cache/Voice",
     ];
     let mut roots = BTreeSet::new();
     for base in data_root
@@ -404,6 +409,16 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         fs::create_dir_all(account.join("FileStorage").join("MsgAttach")).unwrap();
         fs::create_dir_all(account.join("Image")).unwrap();
+        fs::create_dir_all(account.join("Emotion")).unwrap();
+        fs::create_dir_all(account.join("Cache").join("Image")).unwrap();
+        fs::create_dir_all(
+            directory
+                .path()
+                .join("other-account")
+                .join("Cache")
+                .join("Image"),
+        )
+        .unwrap();
         for name in ["message.db", "session.db", "user.db"] {
             let mut bytes = vec![0_u8; 100];
             bytes[..16].copy_from_slice(b"SQLite format 3\0");
@@ -421,6 +436,18 @@ mod tests {
                 .contains(&account.join("FileStorage"))
         );
         assert!(candidates[0].media_roots.contains(&account.join("Image")));
+        assert!(candidates[0].media_roots.contains(&account.join("Emotion")));
+        assert!(
+            candidates[0]
+                .media_roots
+                .contains(&account.join("Cache").join("Image"))
+        );
+        assert!(
+            !candidates[0]
+                .media_roots
+                .iter()
+                .any(|root| root.starts_with(directory.path().join("other-account")))
+        );
     }
 
     #[test]
@@ -455,6 +482,22 @@ mod tests {
         assert!(
             !candidate.media_roots.is_empty(),
             "authorized source exposed no recognized media directories"
+        );
+        let mut cache_roots_checked = 0;
+        if let Some(account) = candidate.root_path.parent() {
+            for name in ["Cache/Image", "Emotion"] {
+                let cache = account.join(name);
+                if cache.is_dir() {
+                    assert!(
+                        candidate.media_roots.contains(&cache),
+                        "existing account cache directory was not discovered"
+                    );
+                    cache_roots_checked += 1;
+                }
+            }
+        }
+        eprintln!(
+            "authorized source cache discovery verified: {cache_roots_checked} existing image cache layouts"
         );
         let file_count = candidate
             .media_roots

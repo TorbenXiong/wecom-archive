@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 const [rootArgument, browser] = process.argv.slice(2);
 if (!rootArgument || !browser) throw new Error("usage: node verify-search-ui.mjs <synthetic-run-dir> <installed-chromium>");
 const root = resolve(rootArgument);
+const { version } = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 if (!root.startsWith(resolve("target/ui-acceptance") + "\\")) throw new Error("synthetic acceptance directory required");
 const { pageUrl } = JSON.parse(await readFile(resolve(root, "connection.json"), "utf8"));
 const address = new URL(pageUrl);
@@ -79,7 +80,7 @@ try {
   await waitUntil(() => evaluate(`Boolean(document.querySelector('.message-row.highlighted'))`));
   report.messagePosition = true;
   await evaluate(`Array.from(document.querySelectorAll('.primary-nav button')).find(e=>e.textContent==='设置').click()`);
-  await waitUntil(() => evaluate(`document.querySelector('.settings-page')?.textContent.includes('0.0.9')`));
+  await waitUntil(() => evaluate(`document.querySelector('.settings-page')?.textContent.includes(${JSON.stringify(version)})`));
   report.settings = true;
   const started = await request("/api/v1/exports/start", { method: "POST", body: JSON.stringify({ scope: "entire_archive", format: "json", simplify: true }) });
   const completed = await waitUntil(async () => { const p = await request(`/api/v1/exports/${started.taskId}`); if (p.status === "failed") throw new Error("HTTP export failed"); return p.status === "completed" ? p : false; });

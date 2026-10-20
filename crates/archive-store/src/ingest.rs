@@ -51,6 +51,32 @@ impl ArchiveStore {
         crate::derived::repair_fts_rows(&transaction, batch)?;
         let mut conversation_times = BTreeMap::<&str, String>::new();
         for message in &batch.messages {
+            let directory = message
+                .raw_payload
+                .get("participant_profiles")
+                .and_then(serde_json::Value::as_object);
+            let sender_profile = message
+                .sender_id
+                .as_deref()
+                .zip(message.raw_payload.get("sender_profile"));
+            for (participant_id, profile) in directory
+                .into_iter()
+                .flatten()
+                .map(|(id, value)| (id.as_str(), value))
+                .chain(sender_profile)
+            {
+                let profile = crate::participant_profile(profile);
+                if !participant_id.trim().is_empty() && !profile.is_empty() {
+                    let profile_json = serde_json::to_string(&profile)?;
+                    transaction.execute(
+                        "INSERT INTO participants (participant_id, metadata_json)
+                         VALUES (?1, ?2)
+                         ON CONFLICT(participant_id) DO UPDATE SET
+                           metadata_json = excluded.metadata_json",
+                        params![participant_id, profile_json],
+                    )?;
+                }
+            }
             message
                 .validate()
                 .map_err(|error| StoreError::Invalid(error.to_string()))?;

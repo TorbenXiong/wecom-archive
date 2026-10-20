@@ -25,6 +25,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Emitter, Manager, State};
 use zeroize::{Zeroize, Zeroizing};
 
+mod collector_http;
 mod collector_update;
 mod diagnostics;
 mod sqlite3mc;
@@ -242,18 +243,34 @@ struct MediaResolver {
 
 impl MediaResolver {
     fn new(candidate: &SourceCandidate, options: MediaCollectionOptions) -> Self {
-        let roots = candidate
-            .media_roots
+        let mut root_candidates = candidate.media_roots.clone();
+        // The client may place downloaded previews beside the recognized media
+        // folders. The source root is already authorized, so include it as a
+        // bounded fallback without reading outside the copied account.
+        root_candidates.push(candidate.root_path.clone());
+        root_candidates.sort();
+        root_candidates.dedup();
+        let roots = root_candidates
             .iter()
             .filter_map(|root| root.canonicalize().ok())
             .collect::<Vec<_>>();
         let mut files_by_key = BTreeMap::new();
         if options.include_files || options.include_images {
+            let account_root = candidate.root_path.canonicalize().ok();
+            let index_account_root = candidate.media_roots.is_empty()
+                || account_root.as_ref().is_some_and(|root| {
+                    candidate
+                        .media_roots
+                        .iter()
+                        .filter_map(|path| path.canonicalize().ok())
+                        .any(|path| &path == root)
+                });
             for root in &roots {
+                if !index_account_root && account_root.as_ref().is_some_and(|path| root == path) {
+                    continue;
+                }
                 index_media_directory(root, root, 0, &mut files_by_key);
             }
-            // resolve() only needs the first authorized hit. Sorting every
-            // bucket made each scheduled run pay an avoidable O(n log n) cost.
         }
         Self {
             roots,
@@ -270,16 +287,26 @@ impl MediaResolver {
                 .chain(self.roots.iter().map(|root| root.join(&locator_path)))
                 .collect()
         };
+        let mut direct_match = None;
         for candidate in direct_candidates {
             if let Some(path) = self.authorized_file(candidate) {
-                return Some(path);
+                if direct_match
+                    .as_ref()
+                    .is_some_and(|existing| existing != &path)
+                {
+                    return None;
+                }
+                direct_match = Some(path);
             }
+        }
+        if direct_match.is_some() {
+            return direct_match;
         }
         media_lookup_keys(locator).into_iter().find_map(|key| {
             self.files_by_key
                 .get(&key)
-                .and_then(|paths| paths.first())
-                .cloned()
+                .filter(|paths| paths.len() == 1)
+                .and_then(|paths| self.authorized_file(paths[0].clone()))
         })
     }
 
@@ -295,7 +322,7 @@ fn index_media_directory(
     depth: usize,
     index: &mut BTreeMap<String, Vec<PathBuf>>,
 ) {
-    if depth > 12 {
+    if depth > 32 {
         return;
     }
     let Ok(entries) = fs::read_dir(directory) else {
@@ -317,7 +344,10 @@ fn index_media_directory(
                 keys.extend(media_lookup_keys(&relative.to_string_lossy()));
             }
             for key in keys {
-                index.entry(key).or_default().push(path.clone());
+                let paths = index.entry(key).or_default();
+                if !paths.contains(&path) {
+                    paths.push(path.clone());
+                }
             }
         }
     }
@@ -342,8 +372,8 @@ fn media_lookup_keys(value: &str) -> Vec<String> {
             keys.push(stem.to_ascii_lowercase());
         }
     }
-    keys.sort();
-    keys.dedup();
+    let mut seen = std::collections::BTreeSet::new();
+    keys.retain(|key| seen.insert(key.clone()));
     keys
 }
 
@@ -976,68 +1006,28 @@ fn post_enterprise_package(
     token: &[u8],
     package: &[u8],
 ) -> Result<String, CommandError> {
-    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
-        return Err(CommandError {
-            code: "ENTERPRISE_UPLOAD_FAILED",
-            message: "企业上传地址无效。".into(),
-            recoverable: true,
-        });
-    }
-    let mut child = Command::new("curl.exe")
-        .args([
-            "--fail-with-body",
-            "--silent",
-            "--show-error",
-            "--connect-timeout",
-            "15",
-            "--max-time",
-            "300",
-            "-X",
-            "POST",
-            "-H",
-            &format!("Authorization: Bearer {}", String::from_utf8_lossy(token)),
-            "-H",
-            "Content-Type: application/octet-stream",
-            "--data-binary",
-            "@-",
-            endpoint,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x0800_0000)
-        .spawn()
-        .map_err(|_| CommandError {
-            code: "ENTERPRISE_UPLOAD_FAILED",
-            message: "系统未找到 curl，无法上传企业加密包。".into(),
-            recoverable: true,
-        })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(package).map_err(|_| CommandError {
-            code: "ENTERPRISE_UPLOAD_FAILED",
-            message: "企业加密包上传失败。".into(),
-            recoverable: true,
-        })?;
-    }
-    let output = child.wait_with_output().map_err(|_| CommandError {
+    let token = std::str::from_utf8(token).map_err(|_| internal_error())?;
+    let response = collector_http::post_json(
+        endpoint,
+        token,
+        package,
+        "application/octet-stream",
+        15,
+        300,
+    )
+    .map_err(|_| CommandError {
         code: "ENTERPRISE_UPLOAD_FAILED",
-        message: "未收到服务端上传结果。".into(),
+        message: "企业加密包上传失败，请检查服务端连接后重试。".into(),
         recoverable: true,
     })?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        let message = if detail.trim().is_empty() {
-            "服务端未接受企业加密包。".to_owned()
-        } else {
-            format!("服务端未接受企业加密包：{}", detail.trim())
-        };
+    if !response.is_success() {
         return Err(CommandError {
             code: "ENTERPRISE_UPLOAD_FAILED",
-            message,
+            message: format!("服务端未接受企业加密包（HTTP {}）。", response.status),
             recoverable: true,
         });
     }
-    serde_json::from_slice::<EnterpriseUploadResponse>(&output.stdout)
+    serde_json::from_slice::<EnterpriseUploadResponse>(&response.body)
         .map(|response| response.completed_at)
         .map_err(|_| CommandError {
             code: "ENTERPRISE_UPLOAD_FAILED",
@@ -1363,6 +1353,47 @@ fn server_base_url(upload_url: &str) -> &str {
         .unwrap_or(upload_url.trim_end_matches('/'))
 }
 
+fn collector_heartbeat_failure(
+    response: &collector_http::Response,
+    status_state: Option<&Arc<Mutex<CollectorScheduleStatus>>>,
+    app_state: Option<&AppState>,
+) -> CommandError {
+    let unauthorized = response.status == 401
+        && serde_json::from_slice::<serde_json::Value>(&response.body)
+            .ok()
+            .is_some_and(|value| {
+                value.get("code").and_then(serde_json::Value::as_str) == Some("UNAUTHORIZED")
+            });
+    if unauthorized {
+        if let Some(state) = status_state
+            && let Ok(mut status) = state.lock()
+        {
+            status.server_authorization_denied = true;
+            status.last_error = Some("采集端授权已失效，后台采集已停止。".into());
+        }
+        if let Some(state) = app_state {
+            state.scheduler_shutdown.store(true, Ordering::Release);
+            if let Ok(Some(app)) = state.tray_app.lock().map(|handle| handle.clone()) {
+                app.exit(0);
+            }
+        }
+    }
+    CommandError {
+        code: if unauthorized {
+            "COLLECTOR_AUTHORIZATION_DENIED"
+        } else {
+            "COLLECTOR_HEARTBEAT_FAILED"
+        },
+        message: if unauthorized {
+            "采集端授权已失效，后台采集已停止。"
+        } else {
+            "服务端暂时不可用，将稍后重试连接。"
+        }
+        .into(),
+        recoverable: !unauthorized,
+    }
+}
+
 fn sync_collector_config_with_status(
     status_state: Option<&Arc<Mutex<CollectorScheduleStatus>>>,
     app_state: Option<&AppState>,
@@ -1391,60 +1422,33 @@ fn sync_collector_config_with_status(
     };
     let pending_diagnostics = diagnostics::take_events();
     let body = serde_json::to_vec(&serde_json::json!({ "updateCapable": true, "softwareUpdateError": app_state.and_then(|state| state.software_update_error.lock().ok().and_then(|value| value.clone())), "clientVersion": env!("CARGO_PKG_VERSION"), "currentConfigRevision": current_revision, "lastAppliedRevision": current.config_revision, "lastRunAt": status.as_ref().and_then(|value| value.last_attempt_at.clone()), "lastSuccessAt": status.as_ref().and_then(|value| value.last_success_at.clone()), "lastError": status.as_ref().and_then(|value| value.last_error.clone()), "lastManualCollectionRequestId": status.as_ref().and_then(|value| value.last_manual_collection_request_id.clone()), "diagnostics": pending_diagnostics.iter().map(|event| CollectorDiagnosticEvent { timestamp: event.timestamp, event: event.event.clone(), details: event.details.clone() }).collect::<Vec<_>>() })).map_err(|_| internal_error())?;
-    let mut child = Command::new("curl.exe")
-        .args([
-            "--fail-with-body",
-            "--silent",
-            "--show-error",
-            "--connect-timeout",
-            "10",
-            "--max-time",
-            "30",
-            "-X",
-            "POST",
-            "-H",
-            &format!("Authorization: Bearer {}", current.upload_token),
-            "-H",
-            "Content-Type: application/json",
-            "--data-binary",
-            "@-",
-            &endpoint,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(0x0800_0000)
-        .spawn()
-        .map_err(|_| internal_error())?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&body).map_err(|_| internal_error())?;
-    }
-    let output = child.wait_with_output().map_err(|_| internal_error())?;
-    if !output.status.success() {
+    let response = match collector_http::post_json(
+        &endpoint,
+        &current.upload_token,
+        &body,
+        "application/json",
+        10,
+        30,
+    ) {
+        Ok(response) => response,
+        Err(_) => {
+            diagnostics::restore_events(pending_diagnostics);
+            diagnostics::write("heartbeat_failed", "transport_failed");
+            return Err(CommandError {
+                code: "COLLECTOR_HEARTBEAT_FAILED",
+                message: "无法连接服务端，将稍后重试。".into(),
+                recoverable: true,
+            });
+        }
+    };
+    if !response.is_success() {
         diagnostics::restore_events(pending_diagnostics);
         diagnostics::write("heartbeat_failed", "http_request_failed");
-        if serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .ok()
-            .and_then(|body| {
-                body.get("code")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            == Some("UNAUTHORIZED")
-            && let Some(state) = status_state
-            && let Ok(mut status) = state.lock()
-        {
-            status.server_authorization_denied = true;
-            status.last_error = Some("采集端授权已失效，后台采集已停止。".into());
-        }
-        if let Some(state) = app_state {
-            state.scheduler_shutdown.store(true, Ordering::Release);
-            if let Ok(Some(app)) = state.tray_app.lock().map(|handle| handle.clone()) {
-                app.exit(0);
-            }
-        }
-        return Ok(());
+        return Err(collector_heartbeat_failure(
+            &response,
+            status_state,
+            app_state,
+        ));
     }
     if let Some(state) = status_state
         && let Ok(mut status) = state.lock()
@@ -1452,11 +1456,11 @@ fn sync_collector_config_with_status(
         status.server_authorization_denied = false;
     }
     let response: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|_| internal_error())?;
+        serde_json::from_slice(&response.body).map_err(|_| internal_error())?;
     if let (Some(value), Some(state)) = (response.get("softwareUpdate"), app_state) {
         collector_update::receive(value, &current, state);
     }
-    let Some(control) = response.get("control") else {
+    let Some(control) = response.get("control").filter(|value| !value.is_null()) else {
         diagnostics::write("heartbeat_ok", "control=none");
         return Ok(());
     };
@@ -2168,13 +2172,14 @@ fn read_snapshot_export_with_options(
                 batch_id,
             )
             .map_err(|_| unsupported_source_schema())?;
-            ensure_media_reference(&mut message, media_options);
-            media_blobs.extend(resolve_media_metadata_with_options(
+            ensure_media_reference(&mut message);
+            media_blobs.extend(resolve_media_metadata_with_local_paths(
                 candidate,
                 &media_resolver,
                 &mut message,
                 media_options,
                 media_sink,
+                &[],
             )?);
             messages.push(message);
         }
@@ -2199,15 +2204,25 @@ fn read_snapshot_export_with_options(
                 .flatten()
                 .map(|sample| source_timestamp_cutoff(cutoff, sample))
         });
-        let query = if source_cutoff.is_some() {
-            "SELECT rowid, send_time, conversation_id, sender_id, content_type, content
-             FROM message_table WHERE send_time >= ?1 ORDER BY send_time, rowid"
+        let local_media_column = if table_columns(&connection, "message_table")
+            .iter()
+            .any(|column| column == "local_extra_content")
+        {
+            "local_extra_content"
         } else {
-            "SELECT rowid, send_time, conversation_id, sender_id, content_type, content
-             FROM message_table ORDER BY send_time, rowid"
+            "NULL"
         };
+        let predicate = if source_cutoff.is_some() {
+            "WHERE send_time >= ?1"
+        } else {
+            ""
+        };
+        let query = format!(
+            "SELECT rowid, send_time, conversation_id, sender_id, content_type, content, {local_media_column}
+             FROM message_table {predicate} ORDER BY send_time, rowid"
+        );
         let mut statement = connection
-            .prepare(query)
+            .prepare(&query)
             .map_err(|_| unsupported_source_schema())?;
         let rows = statement
             .query_map(rusqlite::params_from_iter(source_cutoff), |row| {
@@ -2221,6 +2236,7 @@ fn read_snapshot_export_with_options(
                 };
                 let raw_type = sqlite_value_to_string(row.get_ref(4)?);
                 let content = sqlite_value_to_bytes(row.get_ref(5)?);
+                let local_extra = sqlite_value_to_bytes(row.get_ref(6)?);
                 Ok((
                     row_id,
                     conversation_id,
@@ -2228,16 +2244,25 @@ fn read_snapshot_export_with_options(
                     sent_at_unix_ms,
                     raw_type,
                     content,
+                    local_extra,
                 ))
             })
             .map_err(|_| unsupported_source_schema())?;
         for row in rows {
-            let (source_message_id, conversation_id, sender_id, sent_at_unix_ms, raw_type, content) =
-                row.map_err(|_| unsupported_source_schema())?;
+            let (
+                source_message_id,
+                conversation_id,
+                sender_id,
+                sent_at_unix_ms,
+                raw_type,
+                content,
+                local_extra,
+            ) = row.map_err(|_| unsupported_source_schema())?;
             if since_unix_ms.is_some_and(|cutoff| sent_at_unix_ms < cutoff) {
                 continue;
             }
             let payload = readable_message_payload(&raw_type, &content);
+            let local_paths = local_media_paths(&raw_type, &content, &local_extra);
             let mut message = normalize(
                 RawMessageRow {
                     source_instance_id: candidate.source_id.clone(),
@@ -2253,13 +2278,14 @@ fn read_snapshot_export_with_options(
                 batch_id,
             )
             .map_err(|_| unsupported_source_schema())?;
-            ensure_media_reference(&mut message, media_options);
-            media_blobs.extend(resolve_media_metadata_with_options(
+            ensure_media_reference(&mut message);
+            media_blobs.extend(resolve_media_metadata_with_local_paths(
                 candidate,
                 &media_resolver,
                 &mut message,
                 media_options,
                 media_sink,
+                &local_paths,
             )?);
             messages.push(message);
         }
@@ -2355,12 +2381,6 @@ fn read_snapshot_export_with_options(
             collection_batch_id: batch_id,
         });
     }
-    messages.retain(|message| match message.message_type {
-        MessageType::Image => media_options.include_images,
-        MessageType::File => media_options.include_files,
-        MessageType::Audio | MessageType::Video => false,
-        _ => true,
-    });
     messages.sort_by(|left, right| {
         left.sent_at
             .cmp(&right.sent_at)
@@ -2433,7 +2453,11 @@ fn read_snapshot_export_with_options(
     let conversations = conversation_participants
         .into_iter()
         .map(|(conversation_id, participant_ids)| {
-            let conversation_type = conversation_type(&conversation_id, participant_ids.len());
+            let conversation_type = display_names
+                .conversation_types
+                .get(&conversation_id)
+                .map(String::as_str)
+                .unwrap_or_else(|| conversation_type(&conversation_id, participant_ids.len()));
             let metadata_name = || {
                 display_names
                     .conversations
@@ -2441,13 +2465,25 @@ fn read_snapshot_export_with_options(
                     .or_else(|| display_names.participants.get(&conversation_id))
                     .cloned()
             };
-            let display_name = if conversation_type == "direct" {
+            let display_name = if conversation_type == "assistant"
+                && display_names.conversations.contains_key(&conversation_id)
+            {
+                metadata_name().map(|name| {
+                    self_sender_id
+                        .as_ref()
+                        .and_then(|id| display_names.participants.get(id))
+                        .map(|employee| format!("{name}-{employee}"))
+                        .unwrap_or(name)
+                })
+            } else if conversation_type == "direct" {
                 direct_conversation_name(
                     &conversation_id,
                     &display_names.participants,
                     &display_names.conversation_members,
                 )
                 .or_else(metadata_name)
+            } else if conversation_type == "system" {
+                metadata_name().or_else(|| Some("系统通知".into()))
             } else {
                 metadata_name()
             };
@@ -2459,6 +2495,43 @@ fn read_snapshot_export_with_options(
             }
         })
         .collect::<Vec<_>>();
+    // Carry directory metadata once per conversation, including members who have
+    // not sent a message. Keeping it in raw_payload preserves full JSON round trips.
+    let members_by_conversation = conversations
+        .iter()
+        .map(|conversation| {
+            (
+                conversation.conversation_id.as_str(),
+                &conversation.participant_ids,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut profiled_conversations = std::collections::BTreeSet::new();
+    for message in &mut messages {
+        if !profiled_conversations.insert(message.conversation_id.clone()) {
+            continue;
+        }
+        let Some(members) = members_by_conversation.get(message.conversation_id.as_str()) else {
+            continue;
+        };
+        let profiles = members
+            .iter()
+            .filter_map(|id| {
+                display_names
+                    .profiles
+                    .get(id)
+                    .map(|profile| (id.clone(), serde_json::Value::Object(profile.clone())))
+            })
+            .collect::<serde_json::Map<_, _>>();
+        if !profiles.is_empty()
+            && let Some(payload) = message.raw_payload.as_object_mut()
+        {
+            payload.insert(
+                "participant_profiles".into(),
+                serde_json::Value::Object(profiles),
+            );
+        }
+    }
     let participants = participant_ids
         .into_iter()
         .map(|participant_id| ParticipantV1 {
@@ -2476,8 +2549,11 @@ fn read_snapshot_export_with_options(
                         )
                     }
                 }),
+            participant_kind: display_names
+                .participant_kinds
+                .get(&participant_id)
+                .cloned(),
             participant_id,
-            participant_kind: None,
         })
         .collect::<Vec<_>>();
     let content_sha256 = hex::encode(Sha256::digest(
@@ -2560,6 +2636,10 @@ struct DisplayNameIndex {
     conversations: BTreeMap<String, String>,
     conversation_priorities: BTreeMap<String, u8>,
     conversation_members: BTreeMap<String, BTreeMap<String, String>>,
+    conversation_types: BTreeMap<String, String>,
+    participant_kinds: BTreeMap<String, String>,
+    profiles: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    profile_priorities: BTreeMap<(String, String), u8>,
 }
 
 impl DisplayNameIndex {
@@ -2571,6 +2651,26 @@ impl DisplayNameIndex {
         {
             self.participants.insert(id.to_owned(), name);
             self.participant_priorities.insert(id.to_owned(), priority);
+        }
+    }
+
+    fn set_profile(&mut self, id: &str, key: &str, value: String, priority: u8) {
+        let id = id.trim();
+        let value = value.trim();
+        if id.is_empty() || value.is_empty() {
+            return;
+        }
+        let profile_key = (id.to_owned(), key.to_owned());
+        if self
+            .profile_priorities
+            .get(&profile_key)
+            .is_none_or(|current| priority >= *current)
+        {
+            self.profiles
+                .entry(id.to_owned())
+                .or_default()
+                .insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+            self.profile_priorities.insert(profile_key, priority);
         }
     }
 }
@@ -2627,6 +2727,14 @@ fn direct_conversation_name(
 fn conversation_type(conversation_id: &str, participant_count: usize) -> &'static str {
     if conversation_id.starts_with("S:") {
         "direct"
+    } else if conversation_id.starts_with("M:") {
+        "application"
+    } else if conversation_id.starts_with("O:") {
+        "assistant"
+    } else if conversation_id.starts_with("T:") {
+        "temporary"
+    } else if conversation_id.starts_with("Y:") {
+        "system"
     } else if conversation_id.starts_with("R:") || participant_count > 2 {
         "group"
     } else {
@@ -2675,6 +2783,8 @@ fn open_snapshot_metadata_database(
 }
 
 fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayNameIndex) {
+    collect_document_conversations(connection, index);
+    collect_participant_profiles(connection, index);
     for (table, id_column, name_column, priority) in [
         ("user_table", "id", "name", 100),
         ("wechat_contactV1", "wxid", "name", 80),
@@ -2707,6 +2817,19 @@ fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayN
         &mut index.conversation_priorities,
         100,
     );
+    // O:* 会话是面向当前员工的应用私聊。把应用本身也放进参与者目录，
+    // 后续才能稳定显示“应用名-用户名”，而不是短 ID。
+    let assistant_ids = index
+        .conversations
+        .iter()
+        .filter(|(id, name)| id.starts_with("O:") && !name.trim().is_empty())
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for id in assistant_ids {
+        let name = index.conversations.get(&id).cloned().unwrap_or_default();
+        index.set_participant(&id, name, 105);
+        index.participant_kinds.insert(id, "bot".into());
+    }
 
     let Ok(mut statement) = connection.prepare(
         "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
@@ -2848,6 +2971,449 @@ fn collect_display_names(connection: &rusqlite::Connection, index: &mut DisplayN
     }
 }
 
+fn collect_participant_profiles(connection: &rusqlite::Connection, index: &mut DisplayNameIndex) {
+    let fields: [(&str, &[&str]); 11] = [
+        ("mobile", &["mobile", "mobile_phone", "mobilephone"]),
+        ("phone", &["phone", "telephone", "tel"]),
+        (
+            "office_phone",
+            &[
+                "office_phone",
+                "officephone",
+                "work_phone",
+                "workphone",
+                "landline",
+            ],
+        ),
+        ("email", &["email", "mail", "email_address"]),
+        (
+            "employee_no",
+            &["employee_no", "employee_number", "staff_no", "number"],
+        ),
+        (
+            "department",
+            &["department", "department_name", "dept_name", "dept"],
+        ),
+        (
+            "organization",
+            &[
+                "external_corp_name",
+                "corp_name",
+                "company_name",
+                "company",
+                "enterprise",
+            ],
+        ),
+        (
+            "position",
+            &["position", "external_job", "job_title", "title", "job"],
+        ),
+        ("address", &["address", "work_address", "office_address"]),
+        ("english_name", &["english_name", "englishname", "en_name"]),
+        ("signature", &["signature", "personal_signature", "sign"]),
+    ];
+    for (table, id_candidates) in [
+        ("user_table", &["id"][..]),
+        ("wechat_contactV1", &["wxid"][..]),
+        ("USER", &["RID"][..]),
+    ] {
+        let columns = table_columns(connection, table);
+        let Some(id_column) = choose_column(&columns, id_candidates) else {
+            continue;
+        };
+        let selected = fields
+            .iter()
+            .filter_map(|(key, candidates)| {
+                let present = choose_identifier_columns(&columns, candidates);
+                (!present.is_empty()).then_some((*key, present))
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            continue;
+        }
+        let mut projection = vec![quote_identifier(id_column)];
+        projection.extend(selected.iter().map(|(_, columns)| {
+            let alternatives = columns
+                .iter()
+                .map(|column| {
+                    format!(
+                        "nullif(trim(CAST({} AS TEXT)), '')",
+                        quote_identifier(column)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if alternatives.len() == 1 {
+                alternatives[0].clone()
+            } else {
+                format!("coalesce({})", alternatives.join(", "))
+            }
+        }));
+        let sql = format!(
+            "SELECT {} FROM {}{} LIMIT 100000",
+            projection.join(", "),
+            quote_identifier(table),
+            choose_column(
+                &columns,
+                &[
+                    "updated_at",
+                    "update_time",
+                    "modify_time",
+                    "last_update_time",
+                    "updated"
+                ]
+            )
+            .map(|column| format!(" ORDER BY {} DESC", quote_identifier(column)))
+            .unwrap_or_default()
+        );
+        let Ok(mut statement) = connection.prepare(&sql) else {
+            continue;
+        };
+        let Ok(rows) = statement.query_map([], |row| {
+            let id = sqlite_value_to_string(row.get_ref(0)?);
+            let mut profile = serde_json::Map::new();
+            for (index, (key, _)) in selected.iter().enumerate() {
+                let value = sqlite_value_to_string(row.get_ref(index + 1)?);
+                if !value.trim().is_empty() && value.len() <= 2048 {
+                    profile.insert((*key).into(), serde_json::Value::String(value));
+                }
+            }
+            Ok((id, profile))
+        }) else {
+            continue;
+        };
+        for (id, profile) in rows.filter_map(Result::ok) {
+            let id = id.trim();
+            if id.is_empty() || profile.is_empty() {
+                continue;
+            }
+            let priority = match table {
+                "user_table" => 100,
+                "USER" => 90,
+                _ => 80,
+            };
+            for (key, value) in profile {
+                if let Some(value) = value.as_str() {
+                    index.set_profile(id, &key, value.to_owned(), priority);
+                }
+            }
+        }
+    }
+    collect_protobuf_participant_profiles(connection, index);
+    collect_department_profiles(connection, index);
+}
+
+fn collect_protobuf_participant_profiles(
+    connection: &rusqlite::Connection,
+    index: &mut DisplayNameIndex,
+) {
+    let Ok(mut statement) = connection.prepare("SELECT id, pb_content FROM user_table") else {
+        return;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            sqlite_value_to_string(row.get_ref(0)?),
+            sqlite_value_to_bytes(row.get_ref(1)?),
+        ))
+    }) else {
+        return;
+    };
+    for (id, raw) in rows.filter_map(Result::ok) {
+        let profile = decode_participant_profile(&id, &raw);
+        if profile.is_empty() {
+            continue;
+        }
+        for (key, value) in profile {
+            if let Some(value) = value.as_str() {
+                index.set_profile(&id, &key, value.to_owned(), 110);
+            }
+        }
+    }
+}
+
+fn decode_participant_profile(id: &str, raw: &[u8]) -> serde_json::Map<String, serde_json::Value> {
+    let mut profile = serde_json::Map::new();
+    let Some(fields) = protobuf_fields(raw) else {
+        return profile;
+    };
+    // Bind the payload to its directory row before projecting any private fields.
+    if !fields.iter().any(|(field, value)| matches!((field, value), (1, ProtobufValue::Integer(value)) if value.to_string() == id)) { return profile; }
+    for (field, value) in &fields {
+        let ProtobufValue::Bytes(bytes) = value else {
+            continue;
+        };
+        if let Some(text) = profile_text(bytes) {
+            let key = match field {
+                3 | 17 if text.contains('@') && !text.chars().any(char::is_whitespace) => {
+                    Some("email")
+                }
+                5 => Some("mobile"),
+                // Some client versions keep the landline/extension in the
+                // compact profile envelope instead of the ordinary columns.
+                6 if looks_like_phone(&text) => Some("phone"),
+                22 => Some("english_name"),
+                50 => Some("signature"),
+                // The visible position column is empty on newer clients;
+                // field 55 is the corresponding UTF-8 directory attribute.
+                55 => Some("position"),
+                _ => None,
+            };
+            if let Some(key) = key {
+                profile
+                    .entry(key)
+                    .or_insert(serde_json::Value::String(text));
+            }
+        }
+        // The directory stores configured attributes as labeled records at 33.1.
+        // Parse only this observed envelope; do not treat arbitrary protobuf text
+        // (login accounts, URLs, internal IDs) as contact information.
+        if *field != 33 {
+            continue;
+        }
+        for (entry_field, entry) in protobuf_fields(bytes).unwrap_or_default() {
+            let (1, ProtobufValue::Bytes(entry)) = (entry_field, entry) else {
+                continue;
+            };
+            let Some(attributes) = protobuf_fields(entry) else {
+                continue;
+            };
+            let text_at = |wanted| {
+                attributes.iter().find_map(|(field, value)| match value {
+                    ProtobufValue::Bytes(raw) if *field == wanted => profile_text(raw),
+                    _ => None,
+                })
+            };
+            let (Some(label), Some(value)) = (text_at(1), text_at(2)) else {
+                continue;
+            };
+            if label.len() > 128 || label.chars().any(char::is_control) {
+                continue;
+            }
+            let key = match label.as_str() {
+                "手机" | "手机号" | "手机号码" => "mobile".into(),
+                "座机" | "办公电话" => "office_phone".into(),
+                "电话" | "联系电话" => "phone".into(),
+                "邮箱" | "电子邮箱" | "企业邮箱" => "email".into(),
+                "工号" | "员工编号" | "员工工号" => "employee_no".into(),
+                "部门" => "department".into(),
+                "企业" | "公司" => "organization".into(),
+                "职位" | "职务" => "position".into(),
+                "地址" => "address".into(),
+                "英文名" => "english_name".into(),
+                _ => format!("custom:{label}"),
+            };
+            profile.insert(key, serde_json::Value::String(value));
+        }
+    }
+    profile
+}
+
+fn looks_like_phone(value: &str) -> bool {
+    let digits = value
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .count();
+    (3..=20).contains(&digits)
+        && value
+            .chars()
+            .all(|character| character.is_ascii_digit() || "+-()－— extEXT".contains(character))
+}
+
+fn profile_text(raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?.trim();
+    (!text.is_empty()
+        && text.len() <= 2048
+        && !text
+            .chars()
+            .any(|value| value.is_control() && value != '\n' && value != '\t'))
+    .then(|| text.to_owned())
+}
+
+fn collect_department_profiles(connection: &rusqlite::Connection, index: &mut DisplayNameIndex) {
+    let Ok(mut departments) =
+        connection.prepare("SELECT id, name, parent_id FROM department_tableV2")
+    else {
+        return;
+    };
+    let Ok(rows) = departments.query_map([], |row| {
+        Ok((
+            sqlite_value_to_string(row.get_ref(0)?),
+            sqlite_value_to_string(row.get_ref(1)?),
+            sqlite_value_to_string(row.get_ref(2)?),
+        ))
+    }) else {
+        return;
+    };
+    let departments = rows
+        .filter_map(Result::ok)
+        .map(|(id, name, parent)| (id, (name, parent)))
+        .collect::<BTreeMap<_, _>>();
+    let mut organization_roots = BTreeMap::<String, String>::new();
+    for sql in [
+        "SELECT u.id, c.root_department_id FROM user_table u JOIN company_group4 c ON c.id = u.corp_id",
+        "SELECT u.id, roots.id FROM user_table u JOIN (
+           SELECT min(d.id) AS id, d.corpany_id FROM department_tableV2 d
+           WHERE NOT EXISTS (SELECT 1 FROM department_tableV2 p WHERE p.id = d.parent_id)
+           GROUP BY d.corpany_id HAVING count(*) = 1
+         ) roots ON roots.corpany_id = u.corp_id",
+    ] {
+        if let Ok(mut statement) = connection.prepare(sql)
+            && let Ok(rows) = statement.query_map([], |row| {
+                Ok((
+                    sqlite_value_to_string(row.get_ref(0)?),
+                    sqlite_value_to_string(row.get_ref(1)?),
+                ))
+            })
+        {
+            for (id, root) in rows.filter_map(Result::ok) {
+                if let Some((name, _)) = departments.get(&root)
+                    && !name.trim().is_empty()
+                {
+                    index.set_profile(&id, "organization", name.clone(), 115);
+                    organization_roots.entry(id).or_insert(root);
+                }
+            }
+        }
+    }
+    let Ok(mut statement) = connection.prepare("SELECT user_id, department_id, job FROM user_dept_tableV2 ORDER BY is_main_job DESC, sort, department_id") else { return; };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            sqlite_value_to_string(row.get_ref(0)?),
+            sqlite_value_to_string(row.get_ref(1)?),
+            sqlite_value_to_string(row.get_ref(2)?),
+        ))
+    }) else {
+        return;
+    };
+    let mut paths = BTreeMap::<String, Vec<String>>::new();
+    for (id, mut department_id, job) in rows.filter_map(Result::ok) {
+        if id.trim().is_empty() {
+            continue;
+        }
+        let mut visited = std::collections::BTreeSet::new();
+        let mut names = Vec::new();
+        while visited.len() < 32 && visited.insert(department_id.clone()) {
+            if organization_roots.get(&id) == Some(&department_id) {
+                break;
+            }
+            let Some((name, parent)) = departments.get(&department_id) else {
+                break;
+            };
+            if !name.trim().is_empty() {
+                names.push(name.clone());
+            }
+            department_id = parent.clone();
+        }
+        names.reverse();
+        let path = names.join("/");
+        let user_paths = paths.entry(id.clone()).or_default();
+        if !path.is_empty() && !user_paths.contains(&path) {
+            user_paths.push(path);
+        }
+        if !job.trim().is_empty() {
+            let has_explicit_position = index
+                .profiles
+                .get(&id)
+                .and_then(|profile| profile.get("position"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            if !has_explicit_position {
+                index.set_profile(&id, "position", job, 120);
+            }
+        }
+    }
+    for (id, paths) in paths {
+        if !paths.is_empty() {
+            index.set_profile(&id, "department", paths.join("；"), 120);
+        }
+    }
+}
+
+fn collect_document_conversations(connection: &rusqlite::Connection, index: &mut DisplayNameIndex) {
+    let Ok(mut statement) =
+        connection.prepare("SELECT id, type_content FROM conversation_table WHERE id LIKE 'M:%'")
+    else {
+        return;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            sqlite_value_to_bytes(row.get_ref(1)?),
+        ))
+    }) else {
+        return;
+    };
+    for (id, content) in rows.filter_map(Result::ok) {
+        let Some((title, is_report)) = document_conversation_metadata(&id, &content) else {
+            continue;
+        };
+        index.conversations.insert(id.clone(), title);
+        index.conversation_priorities.insert(id.clone(), 110);
+        index
+            .conversation_types
+            .insert(id.clone(), "document".into());
+        if let Some(entity_id) = id.strip_prefix("M:") {
+            index.set_participant(
+                entity_id,
+                if is_report {
+                    "汇报提醒"
+                } else {
+                    "文档通知"
+                }
+                .into(),
+                110,
+            );
+            index
+                .participant_kinds
+                .insert(entity_id.into(), "bot".into());
+        }
+    }
+}
+
+fn document_conversation_metadata(id: &str, raw: &[u8]) -> Option<(String, bool)> {
+    let entity_id = id.strip_prefix("M:")?.parse::<u64>().ok()?;
+    let mut offset = 0;
+    let mut entity_matches = false;
+    let mut title = None;
+    let mut document_url = None;
+    while offset < raw.len() {
+        let tag = read_varint(raw, &mut offset)?;
+        if tag >> 3 == 0 {
+            return None;
+        }
+        match tag & 7 {
+            0 => {
+                let value = read_varint(raw, &mut offset)?;
+                if tag >> 3 == 1 {
+                    entity_matches = value == entity_id;
+                }
+            }
+            1 => offset = offset.checked_add(8)?,
+            2 => {
+                let length = usize::try_from(read_varint(raw, &mut offset)?).ok()?;
+                let end = offset.checked_add(length)?;
+                let bytes = raw.get(offset..end)?;
+                offset = end;
+                // Only the observed title/location fields are needed;
+                // other fields may contain document access material.
+                match tag >> 3 {
+                    4 => document_url = std::str::from_utf8(bytes).ok().map(str::to_owned),
+                    5 => title = std::str::from_utf8(bytes).ok().and_then(clean_display_name),
+                    _ => {}
+                }
+            }
+            5 => offset = offset.checked_add(4)?,
+            _ => return None,
+        }
+        if offset > raw.len() {
+            return None;
+        }
+    }
+    let url = document_url?;
+    (entity_matches && url.starts_with("https://doc.weixin.qq.com/"))
+        .then(|| (title, url.starts_with("https://doc.weixin.qq.com/journal/")))
+        .and_then(|(title, report)| title.map(|title| (title, report)))
+}
+
 fn collect_group_announcements(
     connection: &rusqlite::Connection,
     target: &mut Vec<(String, String, i64)>,
@@ -2881,7 +3447,7 @@ fn collect_group_announcements(
         return;
     };
     for (conversation_id, raw_body, raw_time) in rows.filter_map(Result::ok) {
-        let Some(body) = decode_wecom_body(&raw_body) else {
+        let Some(body) = decode_wecom_metadata_body(&raw_body) else {
             continue;
         };
         if conversation_id.trim().is_empty() || is_opaque_identifier(&body) {
@@ -3075,6 +3641,58 @@ fn sqlite_value_to_bytes(value: rusqlite::types::ValueRef<'_>) -> Vec<u8> {
 }
 
 fn decode_wecom_body(raw: &[u8]) -> Option<String> {
+    if let Some(segments) = decode_wecom_rich_segments(raw) {
+        let text = segments
+            .iter()
+            .filter_map(|segment| segment.get("text").and_then(serde_json::Value::as_str))
+            .collect::<String>();
+        return clean_message_text(&text);
+    }
+    let values = decode_wecom_values(raw);
+    (!values.is_empty()).then(|| values.join("\n"))
+}
+
+fn decode_wecom_rich_segments(raw: &[u8]) -> Option<Vec<serde_json::Value>> {
+    let mut segments = Vec::new();
+    for (field, value) in protobuf_fields(raw)? {
+        let ProtobufValue::Bytes(fragment) = value else {
+            return None;
+        };
+        if field != 1 {
+            return None;
+        }
+        let mut kind = 0;
+        let mut content = None;
+        for (field, value) in protobuf_fields(fragment)? {
+            match (field, value) {
+                (1, ProtobufValue::Integer(value)) => kind = value,
+                (2, ProtobufValue::Bytes(value)) => content = Some(value),
+                _ => {}
+            }
+        }
+        let fields = protobuf_fields(content?)?;
+        let value = fields
+            .iter()
+            .find_map(|(field, value)| match (field, value) {
+                (1, ProtobufValue::Bytes(value)) => Some(*value),
+                _ => None,
+            })?;
+        let text = std::str::from_utf8(value).ok()?;
+        if text
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            return None;
+        }
+        segments.push(serde_json::json!({
+            "kind": if kind == 3 { "emoji" } else { "text" },
+            "text": text,
+        }));
+    }
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn decode_wecom_metadata_body(raw: &[u8]) -> Option<String> {
     let mut values = decode_wecom_values(raw);
     let mut seen = std::collections::BTreeSet::new();
     values.retain(|value| seen.insert(value.clone()));
@@ -3108,6 +3726,16 @@ fn is_opaque_identifier(value: &str) -> bool {
 }
 
 fn readable_message_payload(raw_type: &str, raw: &[u8]) -> serde_json::Value {
+    if matches!(raw_type.trim(), "14" | "29")
+        && let Some(payload) = wecom_image_payload(raw_type.trim(), raw)
+    {
+        return payload;
+    }
+    if raw_type.trim() == "20"
+        && let Some(payload) = wecom_file_payload(raw)
+    {
+        return payload;
+    }
     if let Ok(serde_json::Value::Object(mut payload)) =
         serde_json::from_slice::<serde_json::Value>(raw)
     {
@@ -3120,18 +3748,143 @@ fn readable_message_payload(raw_type: &str, raw: &[u8]) -> serde_json::Value {
         return serde_json::Value::Object(payload);
     }
     let values = decode_wecom_values(raw);
-    let text = decode_wecom_body(raw);
+    let text = if raw_type.trim() == "2" {
+        decode_wecom_body(raw)
+    } else {
+        decode_wecom_metadata_body(raw)
+    };
     let mut payload = serde_json::Map::new();
     if let Some(text) = text {
         let key = match raw_type.trim() {
-            "15" | "16" => "name",
+            "15" | "16" | "20" => "name",
             "13" => "title",
             _ => "text",
         };
         payload.insert(key.into(), serde_json::Value::String(text));
     }
+    if raw_type.trim() == "2"
+        && let Some(segments) = decode_wecom_rich_segments(raw)
+    {
+        payload.insert("rich_segments".into(), serde_json::Value::Array(segments));
+    }
     enrich_media_payload(raw_type, &mut payload, &values);
     serde_json::Value::Object(payload)
+}
+
+fn wecom_image_payload(raw_type: &str, raw: &[u8]) -> Option<serde_json::Value> {
+    let fields = protobuf_fields(raw)?;
+    let mut payload = serde_json::Map::new();
+    let mut hints = Vec::new();
+    // Project only observed local lookup metadata. Field 1 contains remote
+    // access material and must never enter the archive or diagnostics.
+    for (field, value) in fields {
+        if let ProtobufValue::Bytes(bytes) = value {
+            let Some(text) = std::str::from_utf8(bytes).ok() else {
+                continue;
+            };
+            if raw_type == "14" && field == 2 {
+                let name = text.replace('\\', "/").rsplit('/').next()?.to_owned();
+                if let Some(name) = clean_message_text(&name) {
+                    payload.insert("name".into(), name.clone().into());
+                    payload.insert("media_path".into(), name.into());
+                }
+            } else if ((raw_type == "14" && matches!(field, 8 | 10 | 30))
+                || (raw_type == "29" && field == 6))
+                && text.len() == 32
+                && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !hints
+                    .iter()
+                    .any(|hint: &String| hint.eq_ignore_ascii_case(text))
+            {
+                hints.push(text.to_owned());
+            }
+        }
+    }
+    payload.insert("media_lookup_hints".into(), serde_json::json!(hints));
+    Some(payload.into())
+}
+
+fn local_media_paths(raw_type: &str, content: &[u8], local_extra: &[u8]) -> Vec<PathBuf> {
+    if !is_media_message_type(raw_type) {
+        return Vec::new();
+    }
+    let primary_resource = protobuf_fields(content)
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|(field, value)| {
+            if let (1, ProtobufValue::Bytes(bytes)) = (field, value) {
+                Some(bytes)
+            } else {
+                None
+            }
+        });
+    let mut paths = Vec::new();
+    for (field, value) in protobuf_fields(local_extra).unwrap_or_default() {
+        let (8, ProtobufValue::Bytes(cache)) = (field, value) else {
+            continue;
+        };
+        let mut previous = None;
+        for (field, value) in protobuf_fields(cache).unwrap_or_default() {
+            let (1, ProtobufValue::Bytes(bytes)) = (field, value) else {
+                continue;
+            };
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                let path = PathBuf::from(text);
+                let local_disk = matches!(path.components().next(),
+                    Some(std::path::Component::Prefix(prefix))
+                    if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)));
+                if path.is_absolute()
+                    && local_disk
+                    && !path
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                {
+                    paths.push((
+                        previous != primary_resource || primary_resource.is_none(),
+                        path,
+                    ));
+                }
+            }
+            previous = Some(bytes);
+        }
+    }
+    paths.sort_by_key(|(secondary, _)| *secondary);
+    let mut seen = std::collections::BTreeSet::new();
+    paths
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+fn wecom_file_payload(raw: &[u8]) -> Option<serde_json::Value> {
+    let mut name = None;
+    let mut size = None;
+    let mut md5 = None;
+    for (field, value) in protobuf_fields(raw)? {
+        match (field, value) {
+            (2, ProtobufValue::Bytes(bytes)) => {
+                name = std::str::from_utf8(bytes).ok().and_then(clean_message_text)
+            }
+            (4, ProtobufValue::Integer(value)) => size = Some(value),
+            (10, ProtobufValue::Bytes(bytes)) => {
+                md5 = std::str::from_utf8(bytes)
+                    .ok()
+                    .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .map(str::to_owned)
+            }
+            _ => {}
+        }
+    }
+    let name = name?;
+    let mut payload = serde_json::json!({ "name": name, "media_path": name });
+    if let Some(size) = size {
+        payload["size"] = size.into();
+    }
+    if let Some(md5) = md5 {
+        payload["media_md5"] = md5.into();
+    }
+    Some(payload)
 }
 
 fn enrich_media_payload(
@@ -3187,6 +3940,7 @@ fn is_media_message_type(raw_type: &str) -> bool {
             | "img"
             | "15"
             | "16"
+            | "20"
             | "49"
             | "49:file"
             | "file"
@@ -3197,7 +3951,7 @@ fn is_media_message_type(raw_type: &str) -> bool {
 fn media_locator_candidate(raw_type: &str, values: &[String]) -> Option<String> {
     let allow_plain_name = matches!(
         raw_type.trim().to_ascii_lowercase().as_str(),
-        "15" | "16" | "49" | "49:file" | "file" | "attachment"
+        "15" | "16" | "20" | "49" | "49:file" | "file" | "attachment"
     );
     let mut candidates = values
         .iter()
@@ -3256,6 +4010,12 @@ fn media_locator_score(value: &str, allow_plain_name: bool) -> u8 {
                 | "mp4"
                 | "mov"
                 | "dat"
+                | "exe"
+                | "msi"
+                | "msix"
+                | "bat"
+                | "cmd"
+                | "ps1"
         )
     });
     if normalized.contains('/') && known_extension {
@@ -3280,23 +4040,24 @@ fn media_locator_score(value: &str, allow_plain_name: bool) -> u8 {
     }
 }
 
-fn ensure_media_reference(
-    message: &mut archive_domain::MessageV1,
-    options: MediaCollectionOptions,
-) {
-    let enabled = match message.message_type {
-        MessageType::Image => options.include_images,
-        MessageType::File => options.include_files,
-        _ => false,
-    };
-    if !enabled || !message.media.is_empty() {
+fn ensure_media_reference(message: &mut archive_domain::MessageV1) {
+    if !matches!(
+        message.message_type,
+        MessageType::Image | MessageType::File | MessageType::Audio | MessageType::Video
+    ) || !message.media.is_empty()
+    {
         return;
     }
     message.media.push(archive_domain::MediaRefV1 {
         content_hash: None,
-        original_name: (message.message_type == MessageType::File)
-            .then(|| message.body_text.clone())
-            .flatten(),
+        original_name: message
+            .raw_payload
+            .get("name")
+            .or_else(|| message.raw_payload.get("filename"))
+            .or_else(|| message.raw_payload.get("file_name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| message.body_text.clone()),
         mime_type: None,
         size_bytes: None,
         source_locator: message.source_message_id.clone(),
@@ -3305,51 +4066,64 @@ fn ensure_media_reference(
     });
 }
 
-fn parse_protobuf_text(raw: &[u8], depth: usize, values: &mut Vec<String>) -> Option<()> {
-    if raw.is_empty() || depth > 4 {
-        return None;
-    }
+enum ProtobufValue<'a> {
+    Integer(u64),
+    Bytes(&'a [u8]),
+    Fixed,
+}
+
+fn protobuf_fields(raw: &[u8]) -> Option<Vec<(u64, ProtobufValue<'_>)>> {
     let mut offset = 0;
-    let mut field_count = 0;
+    let mut fields = Vec::new();
     while offset < raw.len() {
         let tag = read_varint(raw, &mut offset)?;
-        if tag == 0 {
+        let field = tag >> 3;
+        if field == 0 {
             return None;
         }
-        field_count += 1;
-        match tag & 7 {
-            0 => {
-                read_varint(raw, &mut offset)?;
+        let value = match tag & 7 {
+            0 => ProtobufValue::Integer(read_varint(raw, &mut offset)?),
+            1 => {
+                offset = offset.checked_add(8)?;
+                ProtobufValue::Fixed
             }
-            1 => offset = offset.checked_add(8)?,
             2 => {
                 let length = usize::try_from(read_varint(raw, &mut offset)?).ok()?;
                 let end = offset.checked_add(length)?;
                 let segment = raw.get(offset..end)?;
                 offset = end;
-                let mut nested = Vec::new();
-                if parse_protobuf_text(segment, depth + 1, &mut nested).is_some()
-                    && !nested.is_empty()
-                {
-                    for text in nested {
-                        if !values.contains(&text) {
-                            values.push(text);
-                        }
-                    }
-                } else if let Some(text) = readable_protobuf_segment(segment)
-                    && !values.contains(&text)
-                {
-                    values.push(text);
-                }
+                ProtobufValue::Bytes(segment)
             }
-            5 => offset = offset.checked_add(4)?,
+            5 => {
+                offset = offset.checked_add(4)?;
+                ProtobufValue::Fixed
+            }
             _ => return None,
-        }
+        };
         if offset > raw.len() {
             return None;
         }
+        fields.push((field, value));
     }
-    (field_count > 0).then_some(())
+    (!fields.is_empty()).then_some(fields)
+}
+
+fn parse_protobuf_text(raw: &[u8], depth: usize, values: &mut Vec<String>) -> Option<()> {
+    if raw.is_empty() || depth > 4 {
+        return None;
+    }
+    for (_, value) in protobuf_fields(raw)? {
+        if let ProtobufValue::Bytes(segment) = value {
+            let mut nested = Vec::new();
+            if parse_protobuf_text(segment, depth + 1, &mut nested).is_some() && !nested.is_empty()
+            {
+                values.extend(nested);
+            } else if let Some(text) = readable_protobuf_segment(segment) {
+                values.push(text);
+            }
+        }
+    }
+    Some(())
 }
 
 fn read_varint(raw: &[u8], offset: &mut usize) -> Option<u64> {
@@ -3415,20 +4189,52 @@ fn source_timestamp_cutoff(cutoff_unix_ms: i64, sample: i64) -> i64 {
     }
 }
 
-fn resolve_media_metadata_with_options(
+fn resolve_media_metadata_with_local_paths(
     candidate: &SourceCandidate,
     resolver: &MediaResolver,
     message: &mut archive_domain::MessageV1,
     options: MediaCollectionOptions,
     media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
+    local_paths: &[PathBuf],
 ) -> Result<Vec<archive_domain::MediaBlobV1>, CommandError> {
     let mut blobs = Vec::new();
-    if message.media.is_empty() {
+    if message.media.is_empty()
+        || (!options.include_files && !options.include_images)
+        || matches!(
+            message.message_type,
+            archive_domain::MessageType::Audio | archive_domain::MessageType::Video
+        )
+    {
         return Ok(blobs);
     }
     for media in &mut message.media {
-        let resolved = resolver
-            .resolve(&candidate.root_path, &media.source_locator)
+        let resolved = local_paths
+            .iter()
+            .find_map(|path| resolver.authorized_file(path.clone()))
+            .or_else(|| resolver.resolve(&candidate.root_path, &media.source_locator))
+            .or_else(|| {
+                media
+                    .original_name
+                    .as_deref()
+                    .and_then(|name| resolver.resolve(&candidate.root_path, name))
+            })
+            .or_else(|| {
+                message
+                    .raw_payload
+                    .get("media_md5")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|md5| resolver.resolve(&candidate.root_path, md5))
+            })
+            .or_else(|| {
+                message
+                    .raw_payload
+                    .get("media_lookup_hints")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .find_map(|hint| resolver.resolve(&candidate.root_path, hint))
+            })
             .or_else(|| resolver.resolve(&candidate.root_path, &message.source_message_id));
         match resolved
             .as_deref()
@@ -4044,6 +4850,7 @@ fn scheduled_collect_and_upload(
     config: &EnterpriseCollectorConfig,
     force_upload: bool,
 ) -> Result<ScheduledCollectionOutcome, CommandError> {
+    ensure_collector_config_fresh(config)?;
     let candidates = discover_local_sources();
     let media_options = MediaCollectionOptions {
         include_files: config.include_files,
@@ -4117,6 +4924,74 @@ impl From<&SourceCandidate> for SafeSourceCandidate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_schedule_waits_for_config_refresh_without_accessing_sources() {
+        let config: EnterpriseCollectorConfig = serde_json::from_value(serde_json::json!({
+            "schemaVersion": "enterprise-collector.v1",
+            "organizationId": "synthetic", "organizationName": "synthetic",
+            "collectionNotice": "synthetic", "keyId": "synthetic",
+            "publicKeyHex": "", "signingPublicKeyHex": "", "signatureHex": "",
+            "uploadUrl": "http://127.0.0.1:1/", "uploadToken": "synthetic",
+            "configExpiresAt": (Utc::now() - TimeDelta::minutes(1)).to_rfc3339(),
+        }))
+        .unwrap();
+        let state = AppState::default();
+        assert!(matches!(
+            scheduled_collect_and_upload(&state, &config, false),
+            Err(CommandError {
+                code: "ENTERPRISE_CONFIG_EXPIRED",
+                ..
+            })
+        ));
+        assert!(!state.scheduler_shutdown.load(Ordering::Acquire));
+        assert!(state.latest_export.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn transient_heartbeat_failures_keep_the_collector_alive() {
+        let state = AppState::default();
+        for (status, body) in [
+            (503, br#"{"code":"UNAUTHORIZED"}"#.as_slice()),
+            (502, b"upstream unavailable".as_slice()),
+            (401, b"proxy authentication".as_slice()),
+        ] {
+            let error = collector_heartbeat_failure(
+                &collector_http::Response {
+                    status,
+                    body: body.to_vec(),
+                },
+                Some(&state.schedule_status),
+                Some(&state),
+            );
+            assert!(error.recoverable);
+            assert!(!state.scheduler_shutdown.load(Ordering::Acquire));
+            assert!(
+                !state
+                    .schedule_status
+                    .lock()
+                    .unwrap()
+                    .server_authorization_denied
+            );
+        }
+        let error = collector_heartbeat_failure(
+            &collector_http::Response {
+                status: 401,
+                body: br#"{"code":"UNAUTHORIZED"}"#.to_vec(),
+            },
+            Some(&state.schedule_status),
+            Some(&state),
+        );
+        assert!(!error.recoverable);
+        assert!(state.scheduler_shutdown.load(Ordering::Acquire));
+        assert!(
+            state
+                .schedule_status
+                .lock()
+                .unwrap()
+                .server_authorization_denied
+        );
+    }
 
     #[test]
     fn collector_schedule_enabling_runs_now_before_waiting_for_the_interval() {
@@ -4459,6 +5334,159 @@ mod tests {
     }
 
     #[test]
+    fn decodes_labeled_profile_attributes_without_importing_unrelated_payload_fields() {
+        fn text_field(field: u64, text: &[u8], out: &mut Vec<u8>) {
+            write_test_varint((field << 3) | 2, out);
+            write_test_varint(text.len() as u64, out);
+            out.extend_from_slice(text);
+        }
+        let mut raw = vec![8, 42];
+        text_field(3, b"person@example.invalid", &mut raw);
+        text_field(5, b"13800000000", &mut raw);
+        text_field(6, b"010-12345678", &mut raw);
+        text_field(50, "及时交付".as_bytes(), &mut raw);
+        text_field(55, "项目经理".as_bytes(), &mut raw);
+        text_field(11, b"https://example.invalid/private-avatar", &mut raw);
+        let mut attributes = Vec::new();
+        for (label, value) in [
+            ("工号", "TEST-001"),
+            ("座机", "1001"),
+            ("办公地点", "测试楼A栋"),
+        ] {
+            let mut entry = Vec::new();
+            text_field(1, label.as_bytes(), &mut entry);
+            text_field(2, value.as_bytes(), &mut entry);
+            text_field(1, &entry, &mut attributes);
+        }
+        text_field(33, &attributes, &mut raw);
+        let profile = decode_participant_profile("42", &raw);
+        assert_eq!(profile["email"], "person@example.invalid");
+        assert_eq!(profile["mobile"], "13800000000");
+        assert_eq!(profile["phone"], "010-12345678");
+        assert_eq!(profile["signature"], "及时交付");
+        assert_eq!(profile["position"], "项目经理");
+        assert_eq!(profile["employee_no"], "TEST-001");
+        assert_eq!(profile["office_phone"], "1001");
+        assert_eq!(profile["custom:办公地点"], "测试楼A栋");
+        assert!(
+            !serde_json::to_string(&profile)
+                .unwrap()
+                .contains("private-avatar")
+        );
+        assert!(decode_participant_profile("43", &raw).is_empty());
+        assert!(decode_participant_profile("42", &raw[..raw.len() - 1]).is_empty());
+    }
+
+    #[test]
+    fn collects_configured_profiles_and_resolves_department_hierarchy() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(
+            "CREATE TABLE user_table (id TEXT, name TEXT, mobile TEXT, office_phone TEXT, email TEXT, number TEXT, corp_id TEXT, position TEXT, external_job TEXT, external_corp_name TEXT, company_name TEXT);
+             INSERT INTO user_table VALUES ('member-a', '测试成员甲', '13800000000', '010-00000000', 'member@example.invalid', 'TEST-001', 'corp-a', '', '工程师', '', '');
+             INSERT INTO user_table VALUES ('member-b', '测试成员乙', '', '', '', '', 'corp-a', '', '', '', '');
+             CREATE TABLE company_group4 (id TEXT, root_department_id TEXT);
+             INSERT INTO company_group4 VALUES ('corp-a', 'root');
+             CREATE TABLE department_tableV2 (id TEXT, name TEXT, parent_id TEXT, corpany_id TEXT);
+             INSERT INTO department_tableV2 VALUES ('root', '测试企业', '0', 'corp-a'), ('sales', '销售部', 'root', 'corp-a'), ('team', '业务组', 'sales', 'corp-a');
+             CREATE TABLE user_dept_tableV2 (user_id TEXT, department_id TEXT, job TEXT, is_main_job INTEGER, sort INTEGER);
+             INSERT INTO user_dept_tableV2 VALUES ('member-a', 'team', '经理', 1, 0), ('member-b', 'missing', '', 1, 0);"
+        ).unwrap();
+        let mut index = DisplayNameIndex::default();
+        collect_display_names(&connection, &mut index);
+        let profile = &index.profiles["member-a"];
+        assert_eq!(profile["mobile"], "13800000000");
+        assert_eq!(profile["office_phone"], "010-00000000");
+        assert_eq!(profile["email"], "member@example.invalid");
+        assert_eq!(profile["employee_no"], "TEST-001");
+        assert_eq!(profile["department"], "销售部/业务组");
+        assert_eq!(profile["organization"], "测试企业");
+        assert_eq!(profile["position"], "工程师");
+        assert!(!index.profiles["member-b"].contains_key("mobile"));
+        assert!(!index.profiles["member-b"].contains_key("department"));
+        connection
+            .execute("DELETE FROM company_group4", [])
+            .unwrap();
+        let mut fallback = DisplayNameIndex::default();
+        collect_display_names(&connection, &mut fallback);
+        assert_eq!(fallback.profiles["member-a"]["organization"], "测试企业");
+        assert_eq!(fallback.profiles["member-a"]["department"], "销售部/业务组");
+        assert_eq!(conversation_type("T:opaque", 9), "temporary");
+        assert_eq!(conversation_type("Y:10024", 1), "system");
+    }
+
+    #[test]
+    fn collected_contact_numbers_survive_profile_projection_and_redaction() {
+        let directory = TestDirectory::new();
+        let source_root = directory.0.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let message_path = source_root.join("message.db");
+        let connection = Connection::open(&message_path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE messages (source_message_id TEXT, conversation_id TEXT, sender_id TEXT, sent_at_unix_ms INTEGER, outgoing INTEGER, raw_type TEXT, payload_json TEXT, recalled INTEGER);
+             INSERT INTO messages VALUES ('1', 'conversation', '42', 1700000000000, 0, 'text', '{\"text\":\"测试消息\"}', 0);"
+        ).unwrap();
+        drop(connection);
+        let user_path = source_root.join("user.db");
+        let connection = Connection::open(&user_path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE user_table (id TEXT, name TEXT, pb_content BLOB);")
+            .unwrap();
+        let attribute = test_protobuf_bytes(&[(1, "座机".as_bytes()), (2, b"010-00000000")]);
+        let attributes = test_protobuf_bytes(&[(1, &attribute)]);
+        let mut raw = vec![8, 42];
+        raw.extend(test_protobuf_bytes(&[
+            (5, b"13800000000"),
+            (6, b"010-12345678"),
+            (33, &attributes),
+        ]));
+        connection
+            .execute(
+                "INSERT INTO user_table VALUES ('42', '测试成员', ?1)",
+                [raw],
+            )
+            .unwrap();
+        drop(connection);
+        let candidate = SourceCandidate {
+            source_id: "fixture".into(),
+            display_path: "fixture".into(),
+            root_path: source_root,
+            databases: [("message", message_path), ("user", user_path)]
+                .into_iter()
+                .map(|(kind, path)| archive_domain::SourceDatabase {
+                    kind: kind.into(),
+                    path,
+                    wal_path: None,
+                    shm_path: None,
+                    encrypted: false,
+                    page_size_hint: Some(4096),
+                })
+                .collect(),
+            media_roots: vec![],
+            client_version: None,
+            capability: SourceCapability::Supported,
+        };
+        let export = collect_candidate_with_options(
+            candidate,
+            directory.0.join("work"),
+            None,
+            authorization(),
+            MediaCollectionOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let profile = &export.batches[0].messages[0].raw_payload["participant_profiles"]["42"];
+        assert_eq!(profile["mobile"], "13800000000");
+        assert_eq!(profile["phone"], "010-12345678");
+        assert_eq!(profile["office_phone"], "010-00000000");
+        let redacted = redact_sensitive_export(&export);
+        let profile = &redacted.batches[0].messages[0].raw_payload["participant_profiles"]["42"];
+        for key in ["mobile", "phone", "office_phone"] {
+            assert_eq!(profile[key], "[敏感数据已脱敏]");
+        }
+    }
+
+    #[test]
     fn maps_known_windows_contact_and_session_tables() {
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -4561,7 +5589,10 @@ mod tests {
         encoded.push(0x12);
         write_test_varint(announcement.len() as u64, &mut encoded);
         encoded.extend_from_slice(announcement.as_bytes());
-        assert_eq!(decode_wecom_body(&encoded).as_deref(), Some(announcement));
+        assert_eq!(
+            decode_wecom_metadata_body(&encoded).as_deref(),
+            Some(announcement)
+        );
 
         let locator = "2026/09/photo-0123456789abcdef.png";
         let mut image = vec![0x0a];
@@ -4574,6 +5605,401 @@ mod tests {
         let file_payload = readable_message_payload("49", br#"{"name":"report.pdf"}"#);
         assert_eq!(file_payload["media_path"], "report.pdf");
         assert_eq!(file_payload["kind"], "file");
+        let installer = "Clash.Verge_2.5.8_x64-setup.exe";
+        let file_payload = readable_message_payload(
+            "49",
+            format!("{{\"name\":\"{installer}\",\"id\":\"1234567890\"}}").as_bytes(),
+        );
+        assert_eq!(file_payload["media_path"], installer);
+        assert_eq!(file_payload["name"], installer);
+    }
+
+    #[test]
+    fn preserves_rich_text_emoji_numbers_spaces_and_repeated_fragments() {
+        // Protobuf writers may omit a zero-valued fragment kind.
+        let content = test_protobuf_bytes(&[(1, b"99345")]);
+        let fragment = test_protobuf_bytes(&[(2, &content)]);
+        let raw = test_protobuf_bytes(&[(1, &fragment)]);
+        assert_eq!(decode_wecom_body(&raw).as_deref(), Some("99345"));
+        assert_eq!(
+            readable_message_payload("2", &raw)["rich_segments"][0]["kind"],
+            "text"
+        );
+        fn rich(parts: &[(u8, &str)]) -> Vec<u8> {
+            let mut result = Vec::new();
+            for (kind, text) in parts {
+                let mut content = vec![0x0a];
+                write_test_varint(text.len() as u64, &mut content);
+                content.extend_from_slice(text.as_bytes());
+                let mut fragment = vec![0x08, *kind, 0x12];
+                write_test_varint(content.len() as u64, &mut fragment);
+                fragment.extend(content);
+                result.push(0x0a);
+                write_test_varint(fragment.len() as u64, &mut result);
+                result.extend(fragment);
+            }
+            result
+        }
+        let bytes = rich(&[(3, "[便便]"), (0, "99345")]);
+        let payload = readable_message_payload("2", &bytes);
+        assert_eq!(payload["text"], "[便便]99345");
+        assert_eq!(payload["rich_segments"][0]["kind"], "emoji");
+        assert_eq!(payload["rich_segments"][1]["kind"], "text");
+        assert_eq!(payload["rich_segments"][1]["text"], "99345");
+        let bytes = rich(&[
+            (0, "99345"),
+            (0, " "),
+            (3, "[便便]"),
+            (3, "[便便]"),
+            (0, "99345"),
+        ]);
+        assert_eq!(
+            decode_wecom_body(&bytes).as_deref(),
+            Some("99345 [便便][便便]99345")
+        );
+        assert_eq!(decode_wecom_body(b"99345").as_deref(), Some("99345"));
+        assert_eq!(
+            decode_wecom_body(&rich(&[(0, "1234567890123456")])).as_deref(),
+            Some("1234567890123456")
+        );
+        assert_eq!(
+            decode_wecom_body(&rich(&[(0, "a"); 20])).as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn extracts_type_20_file_metadata_without_storing_remote_access_material() {
+        let name = "synthetic-setup.exe";
+        let md5 = "0123456789abcdef0123456789abcdef";
+        let mut raw = Vec::new();
+        for (field, value) in [
+            (1, "remote-access-material-not-for-archive"),
+            (2, name),
+            (10, md5),
+        ] {
+            write_test_varint((field << 3) | 2, &mut raw);
+            write_test_varint(value.len() as u64, &mut raw);
+            raw.extend_from_slice(value.as_bytes());
+        }
+        raw.push(0x20);
+        write_test_varint(37, &mut raw);
+        let payload = readable_message_payload("20", &raw);
+        assert_eq!(payload["name"], name);
+        assert_eq!(payload["media_path"], name);
+        assert_eq!(payload["media_md5"], md5);
+        assert_eq!(payload["size"], 37);
+        assert!(!payload.to_string().contains("remote-access-material"));
+        let mut message = normalize(
+            RawMessageRow {
+                source_instance_id: "fixture".into(),
+                source_message_id: "1".into(),
+                conversation_id: "conversation".into(),
+                sender_id: None,
+                sent_at_unix_ms: 1700000000000,
+                outgoing: None,
+                raw_type: "20".into(),
+                payload,
+                recalled: false,
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .unwrap();
+        assert_eq!(message.message_type, MessageType::File);
+        assert_eq!(message.media[0].original_name.as_deref(), Some(name));
+        let directory = TestDirectory::new();
+        fs::write(directory.0.join(md5), [1_u8; 37]).unwrap();
+        let candidate = SourceCandidate {
+            source_id: "fixture".into(),
+            display_path: "fixture".into(),
+            root_path: directory.0.clone(),
+            databases: Vec::new(),
+            media_roots: vec![directory.0.clone()],
+            client_version: None,
+            capability: SourceCapability::Supported,
+        };
+        let options = MediaCollectionOptions {
+            include_files: true,
+            include_images: true,
+        };
+        let resolver = MediaResolver::new(&candidate, options);
+        let blobs = resolve_media_metadata_with_local_paths(
+            &candidate,
+            &resolver,
+            &mut message,
+            options,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(message.media[0].integrity, MediaIntegrity::Verified);
+        assert_eq!(message.media[0].size_bytes, Some(37));
+        assert_eq!(blobs[0].original_name.as_deref(), Some(name));
+    }
+
+    fn test_protobuf_bytes(fields: &[(u64, &[u8])]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for (field, bytes) in fields {
+            write_test_varint((field << 3) | 2, &mut output);
+            write_test_varint(bytes.len() as u64, &mut output);
+            output.extend_from_slice(bytes);
+        }
+        output
+    }
+
+    #[test]
+    fn native_images_use_message_cache_paths_without_archiving_private_metadata() {
+        let directory = TestDirectory::new();
+        let account = directory.0.join("private-account");
+        let source_root = account.join("Data");
+        let cache = account.join("Cache").join("Image");
+        let storage = account.join("FileStorage");
+        let emotions = account.join("Emotion");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&storage).unwrap();
+        fs::create_dir_all(&emotions).unwrap();
+        let sticker = emotions.join("downloaded-sticker");
+        fs::write(&sticker, b"GIF89a synthetic sticker").unwrap();
+        let original = cache.join("downloaded-cache-object");
+        let preview = cache.join("cached-preview");
+        fs::write(&original, b"synthetic original").unwrap();
+        fs::write(&preview, b"synthetic preview").unwrap();
+        let remote = b"remote-access-material-not-for-archive";
+        let content = test_protobuf_bytes(&[
+            (1, remote),
+            (2, b"photo.png"),
+            (10, b"0123456789abcdef0123456789abcdef"),
+        ]);
+        // Previews can precede the primary resource in the local envelope.
+        let paths = test_protobuf_bytes(&[
+            (1, b"preview-remote-material"),
+            (1, preview.to_str().unwrap().as_bytes()),
+            (1, remote),
+            (1, original.to_str().unwrap().as_bytes()),
+        ]);
+        let extra = test_protobuf_bytes(&[(8, &paths), (22, b"private OCR must not be archived")]);
+        assert_eq!(
+            local_media_paths("14", &content, &extra),
+            vec![original.clone(), preview.clone()]
+        );
+        let database = source_root.join("message.db");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch("CREATE TABLE message_table (send_time INTEGER, conversation_id TEXT, sender_id TEXT, content_type INTEGER, content BLOB, local_extra_content BLOB);").unwrap();
+        for raw_type in [14, 29] {
+            let content = if raw_type == 14 {
+                content.clone()
+            } else {
+                test_protobuf_bytes(&[(1, remote), (6, b"0123456789abcdef0123456789abcdef")])
+            };
+            let extra = if raw_type == 14 {
+                extra.clone()
+            } else {
+                test_protobuf_bytes(&[(
+                    8,
+                    &test_protobuf_bytes(&[(1, remote), (1, sticker.to_str().unwrap().as_bytes())]),
+                )])
+            };
+            connection.execute("INSERT INTO message_table VALUES (1700000000, 'conversation', 'sender', ?1, ?2, ?3)", rusqlite::params![raw_type, content, extra]).unwrap();
+        }
+        drop(connection);
+        let candidate = SourceCandidate {
+            source_id: "fixture".into(),
+            display_path: "fixture".into(),
+            root_path: source_root,
+            databases: vec![archive_domain::SourceDatabase {
+                kind: "message".into(),
+                path: database,
+                wal_path: None,
+                shm_path: None,
+                encrypted: false,
+                page_size_hint: Some(4096),
+            }],
+            media_roots: vec![storage, cache, emotions],
+            client_version: None,
+            capability: SourceCapability::Supported,
+        };
+        let options = MediaCollectionOptions {
+            include_files: true,
+            include_images: true,
+        };
+        let export = collect_candidate_with_options(
+            candidate.clone(),
+            directory.0.join("work"),
+            None,
+            authorization(),
+            options,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(export.message_count, 2);
+        assert_eq!(export.missing_media_count, 0);
+        assert_eq!(export.media_blobs.len(), 2);
+        for expected in [
+            b"synthetic original".as_slice(),
+            b"GIF89a synthetic sticker".as_slice(),
+        ] {
+            assert!(
+                export
+                    .media_blobs
+                    .iter()
+                    .any(|blob| hex::decode(&blob.content_hex).unwrap() == expected)
+            );
+        }
+        let serialized = serde_json::to_string(&export).unwrap();
+        let image = export.batches[0]
+            .messages
+            .iter()
+            .find(|message| message.raw_type == "14")
+            .unwrap();
+        assert!(!serialized.contains("remote-access-material"));
+        assert!(!serialized.contains("private-account"));
+        assert!(!serialized.contains("private OCR"));
+        // A deleted original still leaves an authorized preview for this message.
+        let missing = original.with_file_name("missing-original");
+        let resolver = MediaResolver::new(&candidate, options);
+        let mut message = image.clone();
+        let blobs = resolve_media_metadata_with_local_paths(
+            &candidate,
+            &resolver,
+            &mut message,
+            options,
+            None,
+            &[missing, preview],
+        )
+        .unwrap();
+        assert_eq!(
+            hex::decode(&blobs[0].content_hex).unwrap(),
+            b"synthetic preview"
+        );
+        // Existing but unauthorized files must not be accepted as local hints.
+        let outside = directory.0.join("outside.png");
+        fs::write(&outside, b"outside").unwrap();
+        let mut message = image.clone();
+        let blobs = resolve_media_metadata_with_local_paths(
+            &candidate,
+            &resolver,
+            &mut message,
+            options,
+            None,
+            &[outside],
+        )
+        .unwrap();
+        assert!(blobs.is_empty());
+        assert_eq!(message.media[0].integrity, MediaIntegrity::Missing);
+    }
+
+    #[test]
+    fn local_media_hints_ignore_urls_network_paths_parent_traversal_and_broken_envelopes() {
+        let paths = test_protobuf_bytes(&[
+            (1, b"https://invalid.example/photo.png"),
+            (1, br"\\server\share\image.png"),
+            (1, br"C:\cache\..\private.png"),
+            (1, b"relative.png"),
+        ]);
+        let extra = test_protobuf_bytes(&[(8, &paths)]);
+        assert!(local_media_paths("14", &[], &extra).is_empty());
+        assert!(local_media_paths("14", &[], &[0x42, 0xff]).is_empty());
+        assert!(local_media_paths("text", &[], &extra).is_empty());
+    }
+
+    #[test]
+    fn media_lookup_prefers_exact_names_rejects_ambiguity_and_deduplicates_overlapping_roots() {
+        let directory = TestDirectory::new();
+        let first = directory.0.join("first");
+        let second = directory.0.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("photo.png"), b"first").unwrap();
+        fs::write(first.join("photo.jpg"), b"second").unwrap();
+        let mut candidate = SourceCandidate {
+            source_id: "fixture".into(),
+            display_path: "fixture".into(),
+            root_path: directory.0.clone(),
+            databases: vec![],
+            media_roots: vec![directory.0.clone(), first.clone()],
+            client_version: None,
+            capability: SourceCapability::Supported,
+        };
+        let options = MediaCollectionOptions {
+            include_files: true,
+            include_images: true,
+        };
+        let resolver = MediaResolver::new(&candidate, options);
+        assert_eq!(
+            resolver.resolve(&directory.0, "photo.png"),
+            Some(first.join("photo.png").canonicalize().unwrap())
+        );
+        assert!(resolver.resolve(&directory.0, "photo").is_none());
+        fs::write(second.join("photo.png"), b"duplicate").unwrap();
+        candidate.media_roots = vec![directory.0.clone()];
+        let resolver = MediaResolver::new(&candidate, options);
+        assert!(resolver.resolve(&directory.0, "photo.png").is_none());
+        candidate.media_roots = vec![first.clone(), second.clone()];
+        let resolver = MediaResolver::new(&candidate, options);
+        assert!(resolver.resolve(&directory.0, "photo.png").is_none());
+        assert_eq!(
+            resolver.resolve(&directory.0, first.join("photo.png").to_str().unwrap()),
+            Some(first.join("photo.png").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn native_image_hash_hints_resolve_cache_without_remote_material() {
+        let directory = TestDirectory::new();
+        let hint = "0123456789abcdef0123456789abcdef";
+        fs::write(directory.0.join(format!("{hint}.dat")), b"synthetic image").unwrap();
+        let raw = test_protobuf_bytes(&[
+            (1, b"remote-secret"),
+            (2, b"original.png"),
+            (8, b"invalid hint"),
+            (30, hint.as_bytes()),
+        ]);
+        let payload = readable_message_payload("14", &raw);
+        assert_eq!(payload["media_lookup_hints"], serde_json::json!([hint]));
+        assert!(!payload.to_string().contains("remote-secret"));
+        let mut message = normalize(
+            RawMessageRow {
+                source_instance_id: "fixture".into(),
+                source_message_id: "1".into(),
+                conversation_id: "conversation".into(),
+                sender_id: None,
+                sent_at_unix_ms: 1700000000000,
+                outgoing: None,
+                raw_type: "14".into(),
+                payload,
+                recalled: false,
+            },
+            uuid::Uuid::new_v4(),
+        )
+        .unwrap();
+        let candidate = SourceCandidate {
+            source_id: "fixture".into(),
+            display_path: "fixture".into(),
+            root_path: directory.0.clone(),
+            databases: vec![],
+            media_roots: vec![directory.0.clone()],
+            client_version: None,
+            capability: SourceCapability::Supported,
+        };
+        let options = MediaCollectionOptions {
+            include_files: false,
+            include_images: true,
+        };
+        let resolver = MediaResolver::new(&candidate, options);
+        let blobs = resolve_media_metadata_with_local_paths(
+            &candidate,
+            &resolver,
+            &mut message,
+            options,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(message.media[0].integrity, MediaIntegrity::Verified);
     }
 
     fn write_test_varint(mut value: u64, output: &mut Vec<u8>) {
@@ -4585,6 +6011,57 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn reads_document_identity_without_treating_notification_entity_as_a_person() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE conversation_table (id TEXT, name TEXT, type_content BLOB);",
+            )
+            .unwrap();
+        let mut content = vec![0x08];
+        write_test_varint(12345, &mut content);
+        for (tag, text) in [
+            (
+                0x22,
+                "https://doc.weixin.qq.com/journal/create?docid=synthetic",
+            ),
+            (0x2a, "测试工作周报"),
+        ] {
+            content.push(tag);
+            write_test_varint(text.len() as u64, &mut content);
+            content.extend_from_slice(text.as_bytes());
+        }
+        connection
+            .execute(
+                "INSERT INTO conversation_table VALUES (?1,'',?2)",
+                rusqlite::params!["M:12345", content],
+            )
+            .unwrap();
+        let mut names = DisplayNameIndex::default();
+        collect_display_names(&connection, &mut names);
+        assert_eq!(
+            names.conversations.get("M:12345").map(String::as_str),
+            Some("测试工作周报")
+        );
+        assert_eq!(
+            names.conversation_types.get("M:12345").map(String::as_str),
+            Some("document")
+        );
+        assert_eq!(
+            names.participants.get("12345").map(String::as_str),
+            Some("汇报提醒")
+        );
+        assert_eq!(
+            names.participant_kinds.get("12345").map(String::as_str),
+            Some("bot")
+        );
+        assert_eq!(conversation_type("M:unclassified", 8), "application");
+        assert!(document_conversation_metadata("M:999", &content).is_none());
+        assert!(document_conversation_metadata("S:12345", &content).is_none());
+        assert!(document_conversation_metadata("M:12345", &content[..content.len() - 1]).is_none());
     }
 
     #[test]
@@ -4634,12 +6111,19 @@ mod tests {
         let mut payload = serde_json::json!({
             "password": "secret-456",
             "profile": { "email": "person@example.com" },
+            "participant_profiles": {"synthetic-member": {"mobile": "13800000000", "office_phone": "010-00000000", "email": "member@example.invalid", "department": "研发部", "employee_no": "TEST-001", "custom:办公地点": "测试楼A栋"}},
             "message": "普通内容"
         });
         redact_sensitive_json(&mut payload);
         let serialized = serde_json::to_string(&payload).unwrap();
         assert!(!serialized.contains("secret-456"));
         assert!(!serialized.contains("person@example.com"));
+        assert!(!serialized.contains("13800000000"));
+        assert!(!serialized.contains("010-00000000"));
+        assert!(!serialized.contains("member@example.invalid"));
+        assert!(!serialized.contains("TEST-001"));
+        assert!(!serialized.contains("测试楼A栋"));
+        assert!(serialized.contains("研发部"));
         assert!(serialized.contains("普通内容"));
     }
 
@@ -4781,7 +6265,7 @@ mod tests {
     }
 
     #[test]
-    fn media_mode_resolves_nested_files_and_text_mode_excludes_media_messages() {
+    fn media_mode_resolves_nested_files_and_text_mode_keeps_media_relations() {
         let directory = TestDirectory::new();
         let source_root = directory.0.join("source");
         let media_root = source_root.join("FileStorage");
@@ -4809,7 +6293,7 @@ mod tests {
                 );
                 INSERT INTO messages VALUES (
                     'image-1', 'conversation-1', 'participant-1', 1700000001000, 0,
-                    'image', '{\"media_path\":\"photo-fixture.png\",\"name\":\"photo-fixture.png\"}', 0
+                    'image', '{\"name\":\"photo-fixture.png\"}', 0
                 );",
             )
             .unwrap();
@@ -4891,11 +6375,16 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(text_only.message_count, 1);
+        assert_eq!(text_only.message_count, 2);
         assert_eq!(
             text_only.batches[0].messages[0].message_type,
             MessageType::Text
         );
+        assert_eq!(
+            text_only.batches[0].messages[1].message_type,
+            MessageType::Image
+        );
+        assert_eq!(text_only.batches[0].messages[1].media.len(), 1);
         assert!(text_only.media_blobs.is_empty());
     }
 
@@ -5229,6 +6718,21 @@ mod tests {
             export.media_count,
             streamed_files.load(std::sync::atomic::Ordering::Relaxed),
             export.missing_media_count
+        );
+        let images = export
+            .batches
+            .iter()
+            .flat_map(|batch| &batch.messages)
+            .filter(|message| message.message_type == MessageType::Image)
+            .flat_map(|message| &message.media)
+            .collect::<Vec<_>>();
+        eprintln!(
+            "authorized image collection verified: {} image references, {} verified images",
+            images.len(),
+            images
+                .iter()
+                .filter(|media| media.integrity == MediaIntegrity::Verified)
+                .count()
         );
     }
 

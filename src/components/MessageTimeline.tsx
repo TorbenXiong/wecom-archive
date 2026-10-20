@@ -1,6 +1,8 @@
-import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, FileText, Image, Megaphone, MoreVertical, SlidersHorizontal, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink, FileText, Image, Megaphone, Mic2, MoreVertical, SlidersHorizontal, X } from "lucide-react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import type { ConversationSummary, MessageItem, ParticipantItem } from "../domain/types";
+import { conversationKindLabel } from "../domain/conversations";
 import { getMediaObjectUrl, openMediaFile } from "../lib/server-api";
 import { ParticipantCard } from "./ParticipantCard";
 
@@ -115,7 +117,7 @@ export function MessageTimeline({
   return (
     <section className="timeline-pane" aria-label="消息时间线">
       <header className="timeline-header">
-        <div className="timeline-heading"><h1>{conversation.title}</h1><em className="conversation-kind-badge">{conversation.isGroup ? "群会话" : "私人会话"}</em></div>
+        <div className="timeline-heading"><h1>{conversation.title}</h1><em className="conversation-kind-badge">{conversationKindLabel(conversation)}</em></div>
         <div className="timeline-actions">
           <button type="button" onClick={() => onSortChange?.(!sortAscending)}><SlidersHorizontal size={15} />按时间{sortAscending ? "升序" : "降序"}</button>
           <button className="icon-button" type="button" aria-label="更多操作"><MoreVertical size={18} /></button>
@@ -142,7 +144,7 @@ export function MessageTimeline({
           <button type="button" aria-label="下一页" disabled={pageIndex >= totalPages - 1} onClick={onNextPage}><ChevronRight size={17} /></button>
         </div>
       </footer>
-      {selectedParticipant && <ParticipantCard participant={selectedParticipant} onClose={() => setSelectedParticipant(undefined)} />}
+      {selectedParticipant && <ParticipantCard participant={participantsById.get(selectedParticipant.id) || selectedParticipant} onClose={() => setSelectedParticipant(undefined)} />}
     </section>
   );
 }
@@ -164,7 +166,7 @@ function MessageRow({ token, message, highlighted, onShowParticipant, onLocateQu
     return <article className={highlighted ? "message-row system-message-row highlighted" : "message-row system-message-row"} data-message-id={message.id}>
       <div className="message-content">
         <div className="message-meta"><span className="system-sender-name">{message.senderName || "系统"}</span><time className="message-time">{formatFullTimestamp(message.sentAt)}</time></div>
-        <div className={announcement ? "message-bubble announcement-message" : "message-bubble"}><p>{announcement && <Megaphone size={14} />}{message.body || "系统消息"}</p></div>
+        <div className={announcement ? "message-bubble announcement-message" : "message-bubble"}>{announcement && <Megaphone size={14} />}<RichMessageText body={message.body || "系统消息"} segments={message.richSegments} /></div>
       </div>
     </article>;
   }
@@ -183,12 +185,100 @@ function MessageRow({ token, message, highlighted, onShowParticipant, onLocateQu
           ? <div className="message-attachment-only"><Attachment token={token} attachment={message.attachment!} /></div>
           : <div className="message-bubble">
             {message.quote && <button className="quote-block" type="button" onClick={() => onLocateQuote(message.quote!.id)} title="定位到原消息"><span><strong>{message.quote.sender}</strong>{message.quote.time && <> · {message.quote.time}</>}</span><p>{message.quote.body}</p></button>}
-            {message.body && <p>{message.body}</p>}
+            {message.body && <RichMessageText body={message.body} segments={message.richSegments} />}
             {message.attachment && <Attachment token={token} attachment={message.attachment} />}
           </div>}
       </div>
     </article>
   );
+}
+
+const knownWeComEmoji: Record<string, string> = {
+  "便便": "💩",
+  "微笑": "🙂",
+  "撇嘴": "🙁",
+  "色": "😍",
+  "发呆": "😳",
+  "得意": "😎",
+  "流泪": "😢",
+  "害羞": "😊",
+  "闭嘴": "🤐",
+  "睡": "😴",
+  "大哭": "😭",
+  "发怒": "😡",
+  "调皮": "😜",
+  "龇牙": "😁",
+  "惊讶": "😲",
+  "难过": "😞",
+  "酷": "😎",
+  "偷笑": "🤭",
+  "可爱": "🥰",
+  "白眼": "🙄",
+  "鼓掌": "👏",
+  "疑问": "❓",
+  "再见": "👋",
+  "强": "👍",
+  "弱": "👎",
+};
+
+function RichMessageText({ body, segments }: { body: string; segments?: MessageItem["richSegments"] }) {
+  const card = parseWeComCard(body);
+  if (card) {
+    return <div className="wecom-rich-card"><h3>{renderInline(card.title)}</h3><div className="wecom-card-lines">{card.lines.map((line, index) => <div className="wecom-card-line" key={`${line}-${index}`}>{renderInline(line)}</div>)}</div></div>;
+  }
+  if (segments?.length) {
+    return <div className="message-rich-text">{segments.map((segment, index) => segment.kind === "emoji"
+      ? <WeComEmoji key={`${segment.text}-${index}`} label={segment.text} />
+      : <span key={`${segment.text}-${index}`}>{segment.text}</span>)}</div>;
+  }
+  const tokenPattern = /\[([^\]\r\n]{1,24})\]/g;
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tokenPattern.exec(body))) {
+    if (match.index > cursor) nodes.push(body.slice(cursor, match.index));
+    const token = match[1];
+    nodes.push(knownWeComEmoji[token] ? <WeComEmoji key={`${match.index}-${token}`} label={token} /> : match[0]);
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < body.length) nodes.push(body.slice(cursor));
+  return <div className="message-rich-text">{nodes}</div>;
+}
+
+function parseWeComCard(body: string): { title: string; lines: string[] } | undefined {
+  const lines = body.replace(/\r\n?/g, "\n").split("\n");
+  const title = lines[0]?.match(/^#{1,6}\s+(.+)$/)?.[1]?.trim();
+  if (!title) return undefined;
+  const nonEmpty = lines.slice(1).filter((line) => line.trim());
+  const cardLines = nonEmpty.map((line) => line.match(/^>\s?(.*)$/)?.[1]);
+  return cardLines.length > 0 && cardLines.every((line): line is string => line !== undefined)
+    ? { title, lines: cardLines }
+    : undefined;
+}
+
+function renderInline(value: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const pattern = /<font\b([^>]*)>([\s\S]*?)<\/font>|\[([^\]\r\n]{1,24})\]/gi;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(value))) {
+    if (match.index > cursor) nodes.push(value.slice(cursor, match.index));
+    if (match[1] !== undefined) {
+      const color = match[1].match(/\bcolor=["'](info|warning|comment)["']/i)?.[1]?.toLowerCase();
+      nodes.push(color
+        ? <span className={`wecom-card-${color}`} key={`${match.index}-${color}`}>{renderInline(match[2])}</span>
+        : <Fragment key={`${match.index}-font`}>{renderInline(match[2])}</Fragment>);
+    } else nodes.push(knownWeComEmoji[match[3]] ? <WeComEmoji key={`${match.index}-${match[3]}`} label={match[3]} /> : match[0]);
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < value.length) nodes.push(value.slice(cursor));
+  return nodes;
+}
+
+function WeComEmoji({ label }: { label: string }) {
+  const normalized = label.replace(/^\[|\]$/g, "");
+  const emoji = knownWeComEmoji[normalized];
+  return <span className="wecom-emoji" role="img" aria-label={`企业微信表情：${normalized}`} title={`企业微信表情：${normalized}`}>{emoji || label}</span>;
 }
 
 function formatFullTimestamp(value: string): string {
@@ -201,8 +291,11 @@ function formatFullTimestamp(value: string): string {
 function Attachment({ token, attachment }: { token: string; attachment: NonNullable<MessageItem["attachment"]> }) {
   const [objectUrl, setObjectUrl] = useState<string>();
   const [loading, setLoading] = useState(false);
-  const [unavailable, setUnavailable] = useState(false);
+  const [error, setError] = useState<string>();
   const [previewOpen, setPreviewOpen] = useState(false);
+  const [confirmRun, setConfirmRun] = useState(false);
+  const active = useRef(true);
+  useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
   useEffect(() => {
     let cancelled = false;
     if (attachment.kind === "image" && attachment.contentHash) {
@@ -210,45 +303,76 @@ function Attachment({ token, attachment }: { token: string; attachment: NonNulla
       void getMediaObjectUrl(token, attachment.contentHash).then((url) => {
         if (cancelled) URL.revokeObjectURL(url);
         else setObjectUrl(url);
-      }).catch(() => { if (!cancelled) setUnavailable(true); }).finally(() => { if (!cancelled) setLoading(false); });
+      }).catch(() => { if (!cancelled) setError("图片读取失败，请重新采集或重试。"); }).finally(() => { if (!cancelled) setLoading(false); });
     }
     return () => { cancelled = true; };
   }, [attachment.contentHash, attachment.kind, token]);
   useEffect(() => () => {
     if (objectUrl) URL.revokeObjectURL(objectUrl);
   }, [objectUrl]);
-  const open = async () => {
+  const open = async (save = false) => {
     if (!attachment.contentHash || loading) return;
     setLoading(true);
-    setUnavailable(false);
+    setError(undefined);
     try {
-      if (attachment.kind === "image") {
+      if (attachment.kind === "image" || save) {
         const url = objectUrl || await getMediaObjectUrl(token, attachment.contentHash);
+        if (!active.current) { if (!objectUrl) URL.revokeObjectURL(url); return; }
         if (!objectUrl) setObjectUrl(url);
-        setPreviewOpen(true);
+        if (save) {
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = attachment.name;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+        } else setPreviewOpen(true);
       } else {
         await openMediaFile(token, attachment.contentHash, attachment.name);
       }
-    } catch {
-      setUnavailable(true);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "附件操作失败，请重试。");
     } finally {
       setLoading(false);
     }
   };
   if (attachment.kind === "image") {
     return <>
-      <button className="image-preview" type="button" aria-label={`查看图片 ${attachment.name}`} onClick={() => void open()} disabled={!attachment.contentHash || loading || unavailable}>
+      <button className="image-preview" type="button" aria-label={`查看图片 ${attachment.name}`} onClick={() => void open()} disabled={!attachment.contentHash || loading}>
         {objectUrl ? <img src={objectUrl} alt={attachment.name} /> : <div className="mini-layout"><span /><span /><span /><span /></div>}
-        <div><Image size={15} />{loading ? "正在读取…" : unavailable ? "未上传图片内容" : attachment.meta}</div>
+        <div><Image size={15} />{loading ? "正在读取…" : error || (!attachment.contentHash ? "未采集图片内容" : attachment.meta)}</div>
       </button>
       {previewOpen && objectUrl && <div className="media-preview-backdrop" role="presentation" onMouseDown={() => setPreviewOpen(false)}><section className="media-preview-dialog" role="dialog" aria-modal="true" aria-label={`图片预览 ${attachment.name}`} onMouseDown={(event) => event.stopPropagation()}><button type="button" aria-label="关闭图片预览" onClick={() => setPreviewOpen(false)}><X size={20} /></button><img src={objectUrl} alt={attachment.name} /><span>{attachment.name}</span></section></div>}
     </>;
   }
-  return (
-    <button className={unavailable ? "file-card unavailable" : "file-card"} type="button" onClick={() => void open()} disabled={!attachment.contentHash || loading} aria-label={`打开附件 ${attachment.name}`} title={attachment.contentHash ? `打开 ${attachment.name}` : "源文件不可用"}>
+  if (attachment.kind === "audio") {
+    return <div className="audio-attachment">
+      <button className={error ? "audio-card unavailable" : "audio-card"} type="button" onClick={() => void open()} disabled={!attachment.contentHash || loading} aria-label="打开语音消息" title={attachment.contentHash ? "打开语音消息" : "未采集语音内容"}>
+        <span className="audio-icon"><Mic2 size={18} /></span>
+        <span><strong>语音消息</strong><small>{loading ? "正在处理…" : attachment.meta || "语音内容"}</small></span>
+        <ExternalLink size={16} />
+      </button>
+      {attachment.contentHash
+        ? <button className="attachment-save" type="button" disabled={loading} onClick={() => void open(true)} aria-label="保存语音消息"><Download size={13} />保存语音</button>
+        : <p className="attachment-status" role="status">未采集语音内容。{messageAudioHint(attachment.name)}</p>}
+      {error && <p className="attachment-status" role="alert">{error}</p>}
+    </div>;
+  }
+  const executable = /\.(exe|msi|msp|com|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|scr|hta|lnk|reg|cpl)$/i.test(attachment.name);
+  return <div className="file-attachment">
+    <button className={error ? "file-card unavailable" : "file-card"} type="button" onClick={() => executable ? setConfirmRun(true) : void open()} disabled={!attachment.contentHash || loading} aria-label={`打开附件 ${attachment.name}`} title={attachment.contentHash ? `打开 ${attachment.name}` : "未采集附件内容"}>
       <span className="file-icon"><FileText size={20} /></span>
-      <span><strong>{attachment.name}</strong><small>{loading ? "正在打开…" : unavailable ? "打开失败，请重试" : attachment.meta}</small></span>
-      <Download size={17} />
+      <span><strong>{attachment.name}</strong><small>{loading ? "正在处理…" : attachment.meta}</small></span>
+      <ExternalLink size={17} />
     </button>
-  );
+    {attachment.contentHash
+      ? <button className="attachment-save" type="button" disabled={loading} onClick={() => void open(true)} aria-label={`保存附件 ${attachment.name}`}><Download size={13} />保存附件</button>
+      : <p className="attachment-status" role="status">未采集附件内容。请在企业微信中下载源文件，再使用“包含全内容”重新采集。</p>}
+    {error && <p className="attachment-status" role="alert">{error}</p>}
+    {confirmRun && <div className="modal-backdrop" role="presentation"><section className="modal-card" role="dialog" aria-modal="true" aria-label="确认运行附件" onKeyDown={(event) => { if (event.key === "Escape") setConfirmRun(false); }}><h2>确认运行附件</h2><p>即将运行 {attachment.name}，可能启动安装程序或修改系统。请确认文件来源可信。</p><div className="modal-actions"><button className="secondary-button" type="button" autoFocus onClick={() => setConfirmRun(false)}>取消</button><button className="primary-button" type="button" onClick={() => { setConfirmRun(false); void open(); }}>确认运行</button></div></section></div>}
+  </div>;
+}
+
+function messageAudioHint(name: string): string {
+  return name && name !== "audio 媒体" ? `源文件：${name}。` : "请在企业微信中下载源文件，再使用“包含全内容”重新采集。";
 }

@@ -1,4 +1,4 @@
-import type { ExportScope, MessageDirection, MessageType } from "../domain/types";
+import type { ExportScope, MessageDirection, MessageType, ParticipantProfile } from "../domain/types";
 
 export interface ServerArchiveSummary {
   conversation_count: number;
@@ -35,7 +35,7 @@ export interface ServerMediaRef {
   content_hash?: string;
   original_name?: string;
   mime_type?: string;
-  size_bytes?: number;
+  size_bytes?: number | null;
   source_locator: string;
   integrity: "verified" | "missing" | "size_mismatch" | "hash_mismatch" | "unreadable";
   missing_reason?: string;
@@ -63,6 +63,10 @@ export interface ServerMessage {
   lifecycle: "active" | "recalled" | "deleted_at_source" | "unknown";
   media: ServerMediaRef[];
   raw_type: string;
+  raw_payload?: {
+    rich_segments?: Array<{ kind: "text" | "emoji"; text: string }>;
+    [key: string]: unknown;
+  };
 }
 
 export interface GlobalSearchResult extends ServerMessage {
@@ -83,6 +87,7 @@ export interface ServerParticipant {
   participant_id: string;
   display_name?: string;
   participant_kind?: string;
+  profile?: ParticipantProfile;
 }
 
 export interface CollectedUser {
@@ -369,9 +374,10 @@ export function getCollectedUsers(token: string, signal?: AbortSignal): Promise<
   return request<CollectedUser[]>("/api/v1/archive/collected-users", token, { signal });
 }
 
-export function collectLocalArchive(token: string, includeMedia: boolean, sourceRoot?: string): Promise<ServerImportResult> {
+export function collectLocalArchive(token: string, includeMedia: boolean, sourceRoot?: string, dataRedaction?: boolean): Promise<ServerImportResult> {
   const parameters = new URLSearchParams({ include_media: String(includeMedia) });
   if (sourceRoot) parameters.set("source_root", sourceRoot);
+  if (dataRedaction !== undefined) parameters.set("data_redaction", String(dataRedaction));
   return request<ServerImportResult>(`/api/v1/collections/local?${parameters}`, token, { method: "POST" });
 }
 

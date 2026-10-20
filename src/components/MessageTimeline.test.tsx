@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, vi } from "vitest";
 import { MessageTimeline } from "./MessageTimeline";
 import type { ConversationSummary, MessageItem } from "../domain/types";
@@ -55,8 +55,14 @@ const messages: MessageItem[] = [
 
 describe("message timeline", () => {
   beforeEach(() => {
-    mediaApi.getMediaObjectUrl.mockClear();
-    mediaApi.openMediaFile.mockClear();
+    mediaApi.getMediaObjectUrl.mockReset().mockImplementation(() => new Promise<string>(() => undefined));
+    mediaApi.openMediaFile.mockReset().mockResolvedValue({ opened: true });
+  });
+
+  it("labels a system conversation independently of the archived participant count", () => {
+    render(<MessageTimeline token="test-token" conversation={{ ...conversation, kind: "system" }} messages={messages} participants={[]} />);
+    expect(screen.getByText("系统会话")).toBeInTheDocument();
+    expect(screen.queryByText("群会话")).not.toBeInTheDocument();
   });
 
   it("shows messages in descending time order by default and offers floating jumps to both edges", () => {
@@ -102,6 +108,43 @@ describe("message timeline", () => {
     expect(firstMeta?.querySelector(".message-time")?.textContent).toMatch(/^2026-09-15.+:\d{2}:00$/);
   });
 
+  it("renders WeCom emoji tokens inline while preserving adjacent text", () => {
+    const emojiMessage: MessageItem = {
+      ...messages[0],
+      id: "emoji-message",
+      body: "[便便]99345 [未知表情]",
+    };
+    render(<MessageTimeline token="test-token" conversation={conversation} messages={[emojiMessage]} participants={[]} />);
+    expect(screen.getByRole("img", { name: "企业微信表情：便便" })).toHaveTextContent("💩");
+    expect(screen.getByText("99345 [未知表情]", { exact: false })).toBeInTheDocument();
+  });
+
+  it("renders structured emoji segments from a newly collected message", () => {
+    const emojiMessage: MessageItem = {
+      ...messages[0],
+      id: "structured-emoji-message",
+      body: "[便便]99345",
+      richSegments: [{ kind: "emoji", text: "[便便]" }, { kind: "text", text: "99345" }],
+    };
+    render(<MessageTimeline token="test-token" conversation={conversation} messages={[emojiMessage]} participants={[]} />);
+    expect(screen.getByRole("img", { name: "企业微信表情：便便" })).toHaveTextContent("💩");
+    expect(screen.getByText("99345")).toBeInTheDocument();
+  });
+
+  it("renders WeCom markdown attendance cards without executing HTML", () => {
+    const cardMessage: MessageItem = {
+      ...messages[0],
+      id: "attendance-card",
+      body: "### <font size=\"4\" color=\"#333\">📋 打卡结果</font>\n\n> 打卡时间：<font color=\"info\">14:11</font>\n> 打卡设备：<font color=\"warning\">办公室</font>\n> <font color=\"comment\">2026年10月16日</font>",
+    };
+    const { container } = render(<MessageTimeline token="test-token" conversation={conversation} messages={[cardMessage]} participants={[]} />);
+    expect(container.querySelector(".wecom-rich-card h3")).toHaveTextContent("📋 打卡结果");
+    expect(container.querySelector(".wecom-card-info")).toHaveTextContent("14:11");
+    expect(container.querySelector(".wecom-card-warning")).toHaveTextContent("办公室");
+    expect(container.querySelector(".wecom-card-comment")).toHaveTextContent("2026年10月16日");
+    expect(container.querySelector("script")).toBeNull();
+  });
+
   it("returns to the top after changing pages", () => {
     const { container, rerender } = render(
       <MessageTimeline token="test-token" conversation={conversation} messages={messages} participants={[]} pageIndex={0} />,
@@ -138,5 +181,53 @@ describe("message timeline", () => {
     expect(container.querySelector(".message-bubble")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "打开附件 report.pdf" }));
     expect(mediaApi.openMediaFile).toHaveBeenCalledWith("test-token", "file-hash", "report.pdf");
+  });
+
+  function showFile(name: string, contentHash?: string) {
+    return render(<MessageTimeline token="test-token" conversation={conversation} messages={[{ ...messages[0], type: "file", body: name, attachment: { name, contentHash, kind: "document", meta: "附件" } }]} participants={[]} />);
+  }
+
+  it("explains how to recover a file whose content was not collected", () => {
+    showFile("report.pdf");
+    expect(screen.getByRole("button", { name: "打开附件 report.pdf" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("包含全内容");
+    expect(screen.queryByRole("button", { name: "保存附件 report.pdf" })).not.toBeInTheDocument();
+  });
+
+  it("requires confirmation before running an executable and supports cancellation", async () => {
+    showFile("test-setup.exe", "file-hash");
+    fireEvent.click(screen.getByRole("button", { name: "打开附件 test-setup.exe" }));
+    expect(screen.getByRole("dialog", { name: "确认运行附件" })).toBeInTheDocument();
+    expect(mediaApi.openMediaFile).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "打开附件 test-setup.exe" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认运行" }));
+    await waitFor(() => expect(mediaApi.openMediaFile).toHaveBeenCalledWith("test-token", "file-hash", "test-setup.exe"));
+  });
+
+  it("shows the backend open error so the user can save the file instead", async () => {
+    mediaApi.openMediaFile.mockRejectedValueOnce(new Error("Windows 无法打开此附件。请先保存附件。"));
+    showFile("report.pdf", "file-hash");
+    fireEvent.click(screen.getByRole("button", { name: "打开附件 report.pdf" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("请先保存附件");
+    expect(screen.getByRole("button", { name: "保存附件 report.pdf" })).toBeEnabled();
+  });
+
+  it("saves an executable without running it and releases its object URL on unmount", async () => {
+    mediaApi.getMediaObjectUrl.mockResolvedValueOnce("blob:attachment");
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      expect(this.download).toBe("test-setup.exe");
+      expect(this.href).toBe("blob:attachment");
+    });
+    const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => undefined);
+    const view = showFile("test-setup.exe", "file-hash");
+    fireEvent.click(screen.getByRole("button", { name: "保存附件 test-setup.exe" }));
+    await waitFor(() => expect(click).toHaveBeenCalledOnce());
+    expect(mediaApi.openMediaFile).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    view.unmount();
+    expect(revoke).toHaveBeenCalledWith("blob:attachment");
+    click.mockRestore(); revoke.mockRestore();
   });
 });
