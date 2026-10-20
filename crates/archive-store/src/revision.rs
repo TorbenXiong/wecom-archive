@@ -10,6 +10,23 @@ pub(super) fn merge_message(
     message: &MessageV1,
     summary: &mut IngestSummary,
 ) -> Result<bool, StoreError> {
+    let existing: Option<(String, String)> = transaction
+        .prepare_cached(
+            "SELECT content_sha256, payload_json FROM messages WHERE stable_message_id = ?1",
+        )?
+        .query_row([message.stable_message_id.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional()?;
+    let mut merged = std::borrow::Cow::Borrowed(message);
+    if message.media.iter().any(|media| {
+        media.integrity == archive_domain::MediaIntegrity::Missing && media.content_hash.is_none()
+    }) && let Some((_, payload)) = &existing
+        && let Ok(previous) = serde_json::from_str::<MessageV1>(payload)
+    {
+        retain_collected_media(merged.to_mut(), &previous);
+    }
+    let message = merged.as_ref();
     let payload_json = serde_json::to_string(message)?;
     let mut content_message = message.clone();
     content_message.collection_batch_id = uuid::Uuid::nil();
@@ -44,11 +61,6 @@ pub(super) fn merge_message(
         summary.unchanged += 1;
         return Ok(false);
     }
-    let existing: Option<String> = transaction
-        .prepare_cached("SELECT content_sha256 FROM messages WHERE stable_message_id = ?1")?
-        .query_row([message.stable_message_id.as_str()], |row| row.get(0))
-        .optional()?;
-
     let inserted = existing.is_none();
     match existing {
         None => {
@@ -100,7 +112,7 @@ pub(super) fn merge_message(
             crate::derived::insert_fts(transaction, message)?;
             summary.inserted += 1;
         }
-        Some(previous_hash) if previous_hash == content_hash => {
+        Some((previous_hash, _)) if previous_hash == content_hash => {
             execute_cached(
                 transaction,
                 "UPDATE messages SET last_batch_id = ?2 WHERE stable_message_id = ?1",
@@ -111,15 +123,15 @@ pub(super) fn merge_message(
             )?;
             summary.unchanged += 1;
         }
-        Some(previous_hash) => {
-            let previous_payload: String = transaction
-                .prepare_cached("SELECT payload_json FROM messages WHERE stable_message_id = ?1")?
-                .query_row([message.stable_message_id.as_str()], |row| row.get(0))?;
+        Some((previous_hash, previous_payload)) => {
+            // History retains each distinct content version once. Revisiting an
+            // archived version must still update the projection and commit the batch.
             execute_cached(
                 transaction,
                 "INSERT INTO message_revisions (
                     stable_message_id, observed_batch_id, observed_at, content_sha256, payload_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(stable_message_id, content_sha256) DO NOTHING",
                 params![
                     message.stable_message_id,
                     message.collection_batch_id.to_string(),
@@ -207,6 +219,53 @@ pub(super) fn merge_message(
         )?;
     }
     Ok(inserted)
+}
+
+fn retain_collected_media(incoming: &mut MessageV1, previous: &MessageV1) {
+    // Text-only recollection and expired source caches do not remove bytes
+    // already archived for the same unchanged media message. Changed media
+    // identity or message content must still replace the old projection.
+    if !matches!(
+        incoming.message_type,
+        archive_domain::MessageType::Image | archive_domain::MessageType::File
+    ) || incoming.message_type != previous.message_type
+        || incoming.raw_type != previous.raw_type
+        || incoming.source_kind != previous.source_kind
+        || incoming.source_instance_id != previous.source_instance_id
+        || incoming.source_message_id != previous.source_message_id
+        || incoming.conversation_id != previous.conversation_id
+        || incoming.sender_id != previous.sender_id
+        || incoming.sent_at != previous.sent_at
+        || incoming.body_text != previous.body_text
+        || incoming.lifecycle != previous.lifecycle
+        || incoming.media.len() != previous.media.len()
+        || [
+            "media_path",
+            "file_path",
+            "local_path",
+            "path",
+            "media_md5",
+            "media_lookup_hints",
+            "name",
+            "filename",
+            "file_name",
+            "size",
+        ]
+        .iter()
+        .any(|key| incoming.raw_payload.get(*key) != previous.raw_payload.get(*key))
+    {
+        return;
+    }
+    for (media, old) in incoming.media.iter_mut().zip(&previous.media) {
+        if media.integrity == archive_domain::MediaIntegrity::Missing
+            && media.content_hash.is_none()
+            && media.original_name == old.original_name
+            && old.integrity == archive_domain::MediaIntegrity::Verified
+            && old.content_hash.is_some()
+        {
+            *media = old.clone();
+        }
+    }
 }
 
 fn canonical_message_hash(message: &MessageV1) -> Result<String, serde_json::Error> {

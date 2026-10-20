@@ -9,3 +9,10 @@
 - 导出内容必须转义、校验范围、防路径穿越；CSV 必须防公式注入；所有导出经 `.partial` 原子完成且不覆盖已有文件。
 - Windows 特定代码放在 `crates/source-windows`；跨平台 domain、archive、parser、media、export 不得依赖 Windows API。
 - 新增依赖或更改锁文件前遵守全局下载安装确认规则。
+
+## 交付打包约定
+
+- Windows 工作台交付包必须使用 `artifacts/<包目录>/` 目录形式，目录初始内容只允许一个 `WeComArchive.exe` 单程序。
+- 交付目录不得包含 ZIP、SHA-256 校验文件、说明文档、源码、`serverData/`、`collectorData/` 或其他旁车文件；`serverData/` 和 `collectorData/` 只能在程序首次运行后由程序生成，不属于打包内容。
+- 生成包前先完成前端资源构建和 Windows x64 Release 构建，再将最终 `target/release/WeComArchive.exe` 复制到交付目录；不得从旧 `artifacts` 子目录拼装或覆盖正在运行的工作台。
+- 打包后必须检查交付目录的文件清单、EXE 版本号、Windows x64 架构和文件哈希；清单不符合“仅一个 `WeComArchive.exe`”时不得交付。

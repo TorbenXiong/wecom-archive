@@ -365,6 +365,7 @@ pub(crate) struct PageQuery {
 #[derive(Debug, Deserialize)]
 pub(crate) struct LocalCollectionQuery {
     pub(crate) include_media: Option<bool>,
+    pub(crate) data_redaction: Option<bool>,
     pub(crate) source_root: Option<String>,
 }
 

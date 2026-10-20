@@ -326,7 +326,26 @@ pub(crate) async fn search_messages(
                                     .join("、")
                             })
                         })
-                        .filter(|name| !name.is_empty());
+                        .or_else(|| {
+                            message
+                                .conversation_id
+                                .starts_with("Y:")
+                                .then(|| "系统通知".to_owned())
+                        })
+                        .filter(|name| !name.is_empty())
+                        .map(|name| {
+                            if message.conversation_id.starts_with("O:") {
+                                participants
+                                    .values()
+                                    .filter(|item| item.participant_kind.as_deref() != Some("bot"))
+                                    .filter_map(|item| item.display_name.as_deref())
+                                    .find(|value| !name.ends_with(*value))
+                                    .map(|employee| format!("{name}-{employee}"))
+                                    .unwrap_or(name)
+                            } else {
+                                name
+                            }
+                        });
                     conversation_cache.insert(message.conversation_id.clone(), name.clone());
                     name
                 };

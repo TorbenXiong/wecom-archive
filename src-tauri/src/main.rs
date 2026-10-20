@@ -4,6 +4,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use libsqlite3_sys as _;
+use tauri::Manager;
+
+fn workspace_capability(page_url: &tauri::Url) -> tauri::ipc::CapabilityBuilder {
+    // Authorize only the server started by this process, including its exact
+    // port. Do not grant desktop commands to arbitrary LAN or remote pages.
+    // URLPattern treats IPv6 colons as parameter syntax unless escaped.
+    let host = page_url
+        .host_str()
+        .expect("workspace URL must have a host")
+        .replace(':', "\\:");
+    let port = page_url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    let pattern = format!("{}://{host}{port}/*", page_url.scheme());
+    tauri::ipc::CapabilityBuilder::new("workspace-runtime")
+        .local(false)
+        .window("main")
+        .remote(pattern)
+        .permission("allow-exit-workspace")
+        .permission("allow-check-for-update")
+        .permission("allow-install-update")
+}
 
 #[tauri::command]
 async fn check_for_update() -> Result<Option<wecom_archive_desktop::UpdateInfo>, String> {
@@ -66,6 +89,7 @@ fn main() {
 
     tauri::Builder::default()
         .setup(move |app| {
+            app.add_capability(workspace_capability(&page_url))?;
             tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
@@ -114,6 +138,66 @@ fn is_collector() -> bool {
     std::env::current_exe().ok().is_some_and(|executable| {
         archive_transfer::read_enterprise_collector_config(&executable).is_ok()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tauri::ipc::Origin;
+
+    #[test]
+    fn workspace_commands_only_allow_the_current_origin_and_window() {
+        for address in [
+            "http://127.0.0.1:9812",
+            "http://10.10.1.202:9812",
+            "http://127.0.0.1:9912",
+            "http://[fd12:3456::20]:9912",
+        ] {
+            let page = tauri::Url::parse(&format!("{address}/#token=synthetic")).unwrap();
+            let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+            let authority = context.runtime_authority_mut();
+            authority
+                .add_capability(workspace_capability(&page))
+                .unwrap();
+            let origin = Origin::Remote { url: page.clone() };
+            for command in ["exit_workspace", "check_for_update", "install_update"] {
+                assert!(
+                    authority
+                        .resolve_access(command, "main", "main", &origin)
+                        .is_some()
+                );
+                assert!(
+                    authority
+                        .resolve_access(command, "other", "other", &origin)
+                        .is_none()
+                );
+                for rejected in [
+                    "http://127.0.0.1:9812/",
+                    "http://10.10.1.203:9812/",
+                    "http://10.10.1.202:9913/",
+                    "http://[fd12:3456::21]:9912/",
+                    "http://[fd12:3456::20]:9913/",
+                    "https://example.invalid/",
+                ] {
+                    let rejected_url = tauri::Url::parse(rejected).unwrap();
+                    if rejected_url.origin() == page.origin() {
+                        continue;
+                    }
+                    let rejected = Origin::Remote { url: rejected_url };
+                    assert!(
+                        authority
+                            .resolve_access(command, "main", "main", &rejected)
+                            .is_none()
+                    );
+                }
+            }
+            assert!(
+                authority
+                    .resolve_access("collect_source", "main", "main", &origin)
+                    .is_none()
+            );
+        }
+    }
 }
 
 fn exit_with_error(message: &str) -> ! {

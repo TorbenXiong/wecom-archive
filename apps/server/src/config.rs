@@ -42,6 +42,8 @@ pub(super) struct EnterpriseConfig {
     pub(super) super_admin_enabled: bool,
     #[serde(default)]
     pub(super) local_collection_plans: Vec<LocalCollectionPlan>,
+    #[serde(default)]
+    pub(super) local_collection_cursors: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing)]
     pub(super) server_include_media: bool,
     #[serde(default)]
@@ -314,6 +316,7 @@ pub(super) fn new_enterprise_config() -> EnterpriseConfig {
         collector_log_level: default_collector_log_level(),
         super_admin_enabled: default_super_admin_enabled(),
         local_collection_plans: Vec::new(),
+        local_collection_cursors: std::collections::BTreeMap::new(),
         server_include_media: false,
         server_schedule: CollectionSchedule::default(),
         collector_schedule: CollectionSchedule::default(),

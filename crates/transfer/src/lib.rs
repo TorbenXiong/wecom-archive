@@ -455,7 +455,11 @@ fn redact_sensitive_json_with_exclusions(value: &mut serde_json::Value, excluded
             .for_each(|item| redact_sensitive_json_with_exclusions(item, excluded_names)),
         serde_json::Value::Object(map) => {
             for (key, item) in map {
-                if is_sensitive_label(key) {
+                if key.starts_with("custom:") || key == "employee_no" || key == "address" {
+                    if item.as_str().is_some_and(|value| !value.trim().is_empty()) {
+                        *item = serde_json::Value::String(REDACTION_PLACEHOLDER.into());
+                    }
+                } else if is_sensitive_label(key) {
                     redact_sensitive_labeled_json_values(item, key, excluded_names);
                 } else {
                     redact_sensitive_json_with_exclusions(item, excluded_names);
@@ -2317,6 +2321,7 @@ mod tests {
 
     #[test]
     fn redacts_only_the_sensitive_value_in_readable_text() {
+        assert_eq!(redact_sensitive_text("[便便]99345"), "[便便]99345");
         assert_eq!(
             redact_sensitive_text("企业微信截图_1789453808453.png"),
             "企业微信截图_1789453808453.png"

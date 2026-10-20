@@ -87,6 +87,7 @@ export default function App() {
   const [toast, setToast] = useState<{ message: string; tone: "success" | "error"; actionLabel?: string; onAction?: () => void }>();
   const [importing, setImporting] = useState(false);
   const [collectingLocal, setCollectingLocal] = useState(false);
+  const [localCollectionDataRedaction, setLocalCollectionDataRedaction] = useState(true);
   const [showLocalCollectionSetup, setShowLocalCollectionSetup] = useState(false);
   const [collectionProgress, setCollectionProgress] = useState<LocalCollectionProgress>({ running: false, percent: 0, stage: "准备采集", detail: "正在初始化本机采集任务。" });
   const [refreshVersion, setRefreshVersion] = useState(0);
@@ -151,6 +152,7 @@ export default function App() {
     // preserve their existing full-content behavior while the real server returns
     // an explicit default of false.
     setSuperAdminEnabled(config?.superAdminEnabled ?? true);
+    setLocalCollectionDataRedaction(config?.dataRedaction ?? true);
     setToken(accessToken);
   };
 
@@ -194,12 +196,14 @@ export default function App() {
     setCollectingLocal(true);
     setCollectionProgress({ running: true, percent: 2, stage: "准备采集", detail: includeMedia ? "正在准备采集文本、图片和文件。" : "正在准备仅采集文本消息。" });
     try {
-      const result = await collectLocalArchive(token, includeMedia, sourceRoot);
+      const result = await collectLocalArchive(token, includeMedia, sourceRoot, localCollectionDataRedaction);
       setCustomRootIssue(null);
       await loadDirectory(token);
       setRefreshVersion((current) => current + 1);
       setToast({
-        message: `本机采集完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条，更新 ${result.revised.toLocaleString("zh-CN")} 条消息${includeMedia ? `；采集媒体 ${result.mediaCount.toLocaleString("zh-CN")} 项${result.missingMediaCount > 0 ? `，${result.missingMediaCount.toLocaleString("zh-CN")} 项源文件未找到` : ""}` : ""}。`,
+        message: includeMedia
+          ? `本机全内容采集完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条，图片和附件已处理。`
+          : `本机采集完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条，更新 ${result.revised.toLocaleString("zh-CN")} 条消息。`,
         tone: "success",
       });
     } catch (error) {
@@ -225,7 +229,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!token || !collectingLocal) return;
+    if (!token || (!collectingLocal && !collectionProgress.running)) return;
     const controller = new AbortController();
     let polling = false;
     const refreshProgress = async () => {
@@ -245,7 +249,7 @@ export default function App() {
       controller.abort();
       window.clearInterval(interval);
     };
-  }, [collectingLocal, token]);
+  }, [collectingLocal, collectionProgress.running, token]);
 
   const showExportCompleted = (result: ServerExportResult, label: string) => {
     if (!token) return;
@@ -320,6 +324,7 @@ export default function App() {
         id: row.participant_id,
         name: row.display_name?.trim() || `成员 ${shortIdentifier(row.participant_id)}`,
         kind: row.participant_kind,
+        profile: row.profile,
       }))))
       .catch((reason) => {
         if (reason instanceof DOMException && reason.name === "AbortError") return;
@@ -371,7 +376,7 @@ export default function App() {
     </div>
     <footer className="status-bar"><span>已归档 {summary.message_count.toLocaleString("zh-CN")} 条消息 · {summary.media_count.toLocaleString("zh-CN")} 项媒体 · {summary.conversation_count.toLocaleString("zh-CN")} 个会话</span><span><i />受控访问 · 审计已启用</span></footer>
      {showExport && superAdminEnabled && <ExportDialog token={token} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} conversations={conversations} selectedConversationId={selectedId} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" || scope === "date_range" ? summary.message_count : scope === "current_filter" ? messages.length : scope === "selected_conversations" ? 0 : selectedConversation.messageCount} mediaCount={scope === "entire_archive" || scope === "date_range" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async (selection: ExportSelection, signal, onProgress) => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, conversationIds: selection.conversationIds, startDate: selection.startDate, endDate: selection.endDate, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }, signal, onProgress); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
-    {showLocalCollectionSetup && !collectingLocal && <LocalCollectionSetupDialog onClose={() => setShowLocalCollectionSetup(false)} onCollect={(includeMedia) => { setShowLocalCollectionSetup(false); void collectLocal(includeMedia); }} />}
+    {showLocalCollectionSetup && !collectingLocal && <LocalCollectionSetupDialog dataRedaction={localCollectionDataRedaction} onDataRedactionChange={setLocalCollectionDataRedaction} onClose={() => setShowLocalCollectionSetup(false)} onCollect={(includeMedia) => { setShowLocalCollectionSetup(false); void collectLocal(includeMedia); }} />}
     {customRootIssue && !collectingLocal && <CustomSourceRootDialog message={customRootIssue.message} initialRoot={customRootIssue.attemptedRoot ?? ""} onClose={() => setCustomRootIssue(null)} onRetry={(root) => { void collectLocal(customRootIssue.includeMedia, root); }} />}
     {collectingLocal && <LocalCollectionDialog progress={collectionProgress} />}
     {toast && <Toast tone={toast.tone} actionLabel={toast.actionLabel} onAction={toast.onAction} onClose={() => setToast(undefined)}>{toast.message}</Toast>}
@@ -384,13 +389,14 @@ function mapConversation(row: ServerConversation, index: number): ConversationSu
   // from archives created before direct/group classification was explicit.
   const isGroup = row.conversation_id.startsWith("R:")
     ? true
-    : row.conversation_id.startsWith("S:")
+    : row.conversation_id.startsWith("S:") || row.conversation_id.startsWith("M:") || row.conversation_id.startsWith("T:") || row.conversation_id.startsWith("Y:")
       ? false
       : explicitType === "group";
   const directNames = (row.participant_names || []).map((name) => name.trim()).filter(Boolean);
-  const title = !isGroup && directNames.length > 0
+  const kind = explicitType === "document" ? "document" : explicitType === "system" || row.conversation_id.startsWith("Y:") ? "system" : explicitType === "assistant" || row.conversation_id.startsWith("O:") ? "assistant" : explicitType === "temporary" || row.conversation_id.startsWith("T:") ? "temporary" : row.conversation_id.startsWith("M:") || explicitType === "application" ? "application" : undefined;
+  const title = !isGroup && !kind && directNames.length > 0
     ? directNames.join("、")
-    : row.display_name?.trim() || `会话 ${shortIdentifier(row.conversation_id)}`;
+    : row.display_name?.trim() || (kind === "temporary" ? "临时会话" : kind === "assistant" ? "应用会话" : kind === "system" ? "系统通知" : `会话 ${shortIdentifier(row.conversation_id)}`);
   const accents: ConversationSummary["accent"][] = ["blue", "slate", "violet", "amber", "teal", "orange"];
   return {
     id: row.conversation_id,
@@ -404,11 +410,12 @@ function mapConversation(row: ServerConversation, index: number): ConversationSu
     mediaCount: row.media_count,
     participantCount: row.participant_count,
     isGroup,
+    kind,
   };
 }
 
 function mapSearchConversation(result: GlobalSearchResult): ConversationSummary {
-  const title = result.conversation_name?.trim() || `会话 ${shortIdentifier(result.conversation_id)}`;
+  const title = result.conversation_name?.trim() || (result.conversation_id.startsWith("T:") ? "临时会话" : result.conversation_id.startsWith("R:") ? "未命名群聊" : result.conversation_id.startsWith("Y:") ? "系统通知" : result.conversation_id.startsWith("O:") ? "应用会话" : `会话 ${shortIdentifier(result.conversation_id)}`);
   return {
     id: result.conversation_id,
     title,
@@ -421,6 +428,7 @@ function mapSearchConversation(result: GlobalSearchResult): ConversationSummary 
     mediaCount: 0,
     participantCount: 0,
     isGroup: result.conversation_id.startsWith("R:"),
+    kind: result.conversation_id.startsWith("Y:") ? "system" : result.conversation_id.startsWith("T:") ? "temporary" : result.conversation_id.startsWith("M:") ? "application" : result.conversation_id.startsWith("O:") ? "assistant" : undefined,
   };
 }
 
@@ -439,7 +447,10 @@ function mapMessage(row: ServerMessage): MessageItem {
     direction: row.direction,
     type: row.message_type,
     rawType: row.raw_type,
-    body: row.body_text || (row.message_type === "unsupported" ? `[暂不支持的消息类型：${row.raw_type}]` : undefined),
+    body: row.body_text
+      || (row.message_type === "audio" ? "[语音消息]"
+        : row.message_type === "unsupported" ? `[暂不支持的消息类型：${row.raw_type}]` : undefined),
+    richSegments: row.raw_payload?.rich_segments,
     quote: row.quoted_message_id ? {
       id: row.quoted_message?.stable_message_id || row.quoted_message_id,
       sender: row.quoted_message?.sender_name?.trim() || (row.quoted_message?.sender_id ? `成员 ${shortIdentifier(row.quoted_message.sender_id)}` : "原消息"),
@@ -486,8 +497,8 @@ function formatConversationTime(value: string): string {
   return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" }).format(date);
 }
 
-function formatBytes(value?: number): string {
-  if (value === undefined) return "";
+function formatBytes(value?: number | null): string {
+  if (value == null) return "";
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / 1024 / 1024).toFixed(1)} MB`;

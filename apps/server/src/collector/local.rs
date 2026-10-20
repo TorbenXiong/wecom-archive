@@ -22,10 +22,9 @@ pub(crate) async fn collect_local(
     Query(query): Query<LocalCollectionQuery>,
 ) -> Result<Json<ImportResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    let collector = state
-        .local_collector
-        .clone()
-        .ok_or_else(ApiError::local_collection_unavailable)?;
+    if state.local_collector.is_none() {
+        return Err(ApiError::local_collection_unavailable());
+    }
     if state
         .local_collection_running
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -34,7 +33,7 @@ pub(crate) async fn collect_local(
         return Err(ApiError::local_collection_running());
     }
     let _run_guard = LocalCollectionRunGuard(Arc::clone(&state.local_collection_running));
-    let (configured_include_media, data_redaction) = {
+    let (configured_include_media, configured_data_redaction) = {
         let config = state
             .enterprise_config
             .lock()
@@ -42,74 +41,15 @@ pub(crate) async fn collect_local(
         (config.server_include_media, config.data_redaction)
     };
     let include_media = query.include_media.unwrap_or(configured_include_media);
-    let source_root = query.source_root;
-    set_local_collection_progress(&state, true, 3, "准备采集", "正在初始化本机采集任务。");
-    let progress = Arc::clone(&state.local_collection_progress);
-    let reporter: LocalCollectionProgressReporter = Arc::new(move |percent, stage, detail| {
-        if let Ok(mut current) = progress.lock() {
-            *current = LocalCollectionProgress {
-                running: true,
-                percent: percent.min(95),
-                stage: stage.to_owned(),
-                detail: detail.to_owned(),
-            };
-        }
-    });
-    let media_root = Arc::clone(&state.data_root);
-    let media_sink: LocalCollectionMediaSink =
-        Arc::new(move |source, expected_hash, expected_size| {
-            persist_local_media_file(&media_root, source, expected_hash, expected_size)
-                .map_err(|_| "媒体文件写入归档失败。".to_owned())
-        });
-    let export = match tokio::task::spawn_blocking(move || {
-        collector(
-            include_media,
-            data_redaction,
-            None,
-            source_root,
-            reporter,
-            media_sink,
-        )
-    })
-    .await
-    {
-        Ok(Ok(export)) => export,
-        Ok(Err(message)) => {
-            set_local_collection_progress(&state, false, 0, "采集失败", &message);
-            return Err(local_collection_error(message));
-        }
-        Err(_) => {
-            let message = "本机采集进程异常结束，请重试。".to_owned();
-            set_local_collection_progress(&state, false, 0, "采集失败", &message);
-            return Err(ApiError::local_collection_failed(message));
-        }
-    };
-    set_local_collection_progress(
+    let data_redaction = query.data_redaction.unwrap_or(configured_data_redaction);
+    run_local_collection(
         &state,
-        true,
-        92,
-        "写入归档",
-        "正在校验并写入消息、图片和文件。",
-    );
-    let result = ingest_export(&state, export).await;
-    if result.is_ok() {
-        set_local_collection_progress(
-            &state,
-            false,
-            100,
-            "采集完成",
-            "本机数据已经合并到当前归档。",
-        );
-    } else {
-        set_local_collection_progress(
-            &state,
-            false,
-            0,
-            "写入失败",
-            "采集结果未能写入归档，请重试。",
-        );
-    }
-    result
+        include_media,
+        data_redaction,
+        None,
+        query.source_root,
+    )
+    .await
 }
 
 pub(crate) struct LocalCollectionRunGuard(Arc<AtomicBool>);
@@ -165,14 +105,8 @@ pub(crate) async fn run_local_collection_scheduler(state: AppState) {
                 continue;
             }
             let guard = LocalCollectionRunGuard(Arc::clone(&state.local_collection_running));
-            let since = plan
-                .last_run_at
-                .as_deref()
-                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                .map(|value| value.timestamp_millis().saturating_sub(5 * 60 * 1000));
-            let result = run_local_collection_once(&state, plan.include_media, since).await;
+            let result = run_local_collection_plan(&state, &plan.id, plan.include_media).await;
             drop(guard);
-            update_local_plan_result(&state, &plan.id, &result);
             if let Err(error) = result {
                 set_local_collection_progress(
                     &state,
@@ -189,9 +123,32 @@ pub(crate) async fn run_local_collection_scheduler(state: AppState) {
     }
 }
 
+pub(crate) async fn run_local_collection_plan(
+    state: &AppState,
+    plan_id: &str,
+    include_media: bool,
+) -> Result<Json<ImportResponse>, ApiError> {
+    let since = state
+        .enterprise_config
+        .lock()
+        .map_err(|_| ApiError::store())?
+        .local_collection_cursors
+        .get(plan_id)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis().saturating_sub(5 * 60 * 1000));
+    // A snapshot predates task completion, sometimes by many minutes. Advance
+    // only to its conservative lower bound after a successful ingest. Old configs
+    // without this cursor get one full scan instead of trusting a completion time.
+    let started_at = Utc::now();
+    let result = run_local_collection_once(state, include_media, since).await;
+    update_local_plan_result(state, plan_id, started_at, &result);
+    result
+}
+
 pub(crate) fn update_local_plan_result(
     state: &AppState,
     plan_id: &str,
+    started_at: chrono::DateTime<Utc>,
     result: &Result<Json<ImportResponse>, ApiError>,
 ) {
     if let Ok(mut config) = state.enterprise_config.lock()
@@ -209,6 +166,11 @@ pub(crate) fn update_local_plan_result(
             .err()
             .map(|error| error.body.message.clone());
         plan.updated_at = Utc::now().to_rfc3339();
+        if result.is_ok() {
+            config
+                .local_collection_cursors
+                .insert(plan_id.to_owned(), started_at.to_rfc3339());
+        }
         let _ = persist_enterprise_config(&state.data_root, &config);
     }
 }
@@ -218,10 +180,6 @@ pub(crate) async fn run_local_collection_once(
     include_media: bool,
     since_unix_ms: Option<i64>,
 ) -> Result<Json<ImportResponse>, ApiError> {
-    let collector = state
-        .local_collector
-        .clone()
-        .ok_or_else(ApiError::local_collection_unavailable)?;
     let data_redaction = {
         let config = state
             .enterprise_config
@@ -229,7 +187,20 @@ pub(crate) async fn run_local_collection_once(
             .map_err(|_| ApiError::store())?;
         config.data_redaction
     };
-    set_local_collection_progress(state, true, 3, "准备采集", "正在初始化定时采集任务。");
+    run_local_collection(state, include_media, data_redaction, since_unix_ms, None).await
+}
+
+async fn run_local_collection(
+    state: &AppState,
+    include_media: bool,
+    data_redaction: bool,
+    since_unix_ms: Option<i64>,
+    source_root: Option<String>,
+) -> Result<Json<ImportResponse>, ApiError> {
+    let collector = state
+        .local_collector
+        .clone()
+        .ok_or_else(ApiError::local_collection_unavailable)?;
     let progress = Arc::clone(&state.local_collection_progress);
     let reporter: LocalCollectionProgressReporter = Arc::new(move |percent, stage, detail| {
         if let Ok(mut current) = progress.lock() {
@@ -247,27 +218,45 @@ pub(crate) async fn run_local_collection_once(
             persist_local_media_file(&media_root, source, expected_hash, expected_size)
                 .map_err(|_| "媒体文件写入归档失败。".to_owned())
         });
-    let export = tokio::task::spawn_blocking(move || {
-        collector(
-            include_media,
-            data_redaction,
-            since_unix_ms,
-            None,
-            reporter,
-            media_sink,
-        )
-    })
-    .await
-    .map_err(|_| ApiError::local_collection_failed("本机采集进程异常结束，请重试。".into()))?
-    .map_err(ApiError::local_collection_failed)?;
-    set_local_collection_progress(
-        state,
-        true,
-        92,
-        "写入归档",
-        "正在校验并写入消息、图片和文件。",
-    );
-    let result = ingest_export(state, export).await;
+    let result = async {
+        set_local_collection_progress(
+            state,
+            true,
+            4,
+            if include_media {
+                "完整采集"
+            } else {
+                "采集文字"
+            },
+            if include_media {
+                "正在一次性采集文字、图片和附件。"
+            } else {
+                "正在采集文字消息和会话关系。"
+            },
+        );
+        let export = tokio::task::spawn_blocking(move || {
+            collector(
+                include_media,
+                data_redaction,
+                since_unix_ms,
+                source_root,
+                reporter,
+                media_sink,
+            )
+        })
+        .await
+        .map_err(|_| ApiError::local_collection_failed("本机采集进程异常结束，请重试。".into()))?
+        .map_err(local_collection_error)?;
+        set_local_collection_progress(
+            state,
+            true,
+            96,
+            "写入归档",
+            "正在写入本次采集的文字、图片和附件。",
+        );
+        ingest_export(state, export).await
+    }
+    .await;
     if result.is_ok() {
         set_local_collection_progress(
             state,
@@ -276,14 +265,8 @@ pub(crate) async fn run_local_collection_once(
             "采集完成",
             "本机数据已经合并到当前归档。",
         );
-    } else {
-        set_local_collection_progress(
-            state,
-            false,
-            0,
-            "写入失败",
-            "采集结果未能写入归档，请重试。",
-        );
+    } else if let Err(error) = &result {
+        set_local_collection_progress(state, false, 0, "采集失败", &error.body.message);
     }
     result
 }

@@ -149,6 +149,7 @@ pub(crate) async fn delete_local_collection_plan(
     if config.local_collection_plans.len() == previous_len {
         return Err(ApiError::invalid_query());
     }
+    config.local_collection_cursors.remove(&plan_id);
     persist_enterprise_config(&state.data_root, &config)?;
     Ok(Json(collection_schedules_response(
         &config,
@@ -487,37 +488,8 @@ pub(crate) async fn collector_heartbeat(
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
-    // A newly enrolled collector on the same device replaces a previous
-    // collector instance. Keep the same collector id intact so restarting or
-    // upgrading that instance does not remove its registration.
-    let replaced_files = {
-        collector_by_device_token(&mut config, &collector_id, &headers)?;
-        let now = Utc::now();
-        let replaced_ids = config
-            .collectors
-            .iter()
-            .filter(|collector| {
-                collector.collector_id != collector_id
-                    && collector.last_client_ip.as_deref() == Some(client_ip.as_str())
-                    && collector_status(collector, now) == "online"
-            })
-            .map(|collector| (collector.collector_id.clone(), collector.file_name.clone()))
-            .collect::<Vec<_>>();
-        if replaced_ids.is_empty() {
-            Vec::new()
-        } else {
-            config.collectors.retain(|collector| {
-                !replaced_ids
-                    .iter()
-                    .any(|(replaced_id, _)| replaced_id == &collector.collector_id)
-            });
-            replaced_ids
-                .into_iter()
-                .map(|(_, file_name)| file_name)
-                .filter(|file_name| !file_name.is_empty())
-                .collect::<Vec<_>>()
-        }
-    };
+    // Multiple devices can share one NAT or proxy address. Only the authenticated
+    // collector identity may be updated; retiring other identities is explicit.
     let snapshot = {
         let collector = collector_by_device_token(&mut config, &collector_id, &headers)?;
         collector.last_seen_at = Some(Utc::now().to_rfc3339());
@@ -564,9 +536,6 @@ pub(crate) async fn collector_heartbeat(
         diagnostics::collector(&snapshot.collector_id, event_name, &details);
     }
     persist_enterprise_config(&state.data_root, &config)?;
-    for file_name in replaced_files {
-        let _ = std::fs::remove_file(state.data_root.join("collectors").join(file_name));
-    }
     let should_send = request.current_config_revision.unwrap_or(0) < snapshot.config_revision;
     let control = if should_send {
         Some(signed_collector_control(

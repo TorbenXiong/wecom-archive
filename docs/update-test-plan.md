@@ -1,24 +1,24 @@
 # 升级功能测试方案
 
-## 已自动验证
+当前验收目标为 `0.0.11`，旧端基线为已发布的 `0.0.10`。本版本其他操作见 [人工验收清单](acceptance-0.0.11.md)，自动验证结果统一见 [实施状态](implementation-status.md)。
+
+## 验证命令
 
 以下命令在 Windows x64、Rust `1.98.1`、Node.js/pnpm 本地缓存环境执行，不下载依赖：
 
 ```powershell
 pnpm exec tsc -b
-pnpm test -- --maxWorkers 1
+pnpm test
 cargo test --workspace --locked --offline
 pnpm build:client
 pnpm build:server
 cargo build --release --locked --offline --bin WeComArchive
 ```
 
-本次结果：Rust 工作区测试全部通过（真实企业微信授权测试按设计忽略），前端 11 个测试文件、67 项通过，TypeScript、前端构建和 Release 构建通过。
-
-单文件启动验收使用全新临时目录复制 `WeComArchive.exe`（源码基线版本为 `0.0.9`）：
+单文件启动验收使用全新临时目录复制本次构建的 `WeComArchive.exe`：
 
 1. 设置临时监听端口并启动 EXE。
-2. 请求 `/api/v1/health`，确认返回 `status=ok` 和 `version=0.0.9`。
+2. 请求 `/api/v1/health`，确认返回 `status=ok` 和 `version=0.0.11`。
 3. 请求 `/` 和其中的 JavaScript 资源，确认界面资源已嵌入 EXE。
 4. 检查 EXE 同级目录，确认首次启动创建 `serverData/`，没有创建 `collectorData/`。
 5. 关闭进程，确认本机服务正常退出。

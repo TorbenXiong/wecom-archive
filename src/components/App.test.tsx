@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, vi } from "vitest";
 import App from "../App";
@@ -104,12 +104,12 @@ function installApiMock() {
   }));
 }
 
-async function connect() {
+async function connect(expectedTitle = "真实 API 会话") {
   fireEvent.change(screen.getByLabelText("服务端访问令牌"), { target: { value: accessToken } });
   fireEvent.click(screen.getByRole("button", { name: "验证并进入工作台" }));
   await screen.findByRole("heading", { name: "快速导出本机记录", level: 2 });
   fireEvent.click(screen.getByRole("button", { name: "会话" }));
-  await screen.findByRole("heading", { name: "真实 API 会话", level: 1 });
+  await screen.findByRole("heading", { name: expectedTitle, level: 1 });
 }
 
 afterEach(() => {
@@ -199,6 +199,21 @@ describe("archive workspace", () => {
     expect(storageSpy).not.toHaveBeenCalled();
   });
 
+  it.each(["document", "group"])("labels M conversations correctly when the stored type is %s", async (storedType) => {
+    installApiMock();
+    const fallback = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (/\/conversations\?limit=\d+&offset=0$/.test(String(input))) {
+        return Response.json([{ conversation_id: "M:12345", display_name: "测试工作周报", conversation_type: storedType, participant_names: ["不应替代标题的成员"], last_message_at: "2026-09-07T10:24:00Z", message_count: 1, media_count: 0, participant_count: 8 }]);
+      }
+      return fallback(input, init);
+    });
+    render(<App />);
+    await connect("测试工作周报");
+    expect(screen.getAllByText(storedType === "document" ? "文档会话" : "应用会话")).toHaveLength(2);
+    expect(screen.queryByText("群会话")).not.toBeInTheDocument();
+  });
+
   it("loads the next message page instead of keeping the first fixed slice", async () => {
     const messageRequests: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
@@ -238,27 +253,44 @@ describe("archive workspace", () => {
       if (url.includes("/participants")) return Response.json([]);
       return Response.json({}, { status: 404 });
     }));
-    render(<App />);
+    const { container } = render(<App />);
     fireEvent.change(screen.getByLabelText("服务端访问令牌"), { target: { value: accessToken } });
     fireEvent.click(screen.getByRole("button", { name: "验证并进入工作台" }));
     await screen.findByRole("heading", { name: "快速导出本机记录", level: 2 });
     fireEvent.click(screen.getByRole("button", { name: "会话" }));
     await screen.findByRole("heading", { name: "人员甲、人员乙", level: 1 });
+    const pagination = within(container.querySelector<HTMLElement>(".timeline-footer")!);
     expect(screen.getAllByText("私人会话").length).toBeGreaterThan(0);
     expect(await screen.findByText(/共 201 条消息/)).toBeInTheDocument();
     expect(screen.getByLabelText("跳转页码")).toHaveValue("1");
     expect(screen.getByText((_, element) => element instanceof HTMLElement && element.classList.contains("page-jump") && element.textContent.includes("/ 2 页"))).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    fireEvent.click(pagination.getByRole("button", { name: "下一页" }));
     await waitFor(() => expect(messageRequests.some((url) => new URL(url, "http://localhost").searchParams.get("offset") === "200")).toBe(true));
     expect(await screen.findByText((_, element) => element instanceof HTMLElement && element.classList.contains("page-jump") && element.textContent.includes("/ 2 页"))).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "上一页" })).not.toBeDisabled();
-    fireEvent.change(screen.getByLabelText("每页数量"), { target: { value: "100" } });
+    expect(pagination.getByRole("button", { name: "上一页" })).not.toBeDisabled();
+    fireEvent.change(pagination.getByLabelText("每页数量"), { target: { value: "100" } });
     await waitFor(() => expect(messageRequests.some((url) => new URL(url, "http://localhost").searchParams.get("limit") === "100" && new URL(url, "http://localhost").searchParams.get("offset") === "0")).toBe(true));
     expect(await screen.findByText((_, element) => element instanceof HTMLElement && element.classList.contains("page-jump") && element.textContent.includes("/ 3 页"))).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("跳转页码"), { target: { value: "99" } });
     fireEvent.blur(screen.getByLabelText("跳转页码"));
     await waitFor(() => expect(messageRequests.some((url) => new URL(url, "http://localhost").searchParams.get("offset") === "200" && new URL(url, "http://localhost").searchParams.get("limit") === "100")).toBe(true));
     expect(await screen.findByText((_, element) => element instanceof HTMLElement && element.classList.contains("page-jump") && element.textContent.includes("/ 3 页"))).toBeInTheDocument();
+  });
+
+  it("renders missing attachment sizes from nullable API fields without null B", async () => {
+    installApiMock();
+    const fallback = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input).includes("/messages?")) return Response.json([{
+        stable_message_id: "missing-file", conversation_id: "conversation-1", sender_id: "participant-1", sent_at: "2026-09-07T10:24:00Z", direction: "incoming", message_type: "file", body_text: "missing.pdf", lifecycle: "active", raw_type: "20", media: [{ original_name: "missing.pdf", content_hash: null, size_bytes: null, mime_type: null, integrity: "missing" }],
+      }]);
+      return fallback(input, init);
+    });
+    render(<App />);
+    await connect();
+    expect(await screen.findByRole("button", { name: "打开附件 missing.pdf" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("未采集附件内容");
+    expect(screen.queryByText(/null B/)).not.toBeInTheDocument();
   });
 
   it("can collapse and expand the conversation detail panel", async () => {
@@ -343,6 +375,7 @@ describe("archive workspace", () => {
     expect(screen.getByRole("progressbar", { name: "本机采集进度" })).toBeInTheDocument();
     expect(await screen.findByText("本机采集完成：新增 3 条，更新 1 条消息。")).toBeInTheDocument();
     expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/collections/local?include_media=false"))).toBe(true);
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("data_redaction=false"))).toBe(true);
   });
 
   it("can include images and files in a local collection", async () => {
@@ -350,19 +383,25 @@ describe("archive workspace", () => {
     render(<App />);
     await connect();
     fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
+    const redaction = await screen.findByRole("checkbox", { name: "数据脱敏" });
+    expect(redaction).not.toBeChecked();
+    fireEvent.click(redaction);
     fireEvent.click(await screen.findByRole("button", { name: "包含全内容" }));
-    expect(await screen.findByText("本机采集完成：新增 3 条，更新 1 条消息；采集媒体 5 项，1 项源文件未找到。")).toBeInTheDocument();
+    expect(await screen.findByText("本机全内容采集完成：新增 3 条，图片和附件已处理。")).toBeInTheDocument();
     expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("/collections/local?include_media=true"))).toBe(true);
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).includes("data_redaction=true"))).toBe(true);
   });
 
   it.each(["collection", "export"] as const)("preserves the custom directory across failed %s retries and sends it to the API", async (mode) => {
     installApiMock();
     const fallback = vi.mocked(fetch).getMockImplementation()!;
     const roots: Array<string | undefined> = [];
+    const redactions: Array<string | null> = [];
     vi.mocked(fetch).mockImplementation(async (input, init) => {
       const url = String(input);
       if (mode === "export" ? url.endsWith("/exports/local") : url.includes("/collections/local?") && init?.method === "POST") {
         roots.push(mode === "export" ? JSON.parse(String(init?.body)).sourceRoot : new URL(url, "http://localhost").searchParams.get("source_root") ?? undefined);
+        if (mode === "collection") redactions.push(new URL(url, "http://localhost").searchParams.get("data_redaction"));
         if (roots.length <= 2) return Response.json({ code: "LOCAL_SOURCE_NOT_FOUND", message: `未发现数据源（第 ${roots.length} 次）` }, { status: 422 });
       }
       return fallback(input, init);
@@ -374,6 +413,7 @@ describe("archive workspace", () => {
       fireEvent.click(screen.getByRole("button", { name: "开始导出" }));
     } else {
       fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
+      fireEvent.click(await screen.findByRole("checkbox", { name: "数据脱敏" }));
       fireEvent.click(await screen.findByRole("button", { name: "包含全内容" }));
     }
     fireEvent.change(await screen.findByLabelText("企业微信数据目录"), { target: { value: "D:\\FixtureWXWork" } });
@@ -382,8 +422,9 @@ describe("archive workspace", () => {
     expect(screen.getByRole("dialog", { name: "没有找到企业微信数据" })).toHaveTextContent("未发现数据源（第 2 次）");
     fireEvent.click(screen.getByRole("button", { name: "用这个目录重试" }));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "没有找到企业微信数据" })).not.toBeInTheDocument());
-    expect(await screen.findByText(mode === "export" ? /本机导出完成：local-export.csv/ : /本机采集完成：新增 3 条/)).toBeInTheDocument();
+    expect(await screen.findByText(mode === "export" ? /本机导出完成：local-export.csv/ : /采集完成：新增 3 条/)).toBeInTheDocument();
     expect(roots).toEqual([undefined, "D:\\FixtureWXWork", "D:\\FixtureWXWork"]);
+    if (mode === "collection") expect(redactions).toEqual(["true", "true", "true"]);
   });
 
   it.each(["collection", "export"] as const)("does not reopen the directory dialog after a %s retry fails for another reason", async (mode) => {

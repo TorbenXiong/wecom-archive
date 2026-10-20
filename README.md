@@ -41,6 +41,8 @@ crates/export/        JSON/CSV/HTML/Markdown 导出
 
 详细设计见 [`docs/architecture.md`](docs/architecture.md)，安全边界见 [`docs/privacy-security.md`](docs/privacy-security.md)，当前能力见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，验证状态见 [`docs/implementation-status.md`](docs/implementation-status.md)。
 
+本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；当前版本操作见 [0.0.11 人工验收](docs/acceptance-0.0.11.md)。
+
 合成数据性能基准见 [`docs/benchmarks.md`](docs/benchmarks.md)，使用 PowerShell 运行 `./scripts/benchmark-archive.ps1`。
 
 ## 开发
@@ -81,7 +83,7 @@ cargo build --release --locked --offline --bin WeComArchive
 
 ## 安全边界
 
-工作台默认仅监听本机。已生成采集端按签名绑定配置向已认证服务端同步心跳；自动上传须启用采集计划，也可由用户手动上传。外网地址应使用 HTTPS。程序不包含遥测、更新检查、远程字体或第三方资源；日志不记录聊天正文、凭据、密钥或私人路径。
+工作台默认仅监听本机。已生成采集端按签名绑定配置向已认证服务端同步心跳；自动上传须启用采集计划，也可由用户手动上传。外网地址应使用 HTTPS。工作台仅在用户操作时检查更新；程序不包含遥测、远程字体或第三方资源，日志不记录聊天正文、凭据、密钥或私人路径。
 
 ## License
 

@@ -49,6 +49,64 @@ use serde_json::json;
 const TEST_TOKEN: &str = "0123456789abcdefghijklmnop";
 
 #[test]
+fn opening_media_uses_verified_independent_copies_and_preserves_names() {
+    let directory = TestDirectory::new();
+    let bytes = b"synthetic attachment; never executable";
+    let hash = encode_hex(&Sha256::digest(bytes));
+    let media_root = directory.0.join("media");
+    std::fs::create_dir_all(&media_root).unwrap();
+    let source = media_root.join(&hash);
+    std::fs::write(&source, bytes).unwrap();
+    let name = "测试附件-setup.exe";
+    let first = prepare_media_copy(&directory.0, &hash, name).unwrap();
+    let second = prepare_media_copy(&directory.0, &hash, name).unwrap();
+    assert_ne!(first, second);
+    assert_eq!(first.file_name().unwrap(), name);
+    assert_eq!(std::fs::read(&first).unwrap(), bytes);
+    std::fs::write(first, b"edited externally").unwrap();
+    assert_eq!(std::fs::read(source).unwrap(), bytes);
+    assert_eq!(std::fs::read(second).unwrap(), bytes);
+    for invalid in [
+        "../bad.exe",
+        r"..\bad.exe",
+        r"C:\bad.exe",
+        "bad.exe:extra",
+        "CON.exe",
+        "LPT1.txt",
+        "bad.exe.",
+    ] {
+        assert_eq!(
+            prepare_media_copy(&directory.0, &hash, invalid)
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // Only prepare copies; never invoke the Windows application launcher here.
+}
+
+#[test]
+fn media_copy_rejects_corrupted_content_and_removes_partial_files() {
+    let directory = TestDirectory::new();
+    let hash = "a".repeat(64);
+    std::fs::create_dir_all(directory.0.join("media")).unwrap();
+    std::fs::write(directory.0.join("media").join(&hash), b"invalid content").unwrap();
+    assert_eq!(
+        prepare_media_copy(&directory.0, &hash, "report.pdf")
+            .unwrap_err()
+            .body
+            .code,
+        "MEDIA_OPEN_FAILED"
+    );
+    assert_eq!(
+        std::fs::read_dir(directory.0.join("opened-media"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
 fn private_collector_url_selects_listener_address() {
     assert_eq!(
         configured_private_listen_address("http://10.10.1.202:9812"),
@@ -476,6 +534,89 @@ async fn local_collection_plans_are_independent_and_persisted() {
 }
 
 #[tokio::test]
+async fn local_plan_cursor_uses_successful_start_time_and_survives_failures() {
+    let directory = TestDirectory::new();
+    let mut app_state = state(&directory);
+    let cutoffs = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&cutoffs);
+    app_state.local_collector = Some(Arc::new(move |_, _, since, _, _, _| {
+        captured.lock().unwrap().push(since);
+        Ok(serde_json::from_slice(&export_bytes("synthetic", Uuid::new_v4(), "cursor")).unwrap())
+    }));
+    let created = create_local_collection_plan(
+        State(app_state.clone()),
+        authorized_headers(),
+        Json(LocalCollectionPlanRequest {
+            name: "synthetic plan".into(),
+            schedule: CollectionSchedule::default(),
+            include_media: false,
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    let id = created.local_plans[0].plan.id.clone();
+    // A legacy completion timestamp is not a safe cursor. Its first upgraded run
+    // must re-read all records, including any gap left by an earlier long task.
+    app_state
+        .enterprise_config
+        .lock()
+        .unwrap()
+        .local_collection_plans[0]
+        .last_run_at = Some(Utc::now().to_rfc3339());
+    let first = run_local_collection_plan(&app_state, &id, false).await;
+    assert!(first.is_ok());
+    assert_eq!(cutoffs.lock().unwrap().as_slice(), &[None]);
+    let started = Utc::now() - chrono::TimeDelta::minutes(10);
+    update_local_plan_result(&app_state, &id, started, &first);
+    let persisted = load_enterprise_config(&directory.0);
+    assert_eq!(
+        persisted.local_collection_cursors.get(&id),
+        Some(&started.to_rfc3339())
+    );
+    let completed = DateTime::parse_from_rfc3339(
+        persisted.local_collection_plans[0]
+            .last_run_at
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(completed.timestamp_millis() - started.timestamp_millis() > 5 * 60 * 1000);
+    let _ = run_local_collection_plan(&app_state, &id, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        cutoffs.lock().unwrap()[1],
+        Some(started.timestamp_millis() - 5 * 60 * 1000)
+    );
+    let before_failure = load_enterprise_config(&directory.0);
+    app_state.local_collector = Some(Arc::new(|_, _, _, _, _, _| Err("synthetic failure".into())));
+    assert!(
+        run_local_collection_plan(&app_state, &id, false)
+            .await
+            .is_err()
+    );
+    let after_failure = load_enterprise_config(&directory.0);
+    assert_eq!(
+        after_failure.local_collection_cursors,
+        before_failure.local_collection_cursors
+    );
+    assert_eq!(
+        after_failure.local_collection_plans[0].last_run_at,
+        before_failure.local_collection_plans[0].last_run_at
+    );
+    let _ =
+        delete_local_collection_plan(State(app_state), AxumPath(id.clone()), authorized_headers())
+            .await
+            .unwrap();
+    assert!(
+        !load_enterprise_config(&directory.0)
+            .local_collection_cursors
+            .contains_key(&id)
+    );
+}
+
+#[tokio::test]
 async fn enterprise_config_update_without_schedules_preserves_existing_plans() {
     let directory = TestDirectory::new();
     let app_state = state(&directory);
@@ -738,11 +879,11 @@ async fn local_collection_query_overrides_the_configured_media_mode() {
     ))
     .unwrap();
     app_state.local_collector = Some(Arc::new(
-        move |include_media, _, _, source_root, reporter, _| {
+        move |include_media, data_redaction, _, source_root, reporter, _| {
             captured_modes
                 .lock()
                 .unwrap()
-                .push((include_media, source_root));
+                .push((include_media, data_redaction, source_root));
             reporter(55, "解析消息", "正在解析测试消息。");
             Ok(export.clone())
         },
@@ -753,6 +894,7 @@ async fn local_collection_query_overrides_the_configured_media_mode() {
         authorized_headers(),
         Query(LocalCollectionQuery {
             include_media: Some(true),
+            data_redaction: Some(false),
             source_root: Some(r"D:\FixtureWXWork".to_owned()),
         }),
     )
@@ -761,12 +903,70 @@ async fn local_collection_query_overrides_the_configured_media_mode() {
 
     assert_eq!(
         *selected_modes.lock().unwrap(),
-        vec![(true, Some(r"D:\FixtureWXWork".to_owned()))]
+        vec![(true, false, Some(r"D:\FixtureWXWork".to_owned()))]
     );
+    for override_value in [Some(true), None] {
+        let _ = collect_local(
+            State(app_state.clone()),
+            authorized_headers(),
+            Query(LocalCollectionQuery {
+                include_media: Some(false),
+                data_redaction: override_value,
+                source_root: None,
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let configured_redaction = app_state.enterprise_config.lock().unwrap().data_redaction;
+    assert_eq!(
+        &selected_modes.lock().unwrap()[1..],
+        &[(false, true, None), (false, configured_redaction, None)]
+    );
+    assert!(configured_redaction);
     let progress = app_state.local_collection_progress.lock().unwrap().clone();
     assert!(!progress.running);
     assert_eq!(progress.percent, 100);
     assert_eq!(progress.stage, "采集完成");
+}
+
+#[tokio::test]
+async fn local_collection_failures_preserve_source_retry_and_release_the_run_lock() {
+    let directory = TestDirectory::new();
+    let mut app_state = state(&directory);
+    for (message, expected_code) in [
+        (
+            "未发现可支持的本机企业微信数据，请确认客户端已登录。",
+            "LOCAL_SOURCE_NOT_FOUND",
+        ),
+        ("读取授权失败。", "LOCAL_COLLECTION_FAILED"),
+    ] {
+        app_state.local_collector = Some(Arc::new(move |_, _, _, _, _, _| Err(message.into())));
+        let error = collect_local(
+            State(app_state.clone()),
+            authorized_headers(),
+            Query(LocalCollectionQuery {
+                include_media: Some(true),
+                data_redaction: Some(false),
+                source_root: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.body.code, expected_code);
+        assert!(
+            !app_state
+                .local_collection_running
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let progress = app_state.local_collection_progress.lock().unwrap().clone();
+        assert!(!progress.running);
+        assert_eq!(progress.detail, message);
+        let scheduled = run_local_collection_once(&app_state, true, None)
+            .await
+            .unwrap_err();
+        assert_eq!(scheduled.body.code, expected_code);
+    }
 }
 
 #[tokio::test]
@@ -1877,7 +2077,7 @@ async fn generated_collector_heartbeat_update_and_revoke_flow() {
 }
 
 #[tokio::test]
-async fn new_collector_replaces_online_collector_on_same_device() {
+async fn collectors_sharing_an_ip_keep_independent_registrations_and_files() {
     let directory = TestDirectory::new();
     let template = directory.0.join("collector-template.exe");
     std::fs::write(&template, b"collector").unwrap();
@@ -1950,7 +2150,7 @@ async fn new_collector_replaces_online_collector_on_same_device() {
     let second_artifact: serde_json::Value = serde_json::from_str(&second.artifact).unwrap();
     let second_id = second.collector_id.clone();
     let second_token = second_artifact["uploadToken"].as_str().unwrap().to_owned();
-    let replaced = collector_heartbeat(
+    let connected = collector_heartbeat(
         State(app_state.clone()),
         AxumPath(second_id.clone()),
         ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 42312))),
@@ -1971,11 +2171,11 @@ async fn new_collector_replaces_online_collector_on_same_device() {
     .await
     .unwrap()
     .0;
-    assert_eq!(replaced.status, "ok");
+    assert_eq!(connected.status, "ok");
 
     let config = app_state.enterprise_config.lock().unwrap();
     assert!(
-        !config
+        config
             .collectors
             .iter()
             .any(|collector| collector.collector_id == first_id)
@@ -1986,5 +2186,23 @@ async fn new_collector_replaces_online_collector_on_same_device() {
             .iter()
             .any(|collector| collector.collector_id == second_id)
     );
-    assert!(!first_path.exists());
+    assert!(first_path.is_file());
+    assert!(
+        directory
+            .0
+            .join("collectors")
+            .join(&second.file_name)
+            .is_file()
+    );
+    drop(config);
+    let mut config = app_state.enterprise_config.lock().unwrap();
+    assert!(
+        collector_by_device_token(&mut config, &first_id, &device_headers(&first_token)).is_ok()
+    );
+    assert!(
+        collector_by_device_token(&mut config, &second_id, &device_headers(&second_token)).is_ok()
+    );
+    assert!(
+        collector_by_device_token(&mut config, &first_id, &device_headers(&second_token)).is_err()
+    );
 }

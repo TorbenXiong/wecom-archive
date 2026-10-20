@@ -27,6 +27,16 @@ pub(super) fn local_collection_error(message: String) -> ApiError {
 }
 
 impl ApiError {
+    pub(super) fn media_open_failed(message: &str) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            body: ErrorResponse {
+                code: "MEDIA_OPEN_FAILED",
+                message: message.into(),
+                recoverable: true,
+            },
+        }
+    }
     pub(super) fn forbidden() -> Self {
         Self {
             status: StatusCode::FORBIDDEN,

@@ -84,15 +84,47 @@ impl ArchiveStore {
             // or may contain a stale participant-count inference.
             if conversation.conversation_id.starts_with("S:") {
                 conversation.conversation_type = Some("direct".into());
+            } else if conversation.conversation_id.starts_with("O:") {
+                conversation.conversation_type = Some("assistant".into());
             } else if conversation.conversation_id.starts_with("R:") {
                 conversation.conversation_type = Some("group".into());
+            } else if conversation.conversation_id.starts_with("T:") {
+                conversation.conversation_type = Some("temporary".into());
+                if conversation
+                    .display_name
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+                {
+                    conversation.display_name = Some("临时会话".into());
+                }
+            } else if conversation.conversation_id.starts_with("Y:") {
+                conversation.conversation_type = Some("system".into());
+                if conversation
+                    .display_name
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+                {
+                    conversation.display_name = Some("系统通知".into());
+                }
+            } else if conversation.conversation_id.starts_with("M:")
+                && conversation.conversation_type.as_deref() != Some("document")
+            {
+                conversation.conversation_type = Some("application".into());
             }
 
-            if conversation.conversation_type.as_deref() == Some("direct") {
-                let mut names = self
+            let unnamed_group = conversation.conversation_type.as_deref() == Some("group")
+                && conversation
+                    .display_name
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty());
+            if conversation.conversation_type.as_deref() == Some("direct")
+                || conversation.conversation_type.as_deref() == Some("assistant")
+                || unnamed_group
+            {
+                let member_rows = self
                     .connection
                     .prepare(
-                        "SELECT p.display_name
+                        "SELECT p.participant_id, p.display_name
                          FROM conversation_participants cp
                          JOIN participants p ON p.participant_id = cp.participant_id
                          WHERE cp.conversation_id = ?1
@@ -101,9 +133,13 @@ impl ArchiveStore {
                          ORDER BY cp.participant_id ASC",
                     )?
                     .query_map([conversation.conversation_id.as_str()], |row| {
-                        row.get::<_, String>(0)
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
+                let mut names = member_rows
+                    .iter()
+                    .map(|(_, name)| name.clone())
+                    .collect::<Vec<_>>();
 
                 // Direct conversations created by older source adapters may not have
                 // conversation_participants rows yet; recover the two IDs from S:a_b.
@@ -129,6 +165,32 @@ impl ArchiveStore {
                         .collect();
                 }
                 names.dedup();
+                if conversation.conversation_type.as_deref() == Some("assistant") {
+                    let employee = member_rows
+                        .iter()
+                        .find(|(id, _)| !id.starts_with("O:"))
+                        .map(|(_, name)| name.clone());
+                    if let Some(app_name) = conversation.display_name.clone()
+                        && let Some(employee) = employee
+                        && !app_name.ends_with(&employee)
+                    {
+                        conversation.display_name = Some(format!("{app_name}-{employee}"));
+                    }
+                }
+                if unnamed_group {
+                    let members = names.iter().take(3).cloned().collect::<Vec<_>>().join("、");
+                    let suffix = if names.len() > 3 { "等" } else { "" };
+                    conversation.display_name = Some(if !members.is_empty() {
+                        format!(
+                            "群聊：{members}{suffix}（{}人）",
+                            conversation.participant_count
+                        )
+                    } else if conversation.participant_count > 0 {
+                        format!("群聊（{}人）", conversation.participant_count)
+                    } else {
+                        "未命名群聊".into()
+                    });
+                }
                 conversation.participant_names = names;
             }
         }

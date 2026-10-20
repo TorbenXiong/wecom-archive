@@ -1,6 +1,7 @@
 import { ArrowRight, Download, HardDriveDownload, LoaderCircle, MessageSquareText, Search, Upload, Users, X } from "lucide-react";
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type { ConversationSummary, MessageType } from "../domain/types";
+import { conversationKindLabel } from "../domain/conversations";
 import { listConversationParticipants, searchMessages, type CollectedUser, type GlobalSearchResult, type ServerParticipant } from "../lib/server-api";
 
 interface ConversationListProps {
@@ -226,7 +227,7 @@ export function ConversationList({
           >
             <span className={"conversation-avatar " + conversation.accent}>{conversation.initials}</span>
             <span className="conversation-copy">
-              <span className="conversation-title-row"><strong>{conversation.title}</strong><em className="conversation-kind-badge">{conversation.isGroup ? "群会话" : "私人会话"}</em><time>{conversation.lastAt}</time></span>
+              <span className="conversation-title-row"><strong>{conversation.title}</strong><em className="conversation-kind-badge">{conversationKindLabel(conversation)}</em><time>{conversation.lastAt}</time></span>
               <span className="conversation-last">{conversation.lastMessage}</span>
             </span>
             {conversation.unread > 0 && <span className="unread-count">{conversation.unread}</span>}

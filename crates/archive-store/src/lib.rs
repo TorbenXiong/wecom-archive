@@ -65,6 +65,42 @@ pub struct ParticipantListItem {
     pub participant_id: String,
     pub display_name: Option<String>,
     pub participant_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<std::collections::BTreeMap<String, String>>,
+}
+
+fn participant_profile(value: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
+    const FIELDS: &[&str] = &[
+        "mobile",
+        "phone",
+        "office_phone",
+        "email",
+        "employee_no",
+        "department",
+        "organization",
+        "position",
+        "address",
+        "english_name",
+        "signature",
+    ];
+    value
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| {
+            FIELDS.contains(&key.as_str())
+                || (key.starts_with("custom:")
+                    && key.len() <= 135
+                    && !key.chars().any(char::is_control))
+        })
+        .filter_map(|(key, value)| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty() && text.len() <= 2048)
+                .map(|text| (key.clone(), text.into()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
