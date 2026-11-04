@@ -15,6 +15,8 @@ mod registry;
 #[cfg(windows)]
 pub mod roots;
 pub mod updater;
+#[cfg(windows)]
+pub mod voice;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -165,7 +167,13 @@ fn discover_under(root: &Path) -> Vec<SourceCandidate> {
 fn discover_media_roots(data_root: &Path, discovery_root: &Path) -> Vec<PathBuf> {
     const MEDIA_DIRECTORIES: &[&str] = &[
         "FileStorage",
+        "FileStorage/MsgAttach",
+        "FileStorage/Voice",
+        "FileStorage/Audio",
         "MsgAttach",
+        "Msg",
+        "Msg/Voice",
+        "Msg/Voice2",
         "File",
         "Files",
         "Image",
@@ -173,11 +181,15 @@ fn discover_media_roots(data_root: &Path, discovery_root: &Path) -> Vec<PathBuf>
         "Emotion",
         "Video",
         "Voice",
+        "Voice2",
+        "Audio",
         "Media",
         "Cache/Image",
         "Cache/File",
         "Cache/Video",
         "Cache/Voice",
+        "Cache/Voice2",
+        "Cache/Audio",
     ];
     let mut roots = BTreeSet::new();
     for base in data_root

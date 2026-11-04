@@ -1,5 +1,6 @@
 import { Building2, Database, Download, LoaderCircle, Server, ShieldCheck } from "lucide-react";
 import { useEffect, useState } from "react";
+import voiceNotices from "../third-party/silk-notices.txt?raw";
 import { getServerHealth, updateSuperAdmin, type ServerHealth } from "../lib/server-api";
 import { checkForUpdate, installUpdate, type UpdateInfo } from "../lib/update";
 import { isTauri } from "@tauri-apps/api/core";
@@ -107,6 +108,7 @@ export function SettingsPage({ token, superAdminEnabled, onSuperAdminChange }: S
           </button>
           {update && <button className="primary-button" type="button" onClick={() => void runUpdateInstall()} disabled={updateBusy}>升级到 {update.latestVersion} 并重启</button>}</div></> : <p>请在桌面工作台中检查和安装更新。</p>}
           {updateMessage && <p role="status" className="settings-inline-status">{updateMessage}</p>}
+          <details className="third-party-notices"><summary>语音解码组件许可</summary><pre>{voiceNotices}</pre></details>
         </section>
       </div>
     </main>

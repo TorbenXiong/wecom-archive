@@ -448,7 +448,7 @@ function mapMessage(row: ServerMessage): MessageItem {
     type: row.message_type,
     rawType: row.raw_type,
     body: row.body_text
-      || (row.message_type === "audio" ? "[语音消息]"
+      || (row.message_type === "audio" ? (media ? undefined : "[语音消息]")
         : row.message_type === "unsupported" ? `[暂不支持的消息类型：${row.raw_type}]` : undefined),
     richSegments: row.raw_payload?.rich_segments,
     quote: row.quoted_message_id ? {
@@ -463,7 +463,7 @@ function mapMessage(row: ServerMessage): MessageItem {
       kind: mediaKind(row.message_type, media.mime_type),
       contentHash: media.content_hash,
     } : undefined,
-    lifecycle: row.lifecycle === "active" ? "active" : "recalled",
+    lifecycle: row.lifecycle === "recalled" ? "recalled" : "active",
   };
 }
 

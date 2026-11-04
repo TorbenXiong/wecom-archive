@@ -12,6 +12,7 @@
 | `react-dom` | `19.2.8` | DOM 渲染 |
 | `@tauri-apps/api` | `2.11.1` | 类型化 IPC |
 | `lucide-react` | `1.42.0` | 独立开源图标 |
+| `silk-wasm` | `3.7.1` | 浏览器 Worker 中离线解码 SILK，随程序内嵌 WASM；不增加第三方运行时请求 |
 
 开发依赖：
 
@@ -31,6 +32,8 @@
 | `@types/react-dom` | `19.2.7` | React DOM 类型 |
 
 解析将创建根目录 `pnpm-lock.yaml` 和 `node_modules/`，写入 pnpm store 缓存；不会修改全局安装或系统 `PATH`。
+
+`silk-wasm 3.7.1` 已经用户明确批准，从 npm registry 获取，未变更其他依赖版本。来源为 [idranme/silk-wasm](https://github.com/idranme/silk-wasm/tree/v3.7.1)，MIT 包装层及内置 SILK 组件的许可保存在 `src/third-party/silk-notices.txt`，随前端嵌入程序，可在“设置 → 关于”展开查看。
 
 ## crates.io (`https://crates.io` / `https://static.crates.io`)
 

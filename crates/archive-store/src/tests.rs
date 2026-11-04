@@ -761,6 +761,38 @@ fn shared_media(hash: &str) -> MediaRefV1 {
 }
 
 #[test]
+fn recollection_retains_voice_bytes_when_transcription_changes_but_not_when_digest_changes() {
+    let directory = tempdir().unwrap();
+    let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+    let mut full = batch("original transcription");
+    full.messages[0].message_type = archive_domain::MessageType::Audio;
+    full.messages[0].raw_type = "16".into();
+    full.messages[0].raw_payload = json!({"media_md5": "11111111111111111111111111111111"});
+    full.messages[0].media = vec![shared_media("a")];
+    store.ingest_batch(&full).unwrap();
+    let mut next = full.clone();
+    next.batch_id = Uuid::new_v4();
+    next.content_sha256 = "voice-text-update-fixture".into();
+    next.messages[0].collection_batch_id = next.batch_id;
+    next.messages[0].body_text = Some("updated transcription".into());
+    next.messages[0].media[0].content_hash = None;
+    next.messages[0].media[0].integrity = MediaIntegrity::Missing;
+    let read = |store: &ArchiveStore| store.get_message("stable-one").unwrap().unwrap();
+    store.ingest_batch(&next).unwrap();
+    assert_eq!(read(&store).media[0].content_hash.as_deref(), Some("a"));
+    assert_eq!(
+        read(&store).body_text.as_deref(),
+        Some("updated transcription")
+    );
+    next.batch_id = Uuid::new_v4();
+    next.content_sha256 = "voice-resource-update-fixture".into();
+    next.messages[0].collection_batch_id = next.batch_id;
+    next.messages[0].raw_payload["media_md5"] = json!("22222222222222222222222222222222");
+    store.ingest_batch(&next).unwrap();
+    assert!(read(&store).media[0].content_hash.is_none());
+}
+
+#[test]
 fn batched_conversation_times_preserve_unsorted_inserts_and_legacy_revision_semantics() {
     let directory = tempdir().unwrap();
     let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();

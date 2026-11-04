@@ -577,12 +577,17 @@ export async function importEnterprisePackage(file: File, token: string): Promis
   });
 }
 
-export async function getMediaObjectUrl(token: string, contentHash: string): Promise<string> {
+export async function getMediaBlob(token: string, contentHash: string, signal?: AbortSignal): Promise<Blob> {
   const response = await fetch(`/api/v1/media/${encodeURIComponent(contentHash)}`, {
     headers: { Authorization: `Bearer ${token}` },
+    signal,
   });
   if (!response.ok) throw new Error("媒体内容尚未上传或不可用。");
-  return URL.createObjectURL(await response.blob());
+  return response.blob();
+}
+
+export async function getMediaObjectUrl(token: string, contentHash: string): Promise<string> {
+  return URL.createObjectURL(await getMediaBlob(token, contentHash));
 }
 
 export function openMediaFile(token: string, contentHash: string, name: string): Promise<{ opened: boolean }> {

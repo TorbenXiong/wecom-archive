@@ -101,15 +101,14 @@ fn classify(raw_type: &str, payload: &Value) -> MessageType {
     match normalized.as_str() {
         "0" | "1" | "2" | "text" => MessageType::Text,
         "3" | "4" | "14" | "29" | "image" | "img" => MessageType::Image,
-        "34" | "voice" | "audio" => MessageType::Audio,
+        "16" | "34" | "voice" | "audio" => MessageType::Audio,
         "43" | "video" => MessageType::Video,
-        "15" | "16" | "20" | "49:file" | "file" | "attachment" => MessageType::File,
+        "15" | "20" | "49:file" | "file" | "attachment" => MessageType::File,
         "13" | "49:link" | "link" | "url" => MessageType::Link,
         "49:quote" | "reply" | "quote" => MessageType::Reply,
         "38" | "40" | "501" | "503" | "671" | "10000" | "1001" | "1002" | "1004" | "1006"
-        | "1017" | "1018" | "1022" | "1051" | "1052" | "1055" | "1073" | "system" | "event" => {
-            MessageType::System
-        }
+        | "1017" | "1018" | "1022" | "1051" | "1052" | "1055" | "1073" | "2063" | "system"
+        | "event" => MessageType::System,
         "49" => match payload.get("kind").and_then(Value::as_str) {
             Some("file") => MessageType::File,
             Some("link") => MessageType::Link,
@@ -283,5 +282,16 @@ mod tests {
         .unwrap();
         assert_eq!(message.message_type, MessageType::Audio);
         assert_eq!(message.body_text.as_deref(), Some("这是语音转文字"));
+    }
+
+    #[test]
+    fn classifies_wecom_content_type_16_as_audio() {
+        let message = normalize(
+            row("16", json!({"transcription": "来自独立转写表"})),
+            Uuid::nil(),
+        )
+        .unwrap();
+        assert_eq!(message.message_type, MessageType::Audio);
+        assert_eq!(message.body_text.as_deref(), Some("来自独立转写表"));
     }
 }
