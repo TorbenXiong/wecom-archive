@@ -64,6 +64,7 @@ fn mime_type(path: &str) -> &'static str {
         Some("png") => "image/png",
         Some("ico") => "image/x-icon",
         Some("woff2") => "font/woff2",
+        Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
     }
 }

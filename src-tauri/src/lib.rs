@@ -6,7 +6,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use archive_domain::{
@@ -239,6 +239,8 @@ struct MediaCollectionOptions {
 struct MediaResolver {
     roots: Vec<PathBuf>,
     files_by_key: BTreeMap<String, Vec<PathBuf>>,
+    voice_roots: Vec<PathBuf>,
+    voice_files_by_md5: OnceLock<BTreeMap<String, Vec<PathBuf>>>,
 }
 
 impl MediaResolver {
@@ -272,9 +274,32 @@ impl MediaResolver {
                 index_media_directory(root, root, 0, &mut files_by_key);
             }
         }
+        let mut voice_roots = std::collections::BTreeSet::new();
+        if options.include_files {
+            for root in &roots {
+                let candidates = [root.clone(), root.join("Cache/Voice"), root.join("Voice")];
+                for path in candidates {
+                    if !path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.eq_ignore_ascii_case("Voice"))
+                    {
+                        continue;
+                    }
+                    if let Ok(path) = path.canonicalize()
+                        && path.is_dir()
+                        && roots.iter().any(|root| path.starts_with(root))
+                    {
+                        voice_roots.insert(path);
+                    }
+                }
+            }
+        }
         Self {
             roots,
             files_by_key,
+            voice_roots: voice_roots.into_iter().collect(),
+            voice_files_by_md5: OnceLock::new(),
         }
     }
 
@@ -313,6 +338,45 @@ impl MediaResolver {
     fn authorized_file(&self, candidate: PathBuf) -> Option<PathBuf> {
         let path = candidate.canonicalize().ok()?;
         (path.is_file() && self.roots.iter().any(|root| path.starts_with(root))).then_some(path)
+    }
+
+    fn resolve_voice_by_md5(&self, expected: &str, size: Option<u64>) -> Option<PathBuf> {
+        if expected.len() != 32 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let expected = expected.to_ascii_lowercase();
+        let index = self.voice_files_by_md5.get_or_init(|| {
+            // The cache uses timestamp filenames, so a name index cannot link it
+            // to a message. Hash each authorized candidate once per collection.
+            let paths = self
+                .files_by_key
+                .values()
+                .flatten()
+                .filter(|path| self.voice_roots.iter().any(|root| path.starts_with(root)))
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut index = BTreeMap::<String, Vec<PathBuf>>::new();
+            for path in paths {
+                let Some(path) = self
+                    .authorized_file(path)
+                    .filter(|path| self.voice_roots.iter().any(|root| path.starts_with(root)))
+                else {
+                    continue;
+                };
+                if let Ok(Some((digest, _))) = source_windows::voice::silk_file_md5(&path) {
+                    index.entry(digest).or_default().push(path);
+                }
+            }
+            index
+        });
+        let paths = index.get(&expected).filter(|paths| paths.len() == 1)?;
+        let path = self.authorized_file(paths[0].clone())?;
+        if !self.voice_roots.iter().any(|root| path.starts_with(root)) {
+            return None;
+        }
+        // A cached lookup must not accept a file replaced since indexing.
+        let (digest, actual_size) = source_windows::voice::silk_file_md5(&path).ok()??;
+        (digest == expected && size.is_none_or(|size| size == actual_size)).then_some(path)
     }
 }
 
@@ -2204,7 +2268,8 @@ fn read_snapshot_export_with_options(
                 .flatten()
                 .map(|sample| source_timestamp_cutoff(cutoff, sample))
         });
-        let local_media_column = if table_columns(&connection, "message_table")
+        let message_table_columns = table_columns(&connection, "message_table");
+        let local_media_column = if message_table_columns
             .iter()
             .any(|column| column == "local_extra_content")
         {
@@ -2212,14 +2277,65 @@ fn read_snapshot_export_with_options(
         } else {
             "NULL"
         };
+        let extra_media_column = if message_table_columns
+            .iter()
+            .any(|column| column == "extra_content")
+        {
+            "extra_content"
+        } else {
+            "NULL"
+        };
+        let voice_table_columns = table_columns(&connection, "msg_voice2text");
+        let voice_text_column = choose_column(&voice_table_columns, &["text"]);
+        let voice_message_id_column = choose_column(&voice_table_columns, &["message_id"]);
+        let server_id_column = choose_column(&message_table_columns, &["server_id"]);
+        let recalled_column = choose_column(
+            &message_table_columns,
+            &[
+                "recalled",
+                "is_recalled",
+                "revoked",
+                "is_revoked",
+                "is_revoke",
+                "revoke",
+            ],
+        );
+        let recalled_select = recalled_column
+            .map(|column| format!("message_table.{}", quote_identifier(column)))
+            .unwrap_or_else(|| "NULL".into());
+        let voice_join = match (server_id_column, voice_message_id_column, voice_text_column) {
+            (Some(server_id), Some(message_id), Some(text)) => format!(
+                "LEFT JOIN (SELECT {message_id} AS message_id, MAX({text}) AS text FROM msg_voice2text GROUP BY {message_id}) AS voice ON voice.message_id = message_table.{server_id}",
+                message_id = quote_identifier(message_id),
+                text = quote_identifier(text),
+                server_id = quote_identifier(server_id),
+            ),
+            _ => String::new(),
+        };
+        let voice_text_select = if voice_join.is_empty() {
+            "NULL".to_owned()
+        } else {
+            "voice.text".to_owned()
+        };
         let predicate = if source_cutoff.is_some() {
             "WHERE send_time >= ?1"
         } else {
             ""
         };
         let query = format!(
-            "SELECT rowid, send_time, conversation_id, sender_id, content_type, content, {local_media_column}
-             FROM message_table {predicate} ORDER BY send_time, rowid"
+            "SELECT message_table.rowid, message_table.send_time,
+                    message_table.conversation_id, message_table.sender_id,
+                    message_table.content_type, message_table.content,
+                    {extra_media_column}, {local_media_column}, {voice_text_select},
+                    {recalled_select}
+             FROM message_table {voice_join} {predicate}
+             ORDER BY message_table.send_time, message_table.rowid",
+            extra_media_column = extra_media_column,
+            recalled_select = recalled_select,
+            local_media_column = local_media_column,
+            voice_text_select = voice_text_select,
+            voice_join = voice_join,
+            predicate = predicate,
         );
         let mut statement = connection
             .prepare(&query)
@@ -2236,7 +2352,13 @@ fn read_snapshot_export_with_options(
                 };
                 let raw_type = sqlite_value_to_string(row.get_ref(4)?);
                 let content = sqlite_value_to_bytes(row.get_ref(5)?);
-                let local_extra = sqlite_value_to_bytes(row.get_ref(6)?);
+                let extra_content = sqlite_value_to_bytes(row.get_ref(6)?);
+                let local_extra = sqlite_value_to_bytes(row.get_ref(7)?);
+                let voice_text = match row.get_ref(8)? {
+                    rusqlite::types::ValueRef::Null => None,
+                    value => Some(sqlite_value_to_string(value)),
+                };
+                let recalled = sqlite_value_to_bool(row.get_ref(9)?);
                 Ok((
                     row_id,
                     conversation_id,
@@ -2244,7 +2366,10 @@ fn read_snapshot_export_with_options(
                     sent_at_unix_ms,
                     raw_type,
                     content,
+                    extra_content,
                     local_extra,
+                    voice_text,
+                    recalled,
                 ))
             })
             .map_err(|_| unsupported_source_schema())?;
@@ -2256,13 +2381,30 @@ fn read_snapshot_export_with_options(
                 sent_at_unix_ms,
                 raw_type,
                 content,
+                extra_content,
                 local_extra,
+                voice_text,
+                recalled,
             ) = row.map_err(|_| unsupported_source_schema())?;
             if since_unix_ms.is_some_and(|cutoff| sent_at_unix_ms < cutoff) {
                 continue;
             }
-            let payload = readable_message_payload(&raw_type, &content);
-            let local_paths = local_media_paths(&raw_type, &content, &local_extra);
+            let mut payload = readable_message_payload(&raw_type, &content);
+            if raw_type.trim() == "16"
+                && let Some(transcription) = voice_text.as_deref().and_then(clean_message_text)
+            {
+                if let serde_json::Value::Object(object) = &mut payload {
+                    object.insert(
+                        "transcription".into(),
+                        serde_json::Value::String(transcription),
+                    );
+                }
+            }
+            let local_paths = local_media_paths_from_extras(
+                &raw_type,
+                &content,
+                &[extra_content.as_slice(), local_extra.as_slice()],
+            );
             let mut message = normalize(
                 RawMessageRow {
                     source_instance_id: candidate.source_id.clone(),
@@ -2273,7 +2415,7 @@ fn read_snapshot_export_with_options(
                     outgoing: None,
                     raw_type,
                     payload,
-                    recalled: false,
+                    recalled,
                 },
                 batch_id,
             )
@@ -3629,6 +3771,21 @@ fn sqlite_value_to_string(value: rusqlite::types::ValueRef<'_>) -> String {
     }
 }
 
+fn sqlite_value_to_bool(value: rusqlite::types::ValueRef<'_>) -> bool {
+    match value {
+        rusqlite::types::ValueRef::Integer(value) => value == 1,
+        rusqlite::types::ValueRef::Real(value) => value == 1.0,
+        rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
+            let text = String::from_utf8_lossy(value);
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "recalled" | "revoked" | "revoke"
+            )
+        }
+        rusqlite::types::ValueRef::Null => false,
+    }
+}
+
 fn sqlite_value_to_bytes(value: rusqlite::types::ValueRef<'_>) -> Vec<u8> {
     match value {
         rusqlite::types::ValueRef::Null => vec![],
@@ -3726,6 +3883,11 @@ fn is_opaque_identifier(value: &str) -> bool {
 }
 
 fn readable_message_payload(raw_type: &str, raw: &[u8]) -> serde_json::Value {
+    if raw_type.trim() == "2063" {
+        // The event may contain the original payload and unrelated numeric IDs.
+        // Until the local target schema is verified, preserve a notice only.
+        return serde_json::json!({ "text": "消息已撤回" });
+    }
     if matches!(raw_type.trim(), "14" | "29")
         && let Some(payload) = wecom_image_payload(raw_type.trim(), raw)
     {
@@ -3747,6 +3909,9 @@ fn readable_message_payload(raw_type: &str, raw: &[u8]) -> serde_json::Value {
         enrich_media_payload(raw_type, &mut payload, &values);
         return serde_json::Value::Object(payload);
     }
+    if raw_type.trim() == "16" {
+        return wecom_voice_payload(raw).unwrap_or_else(|| serde_json::json!({}));
+    }
     let values = decode_wecom_values(raw);
     let text = if raw_type.trim() == "2" {
         decode_wecom_body(raw)
@@ -3756,7 +3921,7 @@ fn readable_message_payload(raw_type: &str, raw: &[u8]) -> serde_json::Value {
     let mut payload = serde_json::Map::new();
     if let Some(text) = text {
         let key = match raw_type.trim() {
-            "15" | "16" | "20" => "name",
+            "15" | "20" => "name",
             "13" => "title",
             _ => "text",
         };
@@ -3769,6 +3934,30 @@ fn readable_message_payload(raw_type: &str, raw: &[u8]) -> serde_json::Value {
     }
     enrich_media_payload(raw_type, &mut payload, &values);
     serde_json::Value::Object(payload)
+}
+
+fn wecom_voice_payload(raw: &[u8]) -> Option<serde_json::Value> {
+    let mut payload = serde_json::json!({"name": "voice.silk", "mime": "audio/silk"});
+    // Only field 10 was verified against local file contents. Fields 1 and 8
+    // carry remote access metadata and must not be projected into the archive.
+    for (field, value) in protobuf_fields(raw)? {
+        match (field, value) {
+            (10, ProtobufValue::Bytes(bytes)) => {
+                if let Ok(digest) = std::str::from_utf8(bytes)
+                    && digest.len() == 32
+                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    let digest = digest.to_ascii_lowercase();
+                    payload["name"] = format!("voice-{digest}.silk").into();
+                    payload["media_path"] = format!("{digest}.silk").into();
+                    payload["media_md5"] = digest.into();
+                }
+            }
+            (4, ProtobufValue::Integer(size)) => payload["size"] = size.into(),
+            _ => {}
+        }
+    }
+    Some(payload)
 }
 
 fn wecom_image_payload(raw_type: &str, raw: &[u8]) -> Option<serde_json::Value> {
@@ -3804,7 +3993,12 @@ fn wecom_image_payload(raw_type: &str, raw: &[u8]) -> Option<serde_json::Value> 
     Some(payload.into())
 }
 
+#[cfg(test)]
 fn local_media_paths(raw_type: &str, content: &[u8], local_extra: &[u8]) -> Vec<PathBuf> {
+    local_media_paths_from_extras(raw_type, content, &[local_extra])
+}
+
+fn local_media_paths_from_extras(raw_type: &str, content: &[u8], extras: &[&[u8]]) -> Vec<PathBuf> {
     if !is_media_message_type(raw_type) {
         return Vec::new();
     }
@@ -3819,33 +4013,37 @@ fn local_media_paths(raw_type: &str, content: &[u8], local_extra: &[u8]) -> Vec<
             }
         });
     let mut paths = Vec::new();
-    for (field, value) in protobuf_fields(local_extra).unwrap_or_default() {
-        let (8, ProtobufValue::Bytes(cache)) = (field, value) else {
-            continue;
-        };
-        let mut previous = None;
-        for (field, value) in protobuf_fields(cache).unwrap_or_default() {
-            let (1, ProtobufValue::Bytes(bytes)) = (field, value) else {
-                continue;
+    for extra in extras {
+        for (field, value) in protobuf_fields(extra).unwrap_or_default() {
+            let cache = match value {
+                ProtobufValue::Bytes(cache) if field == 8 => cache,
+                ProtobufValue::Bytes(cache) if field == 1 => cache,
+                _ => continue,
             };
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                let path = PathBuf::from(text);
-                let local_disk = matches!(path.components().next(),
-                    Some(std::path::Component::Prefix(prefix))
-                    if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)));
-                if path.is_absolute()
-                    && local_disk
-                    && !path
-                        .components()
-                        .any(|part| matches!(part, std::path::Component::ParentDir))
-                {
-                    paths.push((
-                        previous != primary_resource || primary_resource.is_none(),
-                        path,
-                    ));
+            let mut previous = None;
+            for (field, value) in protobuf_fields(cache).unwrap_or_default() {
+                let (1, ProtobufValue::Bytes(bytes)) = (field, value) else {
+                    continue;
+                };
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    let path = PathBuf::from(text);
+                    let local_disk = matches!(path.components().next(),
+                        Some(std::path::Component::Prefix(prefix))
+                        if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)));
+                    if path.is_absolute()
+                        && local_disk
+                        && !path
+                            .components()
+                            .any(|part| matches!(part, std::path::Component::ParentDir))
+                    {
+                        paths.push((
+                            previous != primary_resource || primary_resource.is_none(),
+                            path,
+                        ));
+                    }
                 }
+                previous = Some(bytes);
             }
-            previous = Some(bytes);
         }
     }
     paths.sort_by_key(|(secondary, _)| *secondary);
@@ -4200,42 +4398,48 @@ fn resolve_media_metadata_with_local_paths(
     let mut blobs = Vec::new();
     if message.media.is_empty()
         || (!options.include_files && !options.include_images)
-        || matches!(
-            message.message_type,
-            archive_domain::MessageType::Audio | archive_domain::MessageType::Video
-        )
+        || message.message_type == archive_domain::MessageType::Video
     {
         return Ok(blobs);
     }
     for media in &mut message.media {
-        let resolved = local_paths
-            .iter()
-            .find_map(|path| resolver.authorized_file(path.clone()))
-            .or_else(|| resolver.resolve(&candidate.root_path, &media.source_locator))
-            .or_else(|| {
-                media
-                    .original_name
-                    .as_deref()
-                    .and_then(|name| resolver.resolve(&candidate.root_path, name))
-            })
-            .or_else(|| {
+        let resolved =
+            if message.message_type == MessageType::Audio && message.raw_type.trim() == "16" {
                 message
                     .raw_payload
                     .get("media_md5")
                     .and_then(serde_json::Value::as_str)
-                    .and_then(|md5| resolver.resolve(&candidate.root_path, md5))
-            })
-            .or_else(|| {
-                message
-                    .raw_payload
-                    .get("media_lookup_hints")
-                    .and_then(serde_json::Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(serde_json::Value::as_str)
-                    .find_map(|hint| resolver.resolve(&candidate.root_path, hint))
-            })
-            .or_else(|| resolver.resolve(&candidate.root_path, &message.source_message_id));
+                    .and_then(|digest| resolver.resolve_voice_by_md5(digest, media.size_bytes))
+            } else {
+                local_paths
+                    .iter()
+                    .find_map(|path| resolver.authorized_file(path.clone()))
+                    .or_else(|| resolver.resolve(&candidate.root_path, &media.source_locator))
+                    .or_else(|| {
+                        media
+                            .original_name
+                            .as_deref()
+                            .and_then(|name| resolver.resolve(&candidate.root_path, name))
+                    })
+                    .or_else(|| {
+                        message
+                            .raw_payload
+                            .get("media_md5")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|md5| resolver.resolve(&candidate.root_path, md5))
+                    })
+                    .or_else(|| {
+                        message
+                            .raw_payload
+                            .get("media_lookup_hints")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(serde_json::Value::as_str)
+                            .find_map(|hint| resolver.resolve(&candidate.root_path, hint))
+                    })
+                    .or_else(|| resolver.resolve(&candidate.root_path, &message.source_message_id))
+            };
         match resolved
             .as_deref()
             .and_then(|path| media_store::hash_source(path).ok())
@@ -4243,7 +4447,9 @@ fn resolve_media_metadata_with_local_paths(
             Some((hash, size)) => {
                 let should_embed = match message.message_type {
                     archive_domain::MessageType::Image => options.include_images,
-                    archive_domain::MessageType::File => options.include_files,
+                    archive_domain::MessageType::File | archive_domain::MessageType::Audio => {
+                        options.include_files
+                    }
                     _ => false,
                 };
                 if should_embed && let Some(source_path) = resolved.as_deref() {
@@ -5889,6 +6095,451 @@ mod tests {
         .unwrap();
         assert!(blobs.is_empty());
         assert_eq!(message.media[0].integrity, MediaIntegrity::Missing);
+    }
+
+    #[test]
+    fn native_voice_messages_collect_timestamped_silk_by_content_digest() {
+        let directory = TestDirectory::new();
+        let account = directory.0.join("account");
+        let source_root = account.join("Data");
+        let voice_root = account.join("Cache/Voice");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&voice_root).unwrap();
+        let voice_file = voice_root.join("2026_11_04_12_00_00_001.silk");
+        let bytes = b"\x02#!SILK_V3 synthetic voice bytes";
+        let digest = "D47D1E2BA230C47EAC9B5AE2B72A4ACB";
+        fs::write(&voice_file, bytes).unwrap();
+        let mut voice_content = test_protobuf_bytes(&[
+            (1, b"remote-access-material-not-for-archive"),
+            (8, b"00000000000000000000000000000000"),
+            (10, digest.as_bytes()),
+        ]);
+        write_test_varint(4 << 3, &mut voice_content);
+        write_test_varint(bytes.len() as u64, &mut voice_content);
+        // Observed voice envelopes contain status integers, not a cache path.
+        let voice_extra = vec![8_u8, 1, 112, 1];
+        let database = source_root.join("message.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message_table (
+                    send_time INTEGER, server_id TEXT, conversation_id TEXT,
+                    sender_id TEXT, content_type INTEGER, content BLOB,
+                    local_extra_content BLOB
+                );
+                CREATE TABLE msg_voice2text (message_id TEXT, voice_id TEXT, text TEXT,
+                    collapse INTEGER, voice_silent_transfer INTEGER);
+                INSERT INTO msg_voice2text VALUES
+                    ('server-voice-1', 'voice-1', '来自独立转写表', 0, 0);
+                INSERT INTO msg_voice2text VALUES
+                    ('orphan-server-id', 'voice-orphan', '孤儿转写不应导入', 0, 0);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    1700000000_i64,
+                    "server-voice-1",
+                    "conversation",
+                    "sender",
+                    16_i64,
+                    voice_content,
+                    voice_extra,
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let candidate = SourceCandidate {
+            source_id: "fixture".into(),
+            display_path: "fixture".into(),
+            root_path: source_root.clone(),
+            databases: vec![archive_domain::SourceDatabase {
+                kind: "message".into(),
+                path: database,
+                wal_path: None,
+                shm_path: None,
+                encrypted: false,
+                page_size_hint: Some(4096),
+            }],
+            media_roots: vec![voice_root],
+            client_version: None,
+            capability: SourceCapability::Supported,
+        };
+        let export = collect_candidate_with_options(
+            candidate.clone(),
+            directory.0.join("work"),
+            None,
+            authorization(),
+            MediaCollectionOptions {
+                include_files: true,
+                include_images: false,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(export.message_count, 1);
+        let message = &export.batches[0].messages[0];
+        assert_eq!(message.message_type, MessageType::Audio);
+        assert_eq!(message.body_text.as_deref(), Some("来自独立转写表"));
+        assert_eq!(message.media.len(), 1);
+        assert_eq!(message.media[0].integrity, MediaIntegrity::Verified);
+        assert!(message.media[0].content_hash.is_some());
+        assert_eq!(message.media[0].mime_type.as_deref(), Some("audio/silk"));
+        assert_eq!(message.media[0].size_bytes, Some(bytes.len() as u64));
+        assert!(
+            message.media[0]
+                .original_name
+                .as_deref()
+                .unwrap()
+                .ends_with(".silk")
+        );
+        assert_eq!(export.media_blobs.len(), 1);
+        assert_eq!(
+            hex::decode(&export.media_blobs[0].content_hex).unwrap(),
+            bytes
+        );
+        let serialized = serde_json::to_string(&export).unwrap();
+        assert!(!serialized.contains("remote-access-material"));
+        assert!(!serialized.contains("00000000000000000000000000000000"));
+        assert!(!serialized.contains("2026_11_04_12_00_00_001"));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink_received = Arc::clone(&received);
+        let sink: wecom_archive_server::LocalCollectionMediaSink = Arc::new(move |source, _, _| {
+            *sink_received.lock().unwrap() =
+                fs::read(source).map_err(|_| "fixture read failed".to_owned())?;
+            Ok(())
+        });
+        let streamed = collect_candidate_with_options(
+            candidate.clone(),
+            directory.0.join("streamed-work"),
+            None,
+            authorization(),
+            MediaCollectionOptions {
+                include_files: true,
+                include_images: false,
+            },
+            Some(&sink),
+            None,
+        )
+        .unwrap();
+        assert!(streamed.media_blobs.is_empty());
+        assert_eq!(streamed.missing_media_count, 0);
+        assert_eq!(*received.lock().unwrap(), bytes);
+        let text_only = collect_candidate_with_options(
+            candidate,
+            directory.0.join("text-work"),
+            None,
+            authorization(),
+            MediaCollectionOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(text_only.media_blobs.is_empty());
+        assert!(
+            text_only.batches[0].messages[0].media[0]
+                .content_hash
+                .is_none()
+        );
+        assert!(
+            !serde_json::to_string(&export)
+                .unwrap()
+                .contains("孤儿转写不应导入")
+        );
+    }
+
+    #[test]
+    fn voice_digest_lookup_rejects_wrong_content_size_ambiguity_and_changed_files() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("Data");
+        let voice = directory.0.join("Cache/Voice");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&voice).unwrap();
+        let bytes = b"\x02#!SILK_V3 synthetic voice bytes";
+        let digest = "d47d1e2ba230c47eac9b5ae2b72a4acb";
+        let timestamped = voice.join("2026_11_04_12_00_00_001.silk");
+        // Even a convincing filename is insufficient if its content differs.
+        fs::write(
+            voice.join(format!("{digest}.silk")),
+            b"\x02#!SILK_V3 wrong content",
+        )
+        .unwrap();
+        let candidate = SourceCandidate {
+            source_id: "fixture".into(),
+            display_path: "fixture".into(),
+            root_path: source,
+            databases: vec![],
+            media_roots: vec![voice.clone(), directory.0.join("Cache")],
+            client_version: None,
+            capability: SourceCapability::Supported,
+        };
+        let options = MediaCollectionOptions {
+            include_files: true,
+            include_images: false,
+        };
+        let resolver = MediaResolver::new(&candidate, options);
+        assert!(resolver.resolve_voice_by_md5(digest, None).is_none());
+        assert!(
+            resolver
+                .resolve_voice_by_md5("not a digest", None)
+                .is_none()
+        );
+        fs::write(&timestamped, bytes).unwrap();
+        let resolver = MediaResolver::new(&candidate, options);
+        assert_eq!(
+            resolver.resolve_voice_by_md5(digest, Some(bytes.len() as u64)),
+            Some(timestamped.canonicalize().unwrap())
+        );
+        assert!(
+            resolver
+                .resolve_voice_by_md5(digest, Some(bytes.len() as u64 + 1))
+                .is_none()
+        );
+        fs::write(&timestamped, b"\x02#!SILK_V3 replaced cache").unwrap();
+        assert!(resolver.resolve_voice_by_md5(digest, None).is_none());
+        fs::write(&timestamped, bytes).unwrap();
+        fs::write(voice.join("second.silk"), bytes).unwrap();
+        let resolver = MediaResolver::new(&candidate, options);
+        assert!(resolver.resolve_voice_by_md5(digest, None).is_none());
+        let resolver = MediaResolver::new(&candidate, MediaCollectionOptions::default());
+        assert!(resolver.resolve_voice_by_md5(digest, None).is_none());
+    }
+
+    #[test]
+    fn native_voice_projection_omits_access_metadata_and_requires_the_verified_digest() {
+        let mut raw = test_protobuf_bytes(&[
+            (1, b"remote-access-material"),
+            (8, b"00000000000000000000000000000000"),
+            (10, b"D47D1E2BA230C47EAC9B5AE2B72A4ACB"),
+        ]);
+        write_test_varint(4 << 3, &mut raw);
+        write_test_varint(29, &mut raw);
+        let payload = readable_message_payload("16", &raw);
+        assert_eq!(payload["media_md5"], "d47d1e2ba230c47eac9b5ae2b72a4acb");
+        assert_eq!(payload["size"], 29);
+        assert!(!payload.to_string().contains("remote-access-material"));
+        assert!(
+            !payload
+                .to_string()
+                .contains("00000000000000000000000000000000")
+        );
+        let no_digest = test_protobuf_bytes(&[(8, b"00000000000000000000000000000000")]);
+        assert!(
+            readable_message_payload("16", &no_digest)
+                .get("media_md5")
+                .is_none()
+        );
+        assert!(
+            readable_message_payload("16", &[0x0a, 0xff])
+                .get("media_md5")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn voice_digest_lookup_stays_within_the_authorized_account() {
+        let directory = TestDirectory::new();
+        let source = directory.0.join("first/Data");
+        let voice = directory.0.join("first/Cache/Voice");
+        let other = directory.0.join("second/Cache/Voice");
+        for path in [&source, &voice, &other] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let path = other.join("2026_11_04_12_00_00_001.silk");
+        fs::write(&path, b"\x02#!SILK_V3 synthetic voice bytes").unwrap();
+        let candidate = SourceCandidate {
+            source_id: "fixture".into(),
+            display_path: "fixture".into(),
+            root_path: source,
+            databases: vec![],
+            media_roots: vec![voice],
+            client_version: None,
+            capability: SourceCapability::Supported,
+        };
+        let options = MediaCollectionOptions {
+            include_files: true,
+            include_images: false,
+        };
+        let resolver = MediaResolver::new(&candidate, options);
+        assert!(resolver.authorized_file(path).is_none());
+        assert!(
+            resolver
+                .resolve_voice_by_md5("d47d1e2ba230c47eac9b5ae2b72a4acb", None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires explicitly authorized local Voice cache and a known resource MD5"]
+    fn authorized_real_voice_digest_enters_media_archive_without_exposing_content() {
+        let root = std::env::var_os("WECOM_ARCHIVE_TEST_VOICE_ROOT")
+            .map(PathBuf::from)
+            .expect("explicit Voice root is required");
+        let digest = std::env::var("WECOM_ARCHIVE_TEST_VOICE_MD5")
+            .expect("explicit resource digest is required");
+        assert!(root.is_absolute() && root.is_dir());
+        assert!(
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("Voice"))
+        );
+        let candidate = SourceCandidate {
+            source_id: "authorized-voice-review".into(),
+            display_path: "authorized cache".into(),
+            root_path: root.clone(),
+            databases: vec![],
+            media_roots: vec![root],
+            client_version: None,
+            capability: SourceCapability::Supported,
+        };
+        let payload =
+            readable_message_payload("16", &test_protobuf_bytes(&[(10, digest.as_bytes())]));
+        let mut message = normalize(
+            RawMessageRow {
+                source_instance_id: "fixture".into(),
+                source_message_id: "1".into(),
+                conversation_id: "fixture".into(),
+                sender_id: None,
+                sent_at_unix_ms: 1700000000000,
+                outgoing: None,
+                raw_type: "16".into(),
+                payload,
+                recalled: false,
+            },
+            uuid::Uuid::nil(),
+        )
+        .unwrap();
+        let options = MediaCollectionOptions {
+            include_files: true,
+            include_images: false,
+        };
+        let resolver = MediaResolver::new(&candidate, options);
+        let blobs = resolve_media_metadata_with_local_paths(
+            &candidate,
+            &resolver,
+            &mut message,
+            options,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(blobs.len() == 1, "authorized voice file was not collected");
+        assert!(message.media[0].integrity == MediaIntegrity::Verified);
+        let bytes = hex::decode(&blobs[0].content_hex).unwrap();
+        assert!(bytes.starts_with(b"#!SILK_V3") || bytes.starts_with(b"\x02#!SILK_V3"));
+        assert!(
+            message.media[0].content_hash.as_deref()
+                == Some(hex::encode(Sha256::digest(&bytes)).as_str())
+        );
+        println!(
+            "voice_integrity=verified; media_blobs=1; bytes={}",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn native_recall_uses_explicit_flags_without_matching_arbitrary_event_values() {
+        let directory = TestDirectory::new();
+        let source_root = directory.0.join("WXWork");
+        fs::create_dir_all(&source_root).unwrap();
+        let database = source_root.join("message.db");
+        let connection = Connection::open(&database).unwrap();
+        let recall_content = {
+            let mut bytes = Vec::new();
+            write_test_varint(8, &mut bytes);
+            write_test_varint(12345, &mut bytes);
+            bytes
+        };
+        connection
+            .execute_batch(
+                "CREATE TABLE message_table (
+                    send_time INTEGER, server_id TEXT, conversation_id TEXT,
+                    sender_id TEXT, content_type INTEGER, content BLOB,
+                    local_extra_content BLOB, is_revoke INTEGER, is_deleted INTEGER
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, 1)",
+                rusqlite::params![
+                    1700000000_i64,
+                    "12345",
+                    "conversation",
+                    "sender",
+                    20_i64,
+                    br#"{"name":"withdrawn.bin"}"#.as_slice(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, 0)",
+                rusqlite::params![
+                    1700000010_i64,
+                    "recall-event",
+                    "conversation",
+                    "sender",
+                    2063_i64,
+                    recall_content,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message_table VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 1, 0)",
+                rusqlite::params![
+                    1700000020_i64,
+                    "explicitly-recalled",
+                    "conversation",
+                    "sender",
+                    20_i64,
+                    br#"{"name":"recalled.bin"}"#.as_slice(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let candidate = SourceCandidate {
+            source_id: "fixture".into(),
+            display_path: "fixture".into(),
+            root_path: source_root.clone(),
+            databases: vec![archive_domain::SourceDatabase {
+                kind: "message".into(),
+                path: database,
+                wal_path: None,
+                shm_path: None,
+                encrypted: false,
+                page_size_hint: Some(4096),
+            }],
+            media_roots: vec![source_root],
+            client_version: None,
+            capability: SourceCapability::Supported,
+        };
+        let export = collect_candidate_with_options(
+            candidate,
+            directory.0.join("work"),
+            None,
+            authorization(),
+            MediaCollectionOptions::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let original = export.batches[0]
+            .messages
+            .iter()
+            .find(|message| message.source_message_id == "1")
+            .unwrap();
+        assert_eq!(original.lifecycle, archive_domain::LifecycleState::Active);
+        let recalled = &export.batches[0].messages[2];
+        assert_eq!(recalled.lifecycle, archive_domain::LifecycleState::Recalled);
+        let notice = &export.batches[0].messages[1];
+        assert_eq!(notice.message_type, MessageType::System);
+        assert_eq!(notice.body_text.as_deref(), Some("消息已撤回"));
     }
 
     #[test]

@@ -65,6 +65,22 @@ describe("message timeline", () => {
     expect(screen.queryByText("群会话")).not.toBeInTheDocument();
   });
 
+  it.each(["incoming", "system"] as const)("hides recalled file content and attachment actions for %s messages", (direction) => {
+    const recalled: MessageItem = {
+      ...messages[0],
+      direction,
+      type: "file",
+      body: "synthetic withdrawn content",
+      attachment: { name: "withdrawn.bin", meta: "不可用", kind: "document" },
+      lifecycle: "recalled",
+    };
+    render(<MessageTimeline token="test-token" conversation={conversation} messages={[recalled]} participants={[]} />);
+    expect(screen.getByText("消息已撤回")).toBeInTheDocument();
+    expect(screen.queryByText("synthetic withdrawn content")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "打开附件 withdrawn.bin" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/未采集附件内容/)).not.toBeInTheDocument();
+  });
+
   it("shows messages in descending time order by default and offers floating jumps to both edges", () => {
     const { container } = render(
         <MessageTimeline

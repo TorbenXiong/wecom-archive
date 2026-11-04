@@ -1,10 +1,11 @@
-import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink, FileText, Image, Megaphone, Mic2, MoreVertical, SlidersHorizontal, X } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink, FileText, Image, Megaphone, MoreVertical, SlidersHorizontal, X } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { ConversationSummary, MessageItem, ParticipantItem } from "../domain/types";
 import { conversationKindLabel } from "../domain/conversations";
 import { getMediaObjectUrl, openMediaFile } from "../lib/server-api";
 import { ParticipantCard } from "./ParticipantCard";
+import { VoiceAttachment } from "./VoiceAttachment";
 
 interface MessageTimelineProps {
   token: string;
@@ -161,6 +162,14 @@ function isOpaqueSystemIdentifier(value?: string): boolean {
 }
 
 function MessageRow({ token, message, highlighted, onShowParticipant, onLocateQuote }: { token: string; message: MessageItem; highlighted: boolean; onShowParticipant: () => void; onLocateQuote: (messageId: string) => void }) {
+  if (message.lifecycle === "recalled") {
+    return <article className={highlighted ? "message-row highlighted" : "message-row"} data-message-id={message.id}>
+      <div className="message-content">
+        <div className="message-meta"><button className="sender-name" type="button" onClick={onShowParticipant}>{message.senderName}</button><time className="message-time">{formatFullTimestamp(message.sentAt)}</time></div>
+        <div className="message-bubble recalled-message">消息已撤回</div>
+      </div>
+    </article>;
+  }
   if (message.direction === "system") {
     const announcement = message.rawType === "group_announcement" || message.body?.includes("公告");
     return <article className={highlighted ? "message-row system-message-row highlighted" : "message-row system-message-row"} data-message-id={message.id}>
@@ -183,10 +192,10 @@ function MessageRow({ token, message, highlighted, onShowParticipant, onLocateQu
         <div className="message-meta"><button className="sender-name" type="button" onClick={onShowParticipant}>{message.senderName}</button><time className="message-time">{formatFullTimestamp(message.sentAt)}</time></div>
         {attachmentOnly
           ? <div className="message-attachment-only"><Attachment token={token} attachment={message.attachment!} /></div>
-          : <div className="message-bubble">
+          : <div className={message.attachment?.kind === "audio" ? "message-bubble voice-message" : "message-bubble"}>
             {message.quote && <button className="quote-block" type="button" onClick={() => onLocateQuote(message.quote!.id)} title="定位到原消息"><span><strong>{message.quote.sender}</strong>{message.quote.time && <> · {message.quote.time}</>}</span><p>{message.quote.body}</p></button>}
-            {message.body && <RichMessageText body={message.body} segments={message.richSegments} />}
-            {message.attachment && <Attachment token={token} attachment={message.attachment} />}
+            {message.body && message.attachment?.kind !== "audio" && <RichMessageText body={message.body} segments={message.richSegments} />}
+            {message.attachment && <Attachment token={token} attachment={message.attachment} transcript={message.attachment.kind === "audio" && message.body ? <RichMessageText body={message.body} segments={message.richSegments} /> : undefined} />}
           </div>}
       </div>
     </article>
@@ -288,7 +297,7 @@ function formatFullTimestamp(value: string): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-function Attachment({ token, attachment }: { token: string; attachment: NonNullable<MessageItem["attachment"]> }) {
+function Attachment({ token, attachment, transcript }: { token: string; attachment: NonNullable<MessageItem["attachment"]>; transcript?: ReactNode }) {
   const [objectUrl, setObjectUrl] = useState<string>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
@@ -346,17 +355,7 @@ function Attachment({ token, attachment }: { token: string; attachment: NonNulla
     </>;
   }
   if (attachment.kind === "audio") {
-    return <div className="audio-attachment">
-      <button className={error ? "audio-card unavailable" : "audio-card"} type="button" onClick={() => void open()} disabled={!attachment.contentHash || loading} aria-label="打开语音消息" title={attachment.contentHash ? "打开语音消息" : "未采集语音内容"}>
-        <span className="audio-icon"><Mic2 size={18} /></span>
-        <span><strong>语音消息</strong><small>{loading ? "正在处理…" : attachment.meta || "语音内容"}</small></span>
-        <ExternalLink size={16} />
-      </button>
-      {attachment.contentHash
-        ? <button className="attachment-save" type="button" disabled={loading} onClick={() => void open(true)} aria-label="保存语音消息"><Download size={13} />保存语音</button>
-        : <p className="attachment-status" role="status">未采集语音内容。{messageAudioHint(attachment.name)}</p>}
-      {error && <p className="attachment-status" role="alert">{error}</p>}
-    </div>;
+    return <VoiceAttachment key={`${token}:${attachment.contentHash || attachment.name}`} token={token} attachment={attachment} transcript={transcript} />;
   }
   const executable = /\.(exe|msi|msp|com|bat|cmd|ps1|vbs|vbe|js|jse|wsf|wsh|scr|hta|lnk|reg|cpl)$/i.test(attachment.name);
   return <div className="file-attachment">
@@ -371,8 +370,4 @@ function Attachment({ token, attachment }: { token: string; attachment: NonNulla
     {error && <p className="attachment-status" role="alert">{error}</p>}
     {confirmRun && <div className="modal-backdrop" role="presentation"><section className="modal-card" role="dialog" aria-modal="true" aria-label="确认运行附件" onKeyDown={(event) => { if (event.key === "Escape") setConfirmRun(false); }}><h2>确认运行附件</h2><p>即将运行 {attachment.name}，可能启动安装程序或修改系统。请确认文件来源可信。</p><div className="modal-actions"><button className="secondary-button" type="button" autoFocus onClick={() => setConfirmRun(false)}>取消</button><button className="primary-button" type="button" onClick={() => { setConfirmRun(false); void open(); }}>确认运行</button></div></section></div>}
   </div>;
-}
-
-function messageAudioHint(name: string): string {
-  return name && name !== "audio 媒体" ? `源文件：${name}。` : "请在企业微信中下载源文件，再使用“包含全内容”重新采集。";
 }

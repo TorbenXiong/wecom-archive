@@ -224,10 +224,13 @@ pub(super) fn merge_message(
 fn retain_collected_media(incoming: &mut MessageV1, previous: &MessageV1) {
     // Text-only recollection and expired source caches do not remove bytes
     // already archived for the same unchanged media message. Changed media
-    // identity or message content must still replace the old projection.
+    // identity must still replace the old projection. A new voice transcription
+    // does not change bytes identified by the same source content digest.
     if !matches!(
         incoming.message_type,
-        archive_domain::MessageType::Image | archive_domain::MessageType::File
+        archive_domain::MessageType::Image
+            | archive_domain::MessageType::File
+            | archive_domain::MessageType::Audio
     ) || incoming.message_type != previous.message_type
         || incoming.raw_type != previous.raw_type
         || incoming.source_kind != previous.source_kind
@@ -236,7 +239,13 @@ fn retain_collected_media(incoming: &mut MessageV1, previous: &MessageV1) {
         || incoming.conversation_id != previous.conversation_id
         || incoming.sender_id != previous.sender_id
         || incoming.sent_at != previous.sent_at
-        || incoming.body_text != previous.body_text
+        || (incoming.body_text != previous.body_text
+            && !(incoming.message_type == archive_domain::MessageType::Audio
+                && incoming
+                    .raw_payload
+                    .get("media_md5")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()))
         || incoming.lifecycle != previous.lifecycle
         || incoming.media.len() != previous.media.len()
         || [
