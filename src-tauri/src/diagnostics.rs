@@ -35,10 +35,10 @@ pub fn init() {
 }
 
 pub fn set_level(value: &str) {
-    if let Some(level) = CONFIGURED_LEVEL.get() {
-        if let Ok(mut level) = level.lock() {
-            *level = parse_log_level(value);
-        }
+    if let Some(level) = CONFIGURED_LEVEL.get()
+        && let Ok(mut level) = level.lock()
+    {
+        *level = parse_log_level(value);
     }
 }
 
@@ -63,10 +63,10 @@ fn write_at(required: LogLevel, event: &str, details: &str) {
     let date = Local::now().format("%Y-%m-%d").to_string();
     if state.as_ref().is_none_or(|current| current.date != date) {
         let Some(path) = log_path(&date) else { return };
-        if let Some(parent) = path.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return;
         }
         let Ok(file) = OpenOptions::new().create(true).append(true).open(path) else {
             return;
@@ -81,16 +81,16 @@ fn write_at(required: LogLevel, event: &str, details: &str) {
         .map(|value| value.as_secs())
         .unwrap_or_default();
     let details = details.replace(['\r', '\n'], " ");
-    if let Some(events) = EVENTS.get() {
-        if let Ok(mut events) = events.lock() {
-            events.push_back(DiagnosticEvent {
-                timestamp,
-                event: event.to_owned(),
-                details: details.clone(),
-            });
-            while events.len() > 100 {
-                events.pop_front();
-            }
+    if let Some(events) = EVENTS.get()
+        && let Ok(mut events) = events.lock()
+    {
+        events.push_back(DiagnosticEvent {
+            timestamp,
+            event: event.to_owned(),
+            details: details.clone(),
+        });
+        while events.len() > 100 {
+            events.pop_front();
         }
     }
     let log_timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
@@ -111,12 +111,12 @@ pub fn take_events() -> Vec<DiagnosticEvent> {
 }
 
 pub fn restore_events(mut restored: Vec<DiagnosticEvent>) {
-    if let Some(events) = EVENTS.get() {
-        if let Ok(mut events) = events.lock() {
-            restored.append(&mut events.drain(..).collect());
-            restored.truncate(100);
-            *events = restored.into_iter().collect();
-        }
+    if let Some(events) = EVENTS.get()
+        && let Ok(mut events) = events.lock()
+    {
+        restored.append(&mut events.drain(..).collect());
+        restored.truncate(100);
+        *events = restored.into_iter().collect();
     }
 }
 

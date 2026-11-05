@@ -61,6 +61,18 @@ cargo build --release --locked --offline --bin WeComArchive
 `build:client` 生成采集端界面资源，`build:server` 生成归档工作台资源；采集端文件由服务端配置页按需生成。
 前端构建完成后再编译 Rust，避免嵌入旧资源。以上命令要求工具链和依赖已在本机准备好；`--offline` 不下载缺失依赖。
 
+验收和打包使用 PowerShell，仅使用已有工具与依赖：
+
+```powershell
+./scripts/verify-desktop.ps1
+./scripts/verify-real-environment.ps1 -Authorized
+./scripts/package-release.ps1 -IncludeRealEnvironment
+```
+
+桌面验收使用现有 `target/release/WeComArchive.exe` 和隔离合成数据；真实验收需要已登录的企业微信，默认检查源发现、探针、群资料和媒体采集，可用 `-Cases media` 单独重跑，单项默认等待 15 分钟。
+
+打包入口执行测试、类型与格式检查、Clippy、前端构建、Windows Release 构建及桌面验收；`-IncludeRealEnvironment` 启用真实验收。可通过 `-PackageName` 指定全新交付目录，`-Cargo`、`-Node` 指定本机工具。交付目录仅含一个 `WeComArchive.exe`，检查版本、x64 架构和哈希；不覆盖旧包，不生成验收报告，不执行 Git 提交或对外发布。
+
 ## 运行数据
 
 完整备份范围、离线备份方法、配置异常恢复和 DPAPI 跨机限制见 [备份与恢复](docs/backup-recovery.md)。完整 JSON 导出不包含服务端附件字节，不能替代完整备份。
