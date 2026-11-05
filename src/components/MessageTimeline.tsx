@@ -23,6 +23,7 @@ interface MessageTimelineProps {
   onNextPage?: () => void;
   targetMessageId?: string;
   onTargetLocated?: () => void;
+  onLocateQuote?: (messageId: string, signal: AbortSignal) => Promise<void>;
   sortAscending?: boolean;
   onSortChange?: (ascending: boolean) => void;
 }
@@ -41,6 +42,7 @@ export function MessageTimeline({
   onPageSizeChange,
   onPreviousPage,
   onNextPage,
+  onLocateQuote,
   targetMessageId,
   onTargetLocated,
   sortAscending = false,
@@ -51,7 +53,16 @@ export function MessageTimeline({
   const [showTopJump, setShowTopJump] = useState(false);
   const [showBottomJump, setShowBottomJump] = useState(false);
   const [pageInput, setPageInput] = useState(String(pageIndex + 1));
+  const [locatingQuote, setLocatingQuote] = useState(false);
+  const [quoteError, setQuoteError] = useState("");
+  const quoteController = useRef<AbortController | undefined>(undefined);
   const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    quoteController.current?.abort();
+    setLocatingQuote(false);
+    setQuoteError("");
+    return () => quoteController.current?.abort();
+  }, [conversation.id, pageIndex, pageSize, sortAscending, targetMessageId, token]);
   useEffect(() => {
     setPageInput(String(Math.min(pageIndex + 1, totalPages)));
   }, [pageIndex, totalPages]);
@@ -67,11 +78,31 @@ export function MessageTimeline({
   };
 
   const locateMessage = (messageId: string) => {
+    quoteController.current?.abort();
+    setQuoteError("");
+    setLocatingQuote(false);
     const target = scrollRef.current?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(messageId)}"]`);
-    if (!target) return;
-    target.scrollIntoView({ behavior: "smooth", block: "center" });
-    setHighlightedMessageId(messageId);
-    window.setTimeout(() => setHighlightedMessageId((current) => current === messageId ? undefined : current), 1800);
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      setHighlightedMessageId(messageId);
+      window.setTimeout(() => setHighlightedMessageId((current) => current === messageId ? undefined : current), 1800);
+    } else if (onLocateQuote) {
+      const controller = new AbortController();
+      quoteController.current = controller;
+      setLocatingQuote(true);
+      const timer = window.setTimeout(() => {
+        controller.abort();
+        setLocatingQuote(false);
+        setQuoteError("定位原消息超时，请重试。");
+      }, 30000);
+      void onLocateQuote(messageId, controller.signal).catch((reason) => {
+        if (!controller.signal.aborted) setQuoteError(reason instanceof Error ? reason.message : "无法定位原消息，请重试。");
+      }).finally(() => {
+        window.clearTimeout(timer);
+        if (!controller.signal.aborted) setLocatingQuote(false);
+      });
+      controller.signal.addEventListener("abort", () => window.clearTimeout(timer), { once: true });
+    }
   };
 
   useEffect(() => {
@@ -124,6 +155,8 @@ export function MessageTimeline({
           <button className="icon-button" type="button" aria-label="更多操作"><MoreVertical size={18} /></button>
         </div>
       </header>
+      {locatingQuote && <div className="timeline-location-status" role="status">正在定位原消息…<button type="button" onClick={() => { quoteController.current?.abort(); setLocatingQuote(false); }}>取消定位</button></div>}
+      {quoteError && <div className="timeline-location-status error" role="alert">{quoteError}</div>}
       <div className="date-divider">{boundaryDate && <span>{sortAscending ? `较早消息在前 · ${boundaryDate}` : `最近消息 · ${boundaryDate}`}</span>}</div>
       <div className="message-scroll-frame">
         <div className="message-scroll" ref={scrollRef}>

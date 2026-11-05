@@ -30,21 +30,58 @@ pub(crate) async fn import_enterprise(
 ) -> Result<Json<ImportResponse>, ApiError> {
     let collector_id =
         authorize_enterprise_upload(&headers, &state.token_sha256, &state.enterprise_config)?;
-    let import_path = receive_package(&state.data_root, body).await?;
-    let bytes = tokio::fs::read(&import_path)
+    let permit = Arc::clone(&state.import_slots)
+        .acquire_owned()
         .await
-        .map_err(|_| ApiError::invalid_export())?;
-    let _ = tokio::fs::remove_file(&import_path).await;
+        .map_err(|_| ApiError::store())?;
+    let file = ImportFile(receive_package(&state.data_root, body).await?);
+    let import_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        // A disconnected caller cannot release the slot while this worker is
+        // still retaining the decrypted package or writing the archive.
+        let _permit = permit;
+        let export = decode_enterprise_export(&import_state, &file.0)?;
+        drop(file);
+        let result = ingest_export_blocking(&import_state, export);
+        if let Ok(response) = &result
+            && let Some(collector_id) = collector_id
+            && let Ok(mut config) = import_state.enterprise_config.lock()
+            && let Some(collector) = config
+                .collectors
+                .iter_mut()
+                .find(|collector| collector.collector_id == collector_id)
+        {
+            collector.last_upload_at = Some(response.0.completed_at.clone());
+            let _ = persist_enterprise_config(&import_state.data_root, &config);
+        }
+        result
+    })
+    .await
+    .map_err(|_| ApiError::store())?
+}
+
+struct ImportFile(PathBuf);
+
+impl Drop for ImportFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn decode_enterprise_export(
+    state: &AppState,
+    path: &Path,
+) -> Result<archive_domain::ClientExportV1, ApiError> {
     let config = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?
         .clone();
-    let package = archive_transfer::parse_enterprise_package_for_organization(
-        &bytes,
-        &config.organization_id,
-    )
-    .map_err(|_| ApiError::invalid_export())?;
+    let mut package = {
+        let bytes = std::fs::read(path).map_err(|_| ApiError::invalid_export())?;
+        archive_transfer::parse_enterprise_package_for_organization(&bytes, &config.organization_id)
+            .map_err(|_| ApiError::invalid_export())?
+    };
     let protected_private_key_hex = config
         .collectors
         .iter()
@@ -72,28 +109,17 @@ pub(crate) async fn import_enterprise(
     let wrapped_dek =
         decode_hex(&package.wrapped_dek_hex).map_err(|_| ApiError::invalid_export())?;
     let nonce = decode_hex(&package.nonce_hex).map_err(|_| ApiError::invalid_export())?;
-    let ciphertext = decode_hex(&package.ciphertext_hex).map_err(|_| ApiError::invalid_export())?;
+    let ciphertext = decode_hex(&std::mem::take(&mut package.ciphertext_hex))
+        .map_err(|_| ApiError::invalid_export())?;
     let tag =
         decode_hex(&package.authentication_tag_hex).map_err(|_| ApiError::invalid_export())?;
     let plaintext = Zeroizing::new(
         enterprise_crypto::decrypt(&private_key, &wrapped_dek, &nonce, &ciphertext, &tag)
             .map_err(|_| ApiError::invalid_export())?,
     );
-    let export = archive_transfer::validate_enterprise_plaintext(&package, &plaintext)
-        .map_err(|_| ApiError::invalid_export())?;
-    let result = ingest_export(&state, export).await;
-    if let Ok(response) = &result
-        && let Some(collector_id) = collector_id
-        && let Ok(mut config) = state.enterprise_config.lock()
-        && let Some(collector) = config
-            .collectors
-            .iter_mut()
-            .find(|collector| collector.collector_id == collector_id)
-    {
-        collector.last_upload_at = Some(response.0.completed_at.clone());
-        let _ = persist_enterprise_config(&state.data_root, &config);
-    }
-    result
+    drop(ciphertext);
+    archive_transfer::validate_enterprise_plaintext(&package, &plaintext)
+        .map_err(|_| ApiError::invalid_export())
 }
 
 pub(crate) async fn import_json(
@@ -102,17 +128,32 @@ pub(crate) async fn import_json(
     body: Body,
 ) -> Result<Json<ImportResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    let import_path = receive_json(&state.data_root, body).await?;
-    let parse_path = import_path.clone();
-    let parsed = tokio::task::spawn_blocking(move || read_json(&parse_path))
+    let permit = Arc::clone(&state.import_slots)
+        .acquire_owned()
         .await
-        .map_err(|_| ApiError::invalid_export())?;
-    let _ = std::fs::remove_file(&import_path);
-    let export = parsed.map_err(|_| ApiError::invalid_export())?;
-    ingest_export(&state, export).await
+        .map_err(|_| ApiError::store())?;
+    let file = ImportFile(receive_json(&state.data_root, body).await?);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let export = read_json(&file.0).map_err(|_| ApiError::invalid_export())?;
+        drop(file);
+        ingest_export_blocking(&state, export)
+    })
+    .await
+    .map_err(|_| ApiError::store())?
 }
 
 pub(crate) async fn ingest_export(
+    state: &AppState,
+    export: archive_domain::ClientExportV1,
+) -> Result<Json<ImportResponse>, ApiError> {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || ingest_export_blocking(&state, export))
+        .await
+        .map_err(|_| ApiError::store())?
+}
+
+fn ingest_export_blocking(
     state: &AppState,
     export: archive_domain::ClientExportV1,
 ) -> Result<Json<ImportResponse>, ApiError> {
@@ -120,15 +161,13 @@ pub(crate) async fn ingest_export(
     let batch_count = export.batches.len();
     let media_count = export.media_count;
     let missing_media_count = export.missing_media_count;
-    let archive_path = Arc::clone(&state.archive_path);
-    let data_root = Arc::clone(&state.data_root);
     let conversations = export.conversations;
     let participants = export.participants;
     let batches = export.batches;
     let media_blobs = export.media_blobs;
-    let (summary, revision) = tokio::task::spawn_blocking(move || {
-        persist_media_blobs(&data_root, &media_blobs)?;
-        let mut store = ArchiveStore::open(&archive_path).map_err(ApiError::from_store)?;
+    let (summary, revision) = {
+        persist_media_blobs(&state.data_root, &media_blobs)?;
+        let mut store = ArchiveStore::open(&state.archive_path).map_err(ApiError::from_store)?;
         let mut total = IngestSummary {
             inserted: 0,
             unchanged: 0,
@@ -144,10 +183,8 @@ pub(crate) async fn ingest_export(
             .upsert_directory(&conversations, &participants)
             .map_err(ApiError::from_store)?;
         let revision = store.summary().map_err(ApiError::from_store)?.revision;
-        Ok::<_, ApiError>((total, revision))
-    })
-    .await
-    .map_err(|_| ApiError::store())??;
+        (total, revision)
+    };
     // Keep the latest revision even when the workspace page is not currently
     // listening. `send` drops the value when there are no receivers, which
     // made the first collector upload invisible until a later upload.
@@ -284,84 +321,47 @@ pub(crate) async fn receive_json_with_limit(
     body: Body,
     limit: u64,
 ) -> Result<PathBuf, ApiError> {
-    let import_root = root.join("imports");
-    tokio::fs::create_dir_all(&import_root)
-        .await
-        .map_err(|_| ApiError::store())?;
-    let partial = import_root.join(format!("{}.json.partial", Uuid::new_v4()));
-    let complete = partial.with_extension("json");
-    let mut output = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&partial)
-        .await
-        .map_err(|_| ApiError::store())?;
-    let mut received = 0_u64;
-    let mut stream = body.into_data_stream();
-    while let Some(next) = stream.next().await {
-        let chunk = match next {
-            Ok(chunk) => chunk,
-            Err(_) => {
-                let _ = tokio::fs::remove_file(&partial).await;
-                return Err(ApiError::invalid_export());
-            }
-        };
-        received = received.saturating_add(chunk.len() as u64);
-        if received > limit {
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(ApiError::too_large());
-        }
-        if output.write_all(&chunk).await.is_err() {
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(ApiError::store());
-        }
-    }
-    if received == 0 || output.sync_all().await.is_err() {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(ApiError::invalid_export());
-    }
-    drop(output);
-    tokio::fs::rename(&partial, &complete)
-        .await
-        .map_err(|_| ApiError::store())?;
-    Ok(complete)
+    receive_file(root, body, "json", limit).await
 }
 
 pub(crate) async fn receive_package(root: &Path, body: Body) -> Result<PathBuf, ApiError> {
+    receive_file(root, body, "wca", MAX_CLIENT_EXPORT_BYTES).await
+}
+
+async fn receive_file(
+    root: &Path,
+    body: Body,
+    extension: &str,
+    limit: u64,
+) -> Result<PathBuf, ApiError> {
     let import_root = root.join("imports");
     tokio::fs::create_dir_all(&import_root)
         .await
         .map_err(|_| ApiError::store())?;
-    let partial = import_root.join(format!("{}.wca.partial", Uuid::new_v4()));
-    let complete = partial.with_extension("wca");
+    let complete = import_root.join(format!("{}.{extension}", Uuid::new_v4()));
+    let partial = complete.with_extension(format!("{extension}.partial"));
     let mut output = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&partial)
         .await
         .map_err(|_| ApiError::store())?;
+    // Register cleanup only after exclusive creation succeeds.
+    let _partial_cleanup = ImportFile(partial.clone());
     let mut received = 0_u64;
     let mut stream = body.into_data_stream();
     while let Some(next) = stream.next().await {
-        let chunk = match next {
-            Ok(chunk) => chunk,
-            Err(_) => {
-                let _ = tokio::fs::remove_file(&partial).await;
-                return Err(ApiError::invalid_export());
-            }
-        };
+        let chunk = next.map_err(|_| ApiError::invalid_export())?;
         received = received.saturating_add(chunk.len() as u64);
-        if received > MAX_CLIENT_EXPORT_BYTES {
-            let _ = tokio::fs::remove_file(&partial).await;
+        if received > limit {
             return Err(ApiError::too_large());
         }
-        if output.write_all(&chunk).await.is_err() {
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(ApiError::store());
-        }
+        output
+            .write_all(&chunk)
+            .await
+            .map_err(|_| ApiError::store())?;
     }
     if received == 0 || output.sync_all().await.is_err() {
-        let _ = tokio::fs::remove_file(&partial).await;
         return Err(ApiError::invalid_export());
     }
     drop(output);

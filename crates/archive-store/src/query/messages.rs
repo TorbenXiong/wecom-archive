@@ -3,8 +3,13 @@ use crate::{ArchiveStore, MessageQuery, StoreError};
 use archive_domain::MessageV1;
 use rusqlite::{OptionalExtension, params};
 
+const SEARCH_PREFIX_LIMIT: u64 = 4096;
+
 impl ArchiveStore {
     pub fn query_messages(&self, query: &MessageQuery) -> Result<Vec<MessageV1>, StoreError> {
+        if let Some(page) = self.query_search_prefix(query)? {
+            return Ok(page);
+        }
         // Page over index keys first. Skipped rows never load payload_json,
         // and temporary sorting is limited to the selected page.
         let limit = query.limit.clamp(1, 50_000) as i64;
@@ -41,6 +46,73 @@ impl ArchiveStore {
             Ok(serde_json::from_str(&json)?)
         })
         .collect()
+    }
+
+    fn query_search_prefix(
+        &self,
+        query: &MessageQuery,
+    ) -> Result<Option<Vec<MessageV1>>, StoreError> {
+        use rusqlite::types::Value;
+        let Some(text) = query
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            return Ok(None);
+        };
+        let limit = query.limit.clamp(1, 50_000);
+        // Keep the work bounded for sparse searches and deep pages. NUL is
+        // left to the original MATCH path so its validation cannot be bypassed
+        // by LIKE's NUL-terminated pattern handling.
+        if query.offset.saturating_add(u64::from(limit)) > SEARCH_PREFIX_LIMIT
+            || text.contains('\0')
+        {
+            return Ok(None);
+        }
+        // Small pages should not prepare thousands of qualifying rows when
+        // a sender/type filter already makes the ordered scan expensive.
+        // Allow headroom for substring/attachment hits, with the same hard cap.
+        let prefix_limit = ((query.offset + u64::from(limit)) * 32).min(SEARCH_PREFIX_LIMIT);
+        let mut filters = query.clone();
+        filters.text = None;
+        let (predicate, mut values) = message_predicate(&filters)?;
+        values.push(Value::Text(fts_query(text)));
+        let fts_parameter = values.len();
+        values.push(Value::Text(like_pattern(text)));
+        let like_parameter = values.len();
+        values.push(Value::Integer(i64::from(limit)));
+        let limit_parameter = values.len();
+        values.push(Value::Integer(query.offset as i64));
+        let offset_parameter = values.len();
+        let direction = if query.sort_ascending { "ASC" } else { "DESC" };
+        let media_candidates = media_search_candidates(like_parameter);
+        let sql = format!(
+            "WITH search_window AS MATERIALIZED (
+                SELECT m.rowid AS message_rowid, m.sent_at, m.stable_message_id
+                FROM messages m WHERE {predicate}
+                ORDER BY m.sent_at {direction}, m.stable_message_id {direction}
+                LIMIT {prefix_limit}
+             ) SELECT m.payload_json FROM search_window w
+             JOIN messages m ON m.rowid = w.message_rowid
+             WHERE CASE WHEN m.body_text LIKE ?{like_parameter} ESCAPE '\\' THEN 1
+               WHEN m.stable_message_id IN (
+                 SELECT stable_message_id FROM message_fts WHERE message_fts MATCH ?{fts_parameter}
+               ) THEN 1 ELSE m.stable_message_id IN ({media_candidates}) END
+             ORDER BY w.sent_at {direction}, w.stable_message_id {direction}
+             LIMIT ?{limit_parameter} OFFSET ?{offset_parameter}"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+            row.get::<_, String>(0)
+        })?;
+        let page = rows
+            .map(|row| Ok(serde_json::from_str::<MessageV1>(&row?)?))
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        // Every row outside the window sorts after it under the same filters.
+        // A full page is therefore complete; an incomplete page is discarded
+        // and the original global search runs, rather than hiding later hits.
+        Ok((page.len() == limit as usize).then_some(page))
     }
 
     /// Read every matching message once within the current read snapshot.
@@ -269,6 +341,7 @@ fn message_predicate(
         let body_parameter = values.len();
         values.push(Value::Text(like_pattern(text)));
         let media_parameter = values.len();
+        let media_candidates = media_search_candidates(media_parameter);
         // Materialize candidates once, rather than rerunning MATCH for every message.
         // The LIKE branch completes FTS token matching for partial and CJK text;
         // UNION also prevents a text-and-attachment match from appearing twice.
@@ -279,9 +352,7 @@ fn message_predicate(
                 SELECT stable_message_id FROM messages
                 WHERE body_text LIKE ?{body_parameter} ESCAPE '\\'
                 UNION
-                SELECT mm.stable_message_id FROM media media_search
-                JOIN message_media mm ON mm.media_id = media_search.media_id
-                WHERE media_search.original_name LIKE ?{media_parameter} ESCAPE '\\'
+                {media_candidates}
             )"
         ));
     }
@@ -293,6 +364,17 @@ fn message_predicate(
         },
         values,
     ))
+}
+
+fn media_search_candidates(parameter: usize) -> String {
+    // Filter each distinct media row once before resolving its references.
+    // This also works on old read-only archives without a reverse media index.
+    format!(
+        "SELECT mm.stable_message_id FROM message_media mm
+             WHERE mm.media_id IN (
+               SELECT media_id FROM media WHERE original_name LIKE ?{parameter} ESCAPE '\\'
+             )"
+    )
 }
 
 fn like_pattern(text: &str) -> String {

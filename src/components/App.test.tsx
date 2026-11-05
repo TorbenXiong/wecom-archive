@@ -4,6 +4,7 @@ import { afterEach, vi } from "vitest";
 import App from "../App";
 
 const accessToken = "0123456789abcdefghijklmnop";
+const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
 
 function installApiMock() {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -113,12 +114,108 @@ async function connect(expectedTitle = "真实 API 会话") {
 }
 
 afterEach(() => {
+  if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", originalScrollIntoView);
+  else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
   window.history.replaceState(null, "", "/");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 describe("archive workspace", () => {
+  it.each([
+    { sort: "desc", pageSize: 200, offset: 350, page: 2 },
+    { sort: "asc", pageSize: 100, offset: 250, page: 3 },
+  ])("locates quoted messages across pages with $sort order and $pageSize rows", async ({ sort, pageSize, offset, page }) => {
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
+    installApiMock();
+    const fallback = vi.mocked(fetch).getMockImplementation()!;
+    const positions: string[] = [];
+    const message = { stable_message_id: "quoted-source", conversation_id: "conversation-1", sender_id: "participant-1", sent_at: "2026-09-07T10:24:00.123456Z", direction: "incoming", message_type: "text", body_text: "引用消息正文", lifecycle: "active", media: [], raw_type: "text" };
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/participants")) return Response.json([]);
+      if (url.pathname.endsWith("/position")) { positions.push(url.searchParams.get("sort")!); return Response.json({ conversation_id: "conversation-1", offset_in_conversation: offset }); }
+      if (url.pathname.endsWith("/messages/count")) return Response.json({ total: 401 });
+      if (url.pathname === "/api/v1/messages") {
+        const start = Number(url.searchParams.get("offset"));
+        return Response.json(start === 0 ? [{ ...message, quoted_message_id: "quoted-target", quoted_message: { ...message, stable_message_id: "quoted-target", body_text: "原消息预览" } }] : [{ ...message, stable_message_id: "quoted-target", body_text: "跨页原消息正文" }]);
+      }
+      return fallback(input, init);
+    });
+    const { container } = render(<App />);
+    await connect();
+    if (pageSize !== 200) fireEvent.change(screen.getByLabelText("每页数量"), { target: { value: String(pageSize) } });
+    if (sort === "asc") fireEvent.click(screen.getByRole("button", { name: "按时间降序" }));
+    fireEvent.click(await screen.findByRole("button", { name: /原消息预览/ }));
+    await screen.findByText("跨页原消息正文");
+    await waitFor(() => expect(container.querySelector('[data-message-id="quoted-target"]')).toHaveClass("highlighted"));
+    expect(screen.getByLabelText("跳转页码")).toHaveValue(String(page));
+    expect(positions).toEqual([sort]);
+  });
+
+  it("ignores a quoted-message position response after manual navigation even if fetch ignores abort", async () => {
+    installApiMock();
+    const fallback = vi.mocked(fetch).getMockImplementation()!;
+    let resolvePosition!: (response: Response) => void;
+    let positionSignal: AbortSignal | null | undefined;
+    const source = { stable_message_id: "source", conversation_id: "conversation-1", sender_id: "participant-1", sent_at: "2026-09-07T10:24:00Z", direction: "incoming", message_type: "text", body_text: "引用消息正文", lifecycle: "active", media: [], raw_type: "text", quoted_message_id: "target" };
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/position")) { positionSignal = init?.signal; return new Promise<Response>((resolve) => { resolvePosition = resolve; }); }
+      if (url.pathname.endsWith("/messages/count")) return Response.json({ total: 601 });
+      if (url.pathname === "/api/v1/messages") return Response.json(Number(url.searchParams.get("offset")) === 0 ? [source] : [{ ...source, stable_message_id: "other-page", body_text: "用户选择的下一页", quoted_message_id: undefined }]);
+      return fallback(input, init);
+    });
+    render(<App />); await connect();
+    fireEvent.click(await screen.findByTitle("定位到原消息"));
+    await screen.findByText("正在定位原消息…");
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    await screen.findByText("用户选择的下一页");
+    expect(positionSignal?.aborted).toBe(true);
+    await act(async () => resolvePosition(Response.json({ conversation_id: "conversation-1", offset_in_conversation: 500 })));
+    expect(screen.getByLabelText("跳转页码")).toHaveValue("2");
+    expect(screen.queryByText("正在定位原消息…")).not.toBeInTheDocument();
+  });
+
+  it("shows the first conversation page and loads later conversations for browsing and export on demand", async () => {
+    installApiMock();
+    const apiFetch = vi.mocked(fetch).getMockImplementation()!;
+    let revision = 1;
+    let resolveUpdate: ((response: Response) => void) | undefined;
+    const rows = Array.from({ length: 51 }, (_, index) => ({
+      conversation_id: `conversation-${index + 1}`, display_name: `分页会话 ${index + 1}`,
+      last_message_at: "2026-11-01T00:00:00Z", message_count: 1, media_count: 0, participant_count: 0,
+    }));
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/archive/updates")) return new Promise<Response>((resolve) => { resolveUpdate = resolve; });
+      if (url.pathname.endsWith("/archive/summary")) return Response.json({ conversation_count: 51, message_count: 51, media_count: 0, revision });
+      if (url.pathname === "/api/v1/conversations") {
+        const offset = Number(url.searchParams.get("offset"));
+        return Response.json(rows.slice(offset, offset + 50));
+      }
+      return apiFetch(input, init);
+    });
+    render(<App />);
+    await connect("分页会话 1");
+    const pane = screen.getByRole("complementary", { name: "会话列表" });
+    expect(within(pane).getByText("共 51 个会话")).toBeInTheDocument();
+    expect(within(pane).queryByText("分页会话 51")).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes("/conversations?"))).toHaveLength(1);
+    fireEvent.click(within(pane).getByText("加载更多会话"));
+    fireEvent.click(await within(pane).findByText("分页会话 51"));
+    await screen.findByRole("heading", { name: "分页会话 51", level: 1 });
+    await waitFor(() => expect(resolveUpdate).toBeDefined());
+    revision = 2;
+    await act(async () => { resolveUpdate?.(Response.json({ revision })); });
+    await waitFor(() => expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes("/conversations?limit=50&offset=0"))).toHaveLength(2));
+    expect(screen.getByRole("heading", { name: "分页会话 51", level: 1 })).toBeInTheDocument();
+    fireEvent.click(within(pane).getByText("导出"));
+    const dialog = screen.getByRole("dialog", { name: "准备导出" });
+    fireEvent.click(within(dialog).getByRole("radio", { name: "按会话（多选）" }));
+    expect(within(dialog).getByText("分页会话 51").closest("label")?.querySelector("input")).toBeChecked();
+  });
+
   it("shows the export directory in the export dialog instead of the conversation toolbar", async () => {
     installApiMock();
     render(<App />);

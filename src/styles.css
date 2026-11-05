@@ -768,3 +768,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   .schedule-search { width: 100%; }
 }
 .settings-update-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.conversation-load-more { padding: 8px 12px; }
+.conversation-load-more:empty { display: none; }
+.timeline-location-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 20px; font-size: 13px; color: var(--blue); }
+.timeline-location-status.error { color: var(--danger, #b42318); }
+.conversation-load-more button { width: 100%; justify-content: center; }
+.conversation-load-more p { margin: 0 0 8px; font-size: 12px; color: var(--danger, #b42318); }
+.global-search-conversation-label { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.conversation-load-more.compact { min-width: 0; padding: 0; }
+.conversation-load-more.compact button { min-height: 0; padding: 0; border: 0; color: var(--blue); background: transparent; font-size: 11px; }

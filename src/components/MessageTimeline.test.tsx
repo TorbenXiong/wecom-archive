@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, vi } from "vitest";
+import { afterEach, beforeEach, vi } from "vitest";
 import { MessageTimeline } from "./MessageTimeline";
 import type { ConversationSummary, MessageItem } from "../domain/types";
 
@@ -53,7 +53,28 @@ const messages: MessageItem[] = [
   },
 ];
 
+const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+afterEach(() => {
+  if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", originalScrollIntoView);
+  else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+});
+
 describe("message timeline", () => {
+  it("keeps same-page quote highlighting local and reports missing cross-page targets for retry", async () => {
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
+    const locate = vi.fn<(id: string, signal: AbortSignal) => Promise<void>>().mockRejectedValue(new Error("原消息不存在。"));
+    const localQuote = { ...messages[0], quote: { id: messages[1].id, sender: "成员二", time: "", body: "本页原消息" } };
+    const { container, rerender } = render(<MessageTimeline token="test-token" conversation={conversation} messages={[localQuote, messages[1]]} participants={[]} onLocateQuote={locate} />);
+    fireEvent.click(screen.getByTitle("定位到原消息"));
+    expect(container.querySelector('[data-message-id="older-message"]')).toHaveClass("highlighted");
+    expect(locate).not.toHaveBeenCalled();
+    rerender(<MessageTimeline token="test-token" conversation={conversation} messages={[{ ...localQuote, quote: { ...localQuote.quote, id: "outside-page" } }]} participants={[]} onLocateQuote={locate} />);
+    fireEvent.click(screen.getByTitle("定位到原消息"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("原消息不存在。");
+    fireEvent.click(screen.getByTitle("定位到原消息"));
+    await waitFor(() => expect(locate).toHaveBeenCalledTimes(2));
+  });
+
   beforeEach(() => {
     mediaApi.getMediaObjectUrl.mockReset().mockImplementation(() => new Promise<string>(() => undefined));
     mediaApi.openMediaFile.mockReset().mockResolvedValue({ opened: true });

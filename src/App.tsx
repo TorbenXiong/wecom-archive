@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { LoaderCircle, ShieldCheck } from "lucide-react";
 import { ConversationList } from "./components/ConversationList";
 import { DetailPanel } from "./components/DetailPanel";
@@ -22,7 +22,6 @@ import {
   importClientJson,
   importEnterprisePackage,
   listConversationParticipants,
-  listConversations,
   listMessages,
   openExportDirectory,
   type ExportOrder,
@@ -35,6 +34,7 @@ import {
   type CollectedUser,
   ServerApiError,
 } from "./lib/server-api";
+import { useConversationPages } from "./lib/use-conversation-pages";
 import "./styles.css";
 
 type Section = "conversations" | "local-export" | "server-config" | "settings";
@@ -64,7 +64,7 @@ export default function App() {
   const [summary, setSummary] = useState(emptySummary);
   const [superAdminEnabled, setSuperAdminEnabled] = useState(true);
   const [collectedUsers, setCollectedUsers] = useState<CollectedUser[]>([]);
-  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const conversationPages = useConversationPages();
   const [messages, setMessages] = useState<MessageItem[]>([]);
   const [messagePage, setMessagePage] = useState(0);
   const [messagePageSize, setMessagePageSize] = useState(DEFAULT_MESSAGE_PAGE_SIZE);
@@ -92,21 +92,29 @@ export default function App() {
   const [collectionProgress, setCollectionProgress] = useState<LocalCollectionProgress>({ running: false, percent: 0, stage: "准备采集", detail: "正在初始化本机采集任务。" });
   const [refreshVersion, setRefreshVersion] = useState(0);
   const archiveRevision = useRef(0);
+  const directoryRequest = useRef(0);
   const skipNextPageReset = useRef(false);
   const selectedConversationOverride = useRef<ConversationSummary | undefined>(undefined);
+  const conversations = useMemo(() => {
+    const rows = conversationPages.rows.map(mapConversation);
+    const override = selectedConversationOverride.current;
+    if (override && !rows.some((item) => item.id === override.id)) rows.push(override);
+    return rows;
+  }, [conversationPages.rows, selectedId]);
 
-  const loadDirectory = async (accessToken: string) => {
+  const loadDirectory = async (accessToken: string, signal?: AbortSignal) => {
+    const request = ++directoryRequest.current;
     const [nextSummary, rows] = await Promise.all([
       getArchiveSummary(accessToken),
-      listConversations(accessToken),
+      conversationPages.reset(accessToken, signal),
     ]);
+    if (request !== directoryRequest.current || signal?.aborted) return false;
     const nextConversations = rows.map(mapConversation);
     const override = selectedConversationOverride.current;
     if (override && !nextConversations.some((item) => item.id === override.id)) nextConversations.push(override);
     const changed = nextSummary.revision !== archiveRevision.current;
     archiveRevision.current = nextSummary.revision;
     setSummary(nextSummary);
-    setConversations(nextConversations);
     setSelectedId((current) => nextConversations.some((item) => item.id === current) ? current : (nextConversations[0]?.id ?? ""));
     return changed;
   };
@@ -122,7 +130,7 @@ export default function App() {
           const update = await waitForArchiveUpdate(token, archiveRevision.current, controller.signal);
           if (!active) return;
           if (update.revision !== archiveRevision.current) {
-            const changed = await loadDirectory(token);
+            const changed = await loadDirectory(token, controller.signal);
             if (changed) setRefreshVersion((current) => current + 1);
           }
         } catch (reason) {
@@ -286,6 +294,7 @@ export default function App() {
       listMessages(token, { ...query, limit: messagePageSize, offset: messagePage * messagePageSize, sort: messageSortAscending ? "asc" : "desc" }, controller.signal),
       countMessages(token, query, controller.signal),
     ]).then(([rows, count]) => {
+      if (controller.signal.aborted) return;
       const totalPages = Math.max(1, Math.ceil(count.total / messagePageSize));
       if (messagePage >= totalPages && messagePage > 0) {
         setMessageTotal(count.total);
@@ -296,7 +305,7 @@ export default function App() {
       setMessages(rows.map(mapMessage));
       setMessageStatus(rows.length === 0 ? "当前条件下没有消息" : "");
     }).catch((reason) => {
-      if (reason instanceof DOMException && reason.name === "AbortError") return;
+      if (controller.signal.aborted || reason instanceof DOMException && reason.name === "AbortError") return;
       setMessages([]);
       setMessageTotal(0);
       setMessageStatus(reason instanceof Error ? reason.message : "消息读取失败");
@@ -334,6 +343,16 @@ export default function App() {
   }, [refreshVersion, selectedId, superAdminEnabled, token]);
 
   const selectedConversation = conversations.find((item) => item.id === selectedId) ?? emptyConversation;
+  useEffect(() => {
+    if (selectedConversation.id) selectedConversationOverride.current = selectedConversation;
+  }, [selectedConversation]);
+  const conversationPaging = {
+    hasMore: conversationPages.hasMore,
+    loading: conversationPages.loading,
+    error: conversationPages.error,
+    total: summary.conversation_count,
+    onLoadMore: () => { void conversationPages.loadMore(token); },
+  };
   const isFullPageSection = section === "server-config" || section === "settings" || section === "local-export";
   const openSearchResult = async (result: GlobalSearchResult, signal?: AbortSignal) => {
     if (!token) return;
@@ -343,15 +362,21 @@ export default function App() {
     )).offset_in_conversation;
     if (signal?.aborted) return;
     if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("无法定位原消息，请重试。");
-    if (!conversations.some((conversation) => conversation.id === result.conversation_id)) {
-      const conversation = mapSearchConversation(result);
-      selectedConversationOverride.current = conversation;
-      setConversations((current) => [...current, conversation]);
-    }
+    selectedConversationOverride.current = conversations.find((item) => item.id === result.conversation_id) ?? mapSearchConversation(result);
     skipNextPageReset.current = result.conversation_id !== selectedId;
     setSelectedId(result.conversation_id);
     setMessagePage(Math.floor(offset / messagePageSize));
     setTargetMessageId(result.stable_message_id);
+  };
+  const openQuotedMessage = async (messageId: string, signal: AbortSignal) => {
+    if (!token) return;
+    const position = await getMessagePosition(token, messageId, messageSortAscending ? "asc" : "desc", signal);
+    if (signal.aborted) return;
+    if (position.conversation_id !== selectedId || !Number.isSafeInteger(position.offset_in_conversation) || position.offset_in_conversation < 0) {
+      throw new Error("无法在当前会话中找到原消息。");
+    }
+    setMessagePage(Math.floor(position.offset_in_conversation / messagePageSize));
+    setTargetMessageId(messageId);
   };
 
   if (!token && autoConnecting) return <div className="access-shell startup-shell">
@@ -369,13 +394,13 @@ export default function App() {
     <div className={section === "local-export" ? "workspace-grid local-export-mode" : isFullPageSection ? "workspace-grid settings-mode" : !superAdminEnabled || !selectedConversation.isGroup ? "workspace-grid no-detail" : detailCollapsed ? "workspace-grid detail-collapsed" : "workspace-grid"}>
       <Navigation active={section} onSelect={setSection} />
       {section === "server-config" ? <ServerConfigPage token={token} onTokenChanged={setToken} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal} onOpenLocalCollection={openLocalCollectionSetup} /> : section === "settings" ? <SettingsPage token={token} superAdminEnabled={superAdminEnabled} onSuperAdminChange={setSuperAdminEnabled} /> : section === "local-export" ? <LocalExportPage token={token} onCompleted={(result) => showExportCompleted(result, "本机导出完成")} onFailed={(error) => setToast({ message: error instanceof Error ? error.message : "本机导出失败。", tone: "error" })} /> : <>
-        <ConversationList token={token} conversations={conversations} selectedId={selectedId} messageSortAscending={messageSortAscending} superAdminEnabled={superAdminEnabled} collectedUsers={collectedUsers} onSelect={(id) => { selectedConversationOverride.current = undefined; setTargetMessageId(undefined); setSelectedId(id); }} onOpenSearchResult={openSearchResult} onExport={() => setShowExport(true)} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal} onOpenLocalCollection={openLocalCollectionFromConversation} importing={importing} onImport={(file) => void importPackage(file)} />
-        {superAdminEnabled ? <MessageTimeline token={token} conversation={selectedConversation} messages={messages} participants={participants} sortAscending={messageSortAscending} onSortChange={(ascending) => { setMessageSortAscending(ascending); setMessagePage(0); }} status={messageStatus} targetMessageId={targetMessageId} onTargetLocated={() => setTargetMessageId(undefined)} pageIndex={messagePage} pageSize={messagePageSize} totalMessages={messageTotal} totalPages={Math.max(1, Math.ceil(messageTotal / messagePageSize))} onPageSizeChange={(size) => setMessagePageSize(size)} onPageChange={(page) => setMessagePage(page)} onPreviousPage={() => setMessagePage((current) => Math.max(0, current - 1))} onNextPage={() => setMessagePage((current) => current + 1)} /> : <main className="content-gate"><ShieldCheck size={28} /><h2>会话内容已隐藏</h2></main>}
+        <ConversationList token={token} conversations={conversations} paging={conversationPaging} selectedId={selectedId} messageSortAscending={messageSortAscending} superAdminEnabled={superAdminEnabled} collectedUsers={collectedUsers} onSelect={(id) => { selectedConversationOverride.current = conversations.find((item) => item.id === id); setTargetMessageId(undefined); setSelectedId(id); }} onOpenSearchResult={openSearchResult} onExport={() => setShowExport(true)} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal} onOpenLocalCollection={openLocalCollectionFromConversation} importing={importing} onImport={(file) => void importPackage(file)} />
+        {superAdminEnabled ? <MessageTimeline token={token} conversation={selectedConversation} messages={messages} participants={participants} sortAscending={messageSortAscending} onSortChange={(ascending) => { setMessageSortAscending(ascending); setMessagePage(0); }} status={messageStatus} targetMessageId={targetMessageId} onTargetLocated={() => setTargetMessageId(undefined)} onLocateQuote={openQuotedMessage} pageIndex={messagePage} pageSize={messagePageSize} totalMessages={messageTotal} totalPages={Math.max(1, Math.ceil(messageTotal / messagePageSize))} onPageSizeChange={(size) => setMessagePageSize(size)} onPageChange={(page) => setMessagePage(page)} onPreviousPage={() => setMessagePage((current) => Math.max(0, current - 1))} onNextPage={() => setMessagePage((current) => current + 1)} /> : <main className="content-gate"><ShieldCheck size={28} /><h2>会话内容已隐藏</h2></main>}
         {superAdminEnabled && selectedConversation.isGroup && <DetailPanel conversation={selectedConversation} participants={participants} messages={messages} collapsed={detailCollapsed} onToggleCollapsed={() => setDetailCollapsed((current) => !current)} />}
       </>}
     </div>
     <footer className="status-bar"><span>已归档 {summary.message_count.toLocaleString("zh-CN")} 条消息 · {summary.media_count.toLocaleString("zh-CN")} 项媒体 · {summary.conversation_count.toLocaleString("zh-CN")} 个会话</span><span><i />受控访问 · 审计已启用</span></footer>
-     {showExport && superAdminEnabled && <ExportDialog token={token} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} conversations={conversations} selectedConversationId={selectedId} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" || scope === "date_range" ? summary.message_count : scope === "current_filter" ? messages.length : scope === "selected_conversations" ? 0 : selectedConversation.messageCount} mediaCount={scope === "entire_archive" || scope === "date_range" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async (selection: ExportSelection, signal, onProgress) => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, conversationIds: selection.conversationIds, startDate: selection.startDate, endDate: selection.endDate, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }, signal, onProgress); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
+     {showExport && superAdminEnabled && <ExportDialog token={token} conversationPaging={conversationPaging} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} conversations={conversations} selectedConversationId={selectedId} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" || scope === "date_range" ? summary.message_count : scope === "current_filter" ? messages.length : scope === "selected_conversations" ? 0 : selectedConversation.messageCount} mediaCount={scope === "entire_archive" || scope === "date_range" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async (selection: ExportSelection, signal, onProgress) => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, conversationIds: selection.conversationIds, startDate: selection.startDate, endDate: selection.endDate, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }, signal, onProgress); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
     {showLocalCollectionSetup && !collectingLocal && <LocalCollectionSetupDialog dataRedaction={localCollectionDataRedaction} onDataRedactionChange={setLocalCollectionDataRedaction} onClose={() => setShowLocalCollectionSetup(false)} onCollect={(includeMedia) => { setShowLocalCollectionSetup(false); void collectLocal(includeMedia); }} />}
     {customRootIssue && !collectingLocal && <CustomSourceRootDialog message={customRootIssue.message} initialRoot={customRootIssue.attemptedRoot ?? ""} onClose={() => setCustomRootIssue(null)} onRetry={(root) => { void collectLocal(customRootIssue.includeMedia, root); }} />}
     {collectingLocal && <LocalCollectionDialog progress={collectionProgress} />}

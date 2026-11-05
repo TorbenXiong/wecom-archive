@@ -390,7 +390,7 @@ export async function listConversations(token: string, signal?: AbortSignal): Pr
   const conversations: ServerConversation[] = [];
   const seen = new Set<string>();
   for (let offset = 0; ; offset += pageSize) {
-    const page = await request<ServerConversation[]>(`/api/v1/conversations?limit=${pageSize}&offset=${offset}`, token, { signal });
+    const page = await listConversationPage(token, offset, signal, pageSize);
     let added = 0;
     for (const conversation of page) {
       if (seen.has(conversation.conversation_id)) continue;
@@ -401,6 +401,12 @@ export async function listConversations(token: string, signal?: AbortSignal): Pr
     if (page.length < pageSize || added === 0) break;
   }
   return conversations;
+}
+
+export const CONVERSATION_PAGE_SIZE = 50;
+
+export function listConversationPage(token: string, offset = 0, signal?: AbortSignal, limit = CONVERSATION_PAGE_SIZE): Promise<ServerConversation[]> {
+  return request<ServerConversation[]>(`/api/v1/conversations?limit=${limit}&offset=${offset}`, token, { signal });
 }
 
 export function listConversationParticipants(token: string, conversationId: string, signal?: AbortSignal): Promise<ServerParticipant[]> {

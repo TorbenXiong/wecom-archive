@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 #[derive(Clone)]
 pub(super) struct AppState {
@@ -24,6 +24,7 @@ pub(super) struct AppState {
     pub(super) network_mode: &'static str,
     pub(super) listen_address: String,
     pub(super) export_tasks: Arc<Mutex<HashMap<String, Arc<ExportTask>>>>,
+    pub(super) import_slots: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, Serialize)]

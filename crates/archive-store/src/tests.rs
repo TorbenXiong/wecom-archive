@@ -478,6 +478,116 @@ fn ingest_is_idempotent_and_records_revision() {
 }
 
 #[test]
+fn ordered_search_pages_match_complete_results_across_filters_and_prefix_boundaries() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("archive.db");
+    let mut store = ArchiveStore::open(&path).unwrap();
+    let mut input = batch("fixture");
+    let template = input.messages[0].clone();
+    input.messages = (0..4200)
+        .map(|index| {
+            let mut message = template.clone();
+            message.stable_message_id = format!("ordered-{index:05}");
+            message.source_message_id = format!("ordered-source-{index:05}");
+            message.conversation_id = if index % 3 == 0 { "other" } else { "hot" }.into();
+            message.sender_id = Some(if index % 2 == 0 { "alice" } else { "bob" }.into());
+            // Many equal timestamps expose any unstable page boundary or tiebreaker.
+            message.sent_at += chrono::TimeDelta::seconds(index / 4);
+            message.body_text = Some(format!(
+                "common 项目归档 café alpha middle beta {} {}",
+                if index % 997 == 0 { "rare-needle" } else { "" },
+                if index % 17 == 0 {
+                    r"100%_value C:\fixture\files"
+                } else {
+                    ""
+                }
+            ));
+            if index % 20 == 0 {
+                let mut media = shared_media("ordered-shared");
+                media.original_name = Some("common-shared-attachment.txt".into());
+                // Repeated references to one shared file must still yield one message.
+                message.media = vec![media.clone(), media];
+                message.message_type = MessageType::File;
+            }
+            message
+        })
+        .collect();
+    store.ingest_batch(&input).unwrap();
+    for text in [
+        "common",
+        "目归",
+        "cafe",
+        "alpha beta",
+        "shared-attachment",
+        "rare-needle",
+        "absentneedle",
+        "100%_value",
+        r"C:\fixture\files",
+    ] {
+        for ascending in [false, true] {
+            for filters in 0..3 {
+                let query = MessageQuery {
+                    text: Some(text.into()),
+                    sort_ascending: ascending,
+                    conversation_id: (filters > 0).then(|| "hot".into()),
+                    participant_id: (filters == 2).then(|| "alice".into()),
+                    media_only: filters == 2,
+                    message_type: (filters == 2).then_some(MessageType::File),
+                    starts_at: (filters == 2)
+                        .then_some(template.sent_at + chrono::TimeDelta::seconds(50)),
+                    ends_at: (filters == 2)
+                        .then_some(template.sent_at + chrono::TimeDelta::seconds(1000)),
+                    limit: 50_000,
+                    ..Default::default()
+                };
+                let complete = store.query_messages(&query).unwrap();
+                assert_eq!(store.count_messages(&query).unwrap(), complete.len() as u64);
+                for (limit, offset) in [(50, 0), (50, 50), (1, 4095), (50, 4100), (5000, 0)] {
+                    let page = store
+                        .query_messages(&MessageQuery {
+                            limit,
+                            offset,
+                            ..query.clone()
+                        })
+                        .unwrap();
+                    let expected = complete
+                        .iter()
+                        .skip(offset as usize)
+                        .take(limit as usize)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        page, expected,
+                        "text={text}; ascending={ascending}; filters={filters}; offset={offset}"
+                    );
+                }
+            }
+        }
+    }
+    // Old read-only v2 archives may have arbitrary FTS rowids, duplicate FTS
+    // entries, and no derived mapping. FTS token semantics remain authoritative.
+    store.connection.execute(
+        "INSERT INTO message_fts(rowid, stable_message_id, body_text) VALUES (900000, 'ordered-04199', 'fts-only-token')", [],
+    ).unwrap();
+    remove_derived_tables(&store.connection);
+    drop(store);
+    let reader = ArchiveStore::open_read_only(&path).unwrap();
+    for text in ["cafe", "fts-only-token"] {
+        let query = MessageQuery {
+            text: Some(text.into()),
+            limit: 50_000,
+            ..Default::default()
+        };
+        let complete = reader.query_messages(&query).unwrap();
+        assert!(!complete.is_empty());
+        let page = reader
+            .query_messages(&MessageQuery { limit: 50, ..query })
+            .unwrap();
+        assert_eq!(page, complete.into_iter().take(50).collect::<Vec<_>>());
+    }
+}
+
+#[test]
 fn repeated_revision_content_keeps_history_and_commits_the_whole_batch() {
     let directory = tempdir().unwrap();
     let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();

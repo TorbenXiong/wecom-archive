@@ -169,6 +169,7 @@ fn state(directory: &TestDirectory) -> AppState {
         network_mode: "loopback_only",
         listen_address: "127.0.0.1:9812".into(),
         export_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        import_slots: Arc::new(tokio::sync::Semaphore::new(1)),
     }
 }
 
@@ -1235,6 +1236,166 @@ async fn repeated_import_is_idempotent() {
 }
 
 #[tokio::test]
+async fn imports_share_a_slot_before_reading_bodies_and_release_it_after_failure() {
+    use axum::body::Bytes;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    let directory = TestDirectory::new();
+    let app_state = state(&directory);
+    let (entered, reading) = oneshot::channel();
+    let (release, wait) = oneshot::channel();
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        let _ = entered.send(());
+        let _ = wait.await;
+        Ok::<_, std::io::Error>(Bytes::from_static(b"invalid encrypted package"))
+    }));
+    let first = tokio::spawn(import_enterprise(
+        State(app_state.clone()),
+        authorized_headers(),
+        body,
+    ));
+    tokio::time::timeout(Duration::from_secs(5), reading)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (second_entered, mut second_reading) = oneshot::channel();
+    let bytes = export_bytes("synthetic queued import", Uuid::new_v4(), "queued");
+    let second_body = Body::from_stream(futures_util::stream::once(async move {
+        let _ = second_entered.send(());
+        Ok::<_, std::io::Error>(Bytes::from(bytes))
+    }));
+    let second = tokio::spawn(import_json(
+        State(app_state.clone()),
+        authorized_headers(),
+        second_body,
+    ));
+    // Authentication and unrelated async work remain available while an
+    // authenticated upload is holding the shared admission slot.
+    let unauthorized = tokio::time::timeout(
+        Duration::from_secs(1),
+        import_json(State(app_state.clone()), HeaderMap::new(), Body::empty()),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(unauthorized.status, StatusCode::UNAUTHORIZED);
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        second_reading.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(app_state.import_slots.available_permits(), 0);
+
+    release.send(()).unwrap();
+    assert_eq!(
+        first.await.unwrap().unwrap_err().body.code,
+        "INVALID_CLIENT_EXPORT"
+    );
+    let imported = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(imported.inserted, 1);
+    second_reading.await.unwrap();
+    assert_eq!(app_state.import_slots.available_permits(), 1);
+    assert_eq!(
+        std::fs::read_dir(directory.0.join("imports"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_receiving_import_cleans_partial_files_and_releases_its_slot() {
+    for enterprise in [false, true] {
+        let directory = TestDirectory::new();
+        let app_state = state(&directory);
+        let (entered, reading) = tokio::sync::oneshot::channel();
+        let body = Body::from_stream(futures_util::stream::once(async move {
+            let _ = entered.send(());
+            std::future::pending::<Result<axum::body::Bytes, std::io::Error>>().await
+        }));
+        let import_state = app_state.clone();
+        let task = tokio::spawn(async move {
+            if enterprise {
+                import_enterprise(State(import_state), authorized_headers(), body).await
+            } else {
+                import_json(State(import_state), authorized_headers(), body).await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), reading)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(directory.0.join("imports"))
+                .unwrap()
+                .count(),
+            1
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(app_state.import_slots.available_permits(), 1);
+        assert_eq!(
+            std::fs::read_dir(directory.0.join("imports"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn encrypted_import_keeps_integrity_checks_and_cleans_success_and_failure_files() {
+    let directory = TestDirectory::new();
+    let app_state = state(&directory);
+    let bytes = export_bytes("synthetic encrypted import", Uuid::new_v4(), "encrypted");
+    let export: ClientExportV1 = serde_json::from_slice(&bytes).unwrap();
+    let config = app_state.enterprise_config.lock().unwrap().clone();
+    let public_key = decode_hex(&config.public_key_hex).unwrap();
+    let encrypted = enterprise_crypto::encrypt(&public_key, &bytes).unwrap();
+    let package = archive_transfer::create_enterprise_package(
+        &export,
+        &config.organization_id,
+        &config.key_id,
+        &encrypted.wrapped_dek,
+        &encrypted.nonce,
+        &encrypted.ciphertext,
+        &encrypted.tag,
+    )
+    .unwrap();
+    let mut modified: serde_json::Value = serde_json::from_slice(&package).unwrap();
+    modified["plaintext_sha256"] = json!("00");
+    let error = import_enterprise(
+        State(app_state.clone()),
+        authorized_headers(),
+        Body::from(serde_json::to_vec(&modified).unwrap()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.body.code, "INVALID_CLIENT_EXPORT");
+    let imported = import_enterprise(
+        State(app_state.clone()),
+        authorized_headers(),
+        Body::from(package),
+    )
+    .await
+    .unwrap();
+    assert_eq!(imported.inserted, 1);
+    assert_eq!(app_state.import_slots.available_permits(), 1);
+    assert_eq!(
+        std::fs::read_dir(directory.0.join("imports"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn rejects_conflicting_batch_identifier() {
     let directory = TestDirectory::new();
     let app_state = state(&directory);
@@ -1370,7 +1531,7 @@ fn concurrent_media_persistence_is_idempotent() {
 }
 
 #[tokio::test]
-async fn export_options_reach_both_writers_and_keep_full_local_json_importable() {
+async fn export_options_reach_both_writers_and_keep_full_json_importable() {
     let directory = TestDirectory::new();
     let mut app_state = state(&directory);
     enable_super_admin(&app_state);
@@ -1428,9 +1589,8 @@ async fn export_options_reach_both_writers_and_keep_full_local_json_importable()
                     assert!(!text.contains("participant-fixture"));
                     assert!(!text.contains("raw_payload"));
                     assert!(!text.contains("participants"));
-                } else if local {
-                    assert_eq!(read_json(&path).unwrap().message_count, 1);
                 } else {
+                    assert_eq!(read_json(&path).unwrap().message_count, 1);
                     assert_eq!(
                         document["conversations"][0]["conversation_id"],
                         "conversation-fixture"
@@ -1455,6 +1615,280 @@ fn legacy_export_requests_default_to_full_compact_output() {
     let server: ExportRequest =
         serde_json::from_value(json!({"scope":"entire_archive", "format":"json"})).unwrap();
     assert!(!local.simplify && !local.pretty && !server.simplify && !server.pretty);
+}
+
+#[tokio::test]
+async fn complete_server_json_roundtrips_filtered_batches_directory_and_precise_messages() {
+    let directory = TestDirectory::new();
+    let app_state = state(&directory);
+    enable_super_admin(&app_state);
+    let original: ClientExportV1 =
+        serde_json::from_slice(&export_bytes("合成记录", Uuid::new_v4(), "original-batch"))
+            .unwrap();
+    let mut batch = original.batches[0].clone();
+    let template = batch.messages[0].clone();
+    batch.retention.legal_hold = true;
+    batch.messages = (0..4205)
+        .map(|i| {
+            let mut m = template.clone();
+            m.stable_message_id = format!("roundtrip-{i:05}");
+            m.source_message_id = m.stable_message_id.clone();
+            m.conversation_id = if i % 2 == 0 {
+                "conversation-fixture"
+            } else {
+                "other-conversation"
+            }
+            .into();
+            m.sent_at += TimeDelta::microseconds(i);
+            m.raw_payload =
+                json!({"local_path": r"D:\SyntheticFixture\file.txt", "text": "合成记录"});
+            if i == 0 {
+                m.body_text = Some("账号密码：synthetic-credential-for-test".into());
+            }
+            if i == 1 {
+                m.media.push(archive_domain::MediaRefV1 {
+                    content_hash: None,
+                    original_name: Some("missing.txt".into()),
+                    mime_type: Some("text/plain".into()),
+                    size_bytes: None,
+                    source_locator: "synthetic".into(),
+                    integrity: archive_domain::MediaIntegrity::Missing,
+                    missing_reason: Some("synthetic missing".into()),
+                });
+            }
+            m
+        })
+        .collect();
+    let mut conversations = original.conversations.clone();
+    conversations[0]
+        .participant_ids
+        .push("silent-member".into());
+    conversations.push(ConversationV1 {
+        conversation_id: "other-conversation".into(),
+        display_name: Some("另一个合成会话".into()),
+        conversation_type: Some("group".into()),
+        participant_ids: vec!["participant-fixture".into()],
+    });
+    let mut participants = original.participants;
+    participants.push(ParticipantV1 {
+        participant_id: "silent-member".into(),
+        display_name: Some("未发言成员".into()),
+        participant_kind: Some("employee".into()),
+    });
+    let export =
+        create_export("fixture", vec![batch.clone()], conversations, participants).unwrap();
+    let _ = import_json(
+        State(app_state.clone()),
+        authorized_headers(),
+        Body::from(serde_json::to_vec(&export).unwrap()),
+    )
+    .await
+    .unwrap();
+    let mut revision = batch.clone();
+    revision.batch_id = Uuid::new_v4();
+    revision.content_sha256 = "revision-batch".into();
+    revision.messages = vec![export.batches[0].messages[2].clone()];
+    revision.messages[0].collection_batch_id = revision.batch_id;
+    revision.messages[0].body_text = Some("合成修订记录".into());
+    let update = create_export(
+        "fixture",
+        vec![revision.clone()],
+        export.conversations.clone(),
+        export.participants.clone(),
+    )
+    .unwrap();
+    let _ = import_json(
+        State(app_state.clone()),
+        authorized_headers(),
+        Body::from(serde_json::to_vec(&update).unwrap()),
+    )
+    .await
+    .unwrap();
+    for (scope, pretty, order, redaction) in [
+        ("entire_archive", false, "ascending", false),
+        ("current_conversation", true, "descending", false),
+        ("current_filter", false, "ascending", false),
+        ("selected_conversations", true, "descending", false),
+        ("date_range", false, "ascending", true),
+    ] {
+        let request = json!({"scope":scope,"format":"json","simplify":false,"pretty":pretty,"dataRedaction":redaction,"messageOrder":order,"conversationId":"conversation-fixture","conversationIds":["other-conversation"],"participantId":"participant-fixture","text":if scope=="current_filter" {"修订"} else {""},"startDate":"2026-01-02","endDate":"2026-01-02"});
+        let response = create_export_job(
+            State(app_state.clone()),
+            authorized_headers(),
+            Json(serde_json::from_value(request).unwrap()),
+        )
+        .await
+        .unwrap();
+        let path = directory.0.join("exports").join(&response.file_name);
+        let imported = read_json(&path).unwrap();
+        let expected = match scope {
+            "current_conversation" => 2103,
+            "current_filter" => 1,
+            "selected_conversations" => 2102,
+            _ => 4205,
+        };
+        assert_eq!(imported.message_count, expected);
+        assert_eq!(imported.message_count, response.message_count);
+        assert!(imported.batches.iter().all(|b| b.retention.legal_hold
+            && b.employee_notice == batch.employee_notice
+            && b.cursor_after == batch.cursor_after));
+        if scope != "selected_conversations" {
+            assert!(
+                imported
+                    .participants
+                    .iter()
+                    .any(|p| p.participant_id == "silent-member"
+                        && p.display_name.as_deref() == Some("未发言成员"))
+            );
+        }
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            document["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["messages"].as_array().unwrap().len() as u64)
+                .sum::<u64>(),
+            expected
+        );
+        for c in document["conversations"].as_array().unwrap() {
+            let messages = c["messages"].as_array().unwrap();
+            assert!(messages.windows(2).all(|pair| {
+                let a = DateTime::parse_from_rfc3339(pair[0]["sent_at"].as_str().unwrap()).unwrap();
+                let b = DateTime::parse_from_rfc3339(pair[1]["sent_at"].as_str().unwrap()).unwrap();
+                if order == "ascending" { a <= b } else { a >= b }
+            }));
+        }
+        let fresh = TestDirectory::new();
+        let fresh_state = state(&fresh);
+        let bytes = std::fs::read(&path).unwrap();
+        let loaded = import_json(
+            State(fresh_state.clone()),
+            authorized_headers(),
+            Body::from(bytes.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.inserted, expected);
+        let duplicate = import_json(
+            State(fresh_state),
+            authorized_headers(),
+            Body::from(bytes.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(duplicate.unchanged, expected);
+        assert_eq!(duplicate.revised, 0);
+        if !redaction {
+            let unchanged = import_json(
+                State(app_state.clone()),
+                authorized_headers(),
+                Body::from(bytes),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (unchanged.inserted, unchanged.unchanged, unchanged.revised),
+                (0, expected, 0)
+            );
+        } else {
+            assert!(
+                !String::from_utf8(bytes)
+                    .unwrap()
+                    .contains("synthetic-credential-for-test")
+            );
+        }
+        let mut tampered = document;
+        tampered["batches"][0]["messages"][0]["body_text"] = json!("tampered");
+        assert!(
+            archive_transfer::read_json_slice(&serde_json::to_vec(&tampered).unwrap()).is_err()
+        );
+        assert!(
+            !std::fs::read_dir(directory.0.join("exports"))
+                .unwrap()
+                .any(|p| p
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|e| e == "partial"))
+        );
+    }
+}
+
+#[test]
+fn complete_server_json_cleans_cancelled_streams_and_preserves_existing_files() {
+    let directory = TestDirectory::new();
+    let path = directory.0.join("archive.db");
+    let mut store = ArchiveStore::open(&path).unwrap();
+    let mut export: ClientExportV1 =
+        serde_json::from_slice(&export_bytes("取消测试", Uuid::new_v4(), "cancel-batch")).unwrap();
+    let template = export.batches[0].messages[0].clone();
+    export.batches[0].messages = (0..300)
+        .map(|i| {
+            let mut m = template.clone();
+            m.source_message_id = format!("cancel-{i}");
+            m.stable_message_id = m.source_message_id.clone();
+            m
+        })
+        .collect();
+    store.ingest_batch(&export.batches[0]).unwrap();
+    store
+        .upsert_directory(&export.conversations, &export.participants)
+        .unwrap();
+    let source = ArchiveExportSource::new(&store, ArchiveExportOptions::default()).unwrap();
+    let output = directory.0.join("out");
+    std::fs::create_dir(&output).unwrap();
+    let target = output.join("archive.json");
+    for cancel_stage in ["writing", "finalizing"] {
+        let cancelled = AtomicBool::new(false);
+        let result = crate::service::export_importable_json(
+            &store,
+            &source,
+            &target,
+            false,
+            &cancelled,
+            &mut |_, _, stage| {
+                if stage == cancel_stage {
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(archive_export::ExportError::Cancelled)
+        ));
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 0);
+    }
+    let partial = output.join("archive.json.partial");
+    std::fs::write(&partial, b"other writer").unwrap();
+    assert!(
+        crate::service::export_importable_json(
+            &store,
+            &source,
+            &target,
+            false,
+            &AtomicBool::new(false),
+            &mut |_, _, _| {}
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&partial).unwrap(), b"other writer");
+    std::fs::remove_file(partial).unwrap();
+    std::fs::write(&target, b"completed file").unwrap();
+    assert!(matches!(
+        crate::service::export_importable_json(
+            &store,
+            &source,
+            &target,
+            false,
+            &AtomicBool::new(false),
+            &mut |_, _, _| {}
+        ),
+        Err(archive_export::ExportError::TargetExists)
+    ));
+    assert_eq!(std::fs::read(target).unwrap(), b"completed file");
+    assert_eq!(std::fs::read_dir(output).unwrap().count(), 1);
 }
 
 #[test]
