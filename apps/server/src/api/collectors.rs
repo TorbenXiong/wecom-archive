@@ -61,14 +61,16 @@ pub(crate) async fn update_super_admin(
     Json(request): Json<SuperAdminRequest>,
 ) -> Result<Json<SuperAdminResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     config.super_admin_enabled = request.enabled;
     persist_enterprise_config(&state.data_root, &config)?;
+    *current = config;
     Ok(Json(SuperAdminResponse {
-        super_admin_enabled: config.super_admin_enabled,
+        super_admin_enabled: current.super_admin_enabled,
     }))
 }
 
@@ -80,10 +82,11 @@ pub(crate) async fn create_local_collection_plan(
     authorize(&headers, &state.token_sha256)?;
     request.schedule.validate()?;
     let name = validate_plan_name(&request.name)?;
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     let now = Utc::now().to_rfc3339();
     config.local_collection_plans.push(LocalCollectionPlan {
         id: Uuid::new_v4().to_string(),
@@ -97,8 +100,9 @@ pub(crate) async fn create_local_collection_plan(
         last_detail: None,
     });
     persist_enterprise_config(&state.data_root, &config)?;
+    *current = config;
     Ok(Json(collection_schedules_response(
-        &config,
+        &current,
         &state.data_root,
     )))
 }
@@ -112,10 +116,11 @@ pub(crate) async fn update_local_collection_plan(
     authorize(&headers, &state.token_sha256)?;
     request.schedule.validate()?;
     let name = validate_plan_name(&request.name)?;
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     let plan = config
         .local_collection_plans
         .iter_mut()
@@ -126,8 +131,9 @@ pub(crate) async fn update_local_collection_plan(
     plan.schedule = request.schedule;
     plan.updated_at = Utc::now().to_rfc3339();
     persist_enterprise_config(&state.data_root, &config)?;
+    *current = config;
     Ok(Json(collection_schedules_response(
-        &config,
+        &current,
         &state.data_root,
     )))
 }
@@ -138,10 +144,11 @@ pub(crate) async fn delete_local_collection_plan(
     headers: HeaderMap,
 ) -> Result<Json<CollectionSchedulesResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     let previous_len = config.local_collection_plans.len();
     config
         .local_collection_plans
@@ -151,8 +158,9 @@ pub(crate) async fn delete_local_collection_plan(
     }
     config.local_collection_cursors.remove(&plan_id);
     persist_enterprise_config(&state.data_root, &config)?;
+    *current = config;
     Ok(Json(collection_schedules_response(
-        &config,
+        &current,
         &state.data_root,
     )))
 }
@@ -181,10 +189,11 @@ pub(crate) async fn update_enterprise_config(
     if let Some(schedule) = &request.collector_schedule {
         schedule.validate()?;
     }
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     if let Some(key_id) = request
         .key_id
         .map(|value| value.trim().to_owned())
@@ -215,14 +224,6 @@ pub(crate) async fn update_enterprise_config(
     config.hidden_mode_enabled = request.hidden_mode_enabled;
     config.server_log_level = normalize_log_level(&request.server_log_level);
     config.collector_log_level = normalize_log_level(&request.collector_log_level);
-    diagnostics::set_level(&config.server_log_level);
-    diagnostics::write(
-        "enterprise_config_update",
-        &format!(
-            "hidden_mode={};include_media={}",
-            config.hidden_mode_enabled, request.include_media
-        ),
-    );
     if let Some(enabled) = request.super_admin_enabled {
         config.super_admin_enabled = enabled;
     }
@@ -233,7 +234,16 @@ pub(crate) async fn update_enterprise_config(
         config.collector_schedule = schedule;
     }
     persist_enterprise_config(&state.data_root, &config)?;
-    Ok(Json(enterprise_config_response(&config)))
+    *current = config;
+    diagnostics::set_level(&current.server_log_level);
+    diagnostics::write(
+        "enterprise_config_update",
+        &format!(
+            "hidden_mode={};include_media={}",
+            current.hidden_mode_enabled, request.include_media
+        ),
+    );
+    Ok(Json(enterprise_config_response(&current)))
 }
 
 pub(crate) async fn rotate_enterprise_key(
@@ -241,10 +251,11 @@ pub(crate) async fn rotate_enterprise_key(
     headers: HeaderMap,
 ) -> Result<Json<EnterpriseConfigResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     preserve_current_key_if_used(&mut config);
     let (public_key, private_key) =
         enterprise_crypto::generate_rsa_key_pair().map_err(|_| ApiError::store())?;
@@ -253,7 +264,8 @@ pub(crate) async fn rotate_enterprise_key(
     config.private_key_protected_hex =
         encode_hex(&dpapi_protect::protect(&private_key).map_err(|_| ApiError::store())?);
     persist_enterprise_config(&state.data_root, &config)?;
-    Ok(Json(enterprise_config_response(&config)))
+    *current = config;
+    Ok(Json(enterprise_config_response(&current)))
 }
 
 pub(crate) async fn generate_collector(
@@ -261,10 +273,11 @@ pub(crate) async fn generate_collector(
     headers: HeaderMap,
 ) -> Result<Json<CollectorResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     if config.organization_name.trim().is_empty()
         || config.public_key_hex.is_empty()
         || config.private_key_protected_hex.is_empty()
@@ -391,12 +404,10 @@ pub(crate) async fn generate_collector(
         record.file_name = file_name.clone();
         config.collectors.push(record);
         if let Err(error) = persist_enterprise_config(&state.data_root, &config) {
-            config
-                .collectors
-                .retain(|collector| collector.collector_id != collector_id);
             let _ = std::fs::remove_file(&executable_path);
             return Err(error);
         }
+        *current = config;
         diagnostics::write("collector_generate_completed", "executable=true");
     } else {
         diagnostics::write("collector_generate_completed", "executable=false");
@@ -404,7 +415,7 @@ pub(crate) async fn generate_collector(
     Ok(Json(CollectorResponse {
         file_name,
         directory: collector_root.display().to_string(),
-        organization_id: config.organization_id.clone(),
+        organization_id: current.organization_id.clone(),
         key_id,
         collector_id,
         artifact: artifact_text,
@@ -484,10 +495,11 @@ pub(crate) async fn collector_heartbeat(
             request.current_config_revision.unwrap_or_default()
         ),
     );
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     // Multiple devices can share one NAT or proxy address. Only the authenticated
     // collector identity may be updated; retiring other identities is explicit.
     let snapshot = {
@@ -524,6 +536,27 @@ pub(crate) async fn collector_heartbeat(
         collector.clone()
     };
     let collector_diagnostics = request.diagnostics;
+    let should_send = request.current_config_revision.unwrap_or(0) < snapshot.config_revision;
+    let control = if should_send {
+        Some(signed_collector_control(
+            &config,
+            collector_desired_config(&config, &snapshot),
+        )?)
+    } else {
+        None
+    };
+    let response = CollectorHeartbeatResponse {
+        software_update: crate::signed_software_update(&config, &snapshot)?,
+        status: if snapshot.enabled {
+            "ok".into()
+        } else {
+            "disabled".into()
+        },
+        config: control.as_ref().map(|value| value.config.clone()),
+        control,
+    };
+    persist_enterprise_config(&state.data_root, &config)?;
+    *current = config;
     for event in collector_diagnostics.into_iter().take(100) {
         let event_name = event.event.trim();
         if event_name.is_empty() {
@@ -535,16 +568,6 @@ pub(crate) async fn collector_heartbeat(
         );
         diagnostics::collector(&snapshot.collector_id, event_name, &details);
     }
-    persist_enterprise_config(&state.data_root, &config)?;
-    let should_send = request.current_config_revision.unwrap_or(0) < snapshot.config_revision;
-    let control = if should_send {
-        Some(signed_collector_control(
-            &config,
-            collector_desired_config(&config, &snapshot),
-        )?)
-    } else {
-        None
-    };
     diagnostics::write(
         "collector_heartbeat_response",
         &format!(
@@ -552,16 +575,7 @@ pub(crate) async fn collector_heartbeat(
             should_send, snapshot.hidden_mode_enabled, snapshot.config_revision
         ),
     );
-    Ok(Json(CollectorHeartbeatResponse {
-        software_update: crate::signed_software_update(&config, &snapshot)?,
-        status: if snapshot.enabled {
-            "ok".into()
-        } else {
-            "disabled".into()
-        },
-        config: control.as_ref().map(|value| value.config.clone()),
-        control,
-    }))
+    Ok(Json(response))
 }
 
 pub(crate) async fn get_collector(
@@ -595,10 +609,11 @@ pub(crate) async fn update_collector(
     authorize(&headers, &state.token_sha256)?;
     let display_name = validate_plan_name(&request.display_name)?;
     request.schedule.validate()?;
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     let collector = config
         .collectors
         .iter_mut()
@@ -617,13 +632,14 @@ pub(crate) async fn update_collector(
     collector.schedule = request.schedule;
     collector.config_revision = collector.config_revision.saturating_add(1);
     persist_enterprise_config(&state.data_root, &config)?;
-    let snapshot = config
+    *current = config;
+    let snapshot = current
         .collectors
         .iter()
         .find(|item| item.collector_id == collector_id)
         .ok_or_else(ApiError::invalid_query)?;
     Ok(Json(
-        serde_json::json!({ "config": collector_desired_config(&config, snapshot), "status": "updated" }),
+        serde_json::json!({ "config": collector_desired_config(&current, snapshot), "status": "updated" }),
     ))
 }
 
@@ -633,10 +649,11 @@ pub(crate) async fn revoke_collector(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     let collector = config
         .collectors
         .iter_mut()
@@ -646,6 +663,7 @@ pub(crate) async fn revoke_collector(
     collector.revoked_at = Some(Utc::now().to_rfc3339());
     collector.config_revision = collector.config_revision.saturating_add(1);
     persist_enterprise_config(&state.data_root, &config)?;
+    *current = config;
     Ok(Json(serde_json::json!({ "revoked": true })))
 }
 
@@ -655,10 +673,11 @@ pub(crate) async fn request_collector_collection(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     let collector = config
         .collectors
         .iter_mut()
@@ -671,6 +690,7 @@ pub(crate) async fn request_collector_collection(
     collector.manual_collection_request_id = Some(request_id.clone());
     collector.config_revision = collector.config_revision.saturating_add(1);
     persist_enterprise_config(&state.data_root, &config)?;
+    *current = config;
     Ok(Json(
         serde_json::json!({ "queued": true, "requestId": request_id }),
     ))

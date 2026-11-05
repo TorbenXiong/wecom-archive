@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 use super::*;
 
+mod settings;
+
 #[test]
 fn only_source_discovery_failures_offer_a_custom_root_retry() {
     assert!(is_local_source_not_found(
@@ -47,6 +49,61 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 const TEST_TOKEN: &str = "0123456789abcdefghijklmnop";
+
+#[cfg(windows)]
+#[tokio::test]
+async fn failed_setting_save_preserves_runtime_and_disk_until_retry_succeeds() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let directory = TestDirectory::new();
+    let app_state = state(&directory);
+    let before = app_state.enterprise_config.lock().unwrap().clone();
+    persist_enterprise_config(&directory.0, &before).unwrap();
+    let path = directory.0.join(ENTERPRISE_CONFIG_FILE);
+    let disk_before = std::fs::read(&path).unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&path)
+        .unwrap();
+    let error = update_super_admin(
+        State(app_state.clone()),
+        authorized_headers(),
+        Json(SuperAdminRequest { enabled: false }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        app_state
+            .enterprise_config
+            .lock()
+            .unwrap()
+            .super_admin_enabled,
+        "failed save changed the active setting"
+    );
+    assert!(std::fs::read(&path).unwrap() == disk_before);
+    drop(locked);
+    let response = update_super_admin(
+        State(app_state.clone()),
+        authorized_headers(),
+        Json(SuperAdminRequest { enabled: false }),
+    )
+    .await
+    .unwrap();
+    assert!(!response.super_admin_enabled);
+    assert!(
+        !app_state
+            .enterprise_config
+            .lock()
+            .unwrap()
+            .super_admin_enabled
+    );
+    assert!(
+        !load_enterprise_config(&directory.0)
+            .unwrap()
+            .super_admin_enabled
+    );
+}
 
 #[test]
 fn enterprise_config_initialization_and_recovery_preserve_identity() {

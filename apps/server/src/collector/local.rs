@@ -151,12 +151,15 @@ pub(crate) fn update_local_plan_result(
     started_at: chrono::DateTime<Utc>,
     result: &Result<Json<ImportResponse>, ApiError>,
 ) {
-    if let Ok(mut config) = state.enterprise_config.lock()
-        && let Some(plan) = config
+    if let Ok(mut current) = state.enterprise_config.lock() {
+        let mut config = current.clone();
+        let Some(plan) = config
             .local_collection_plans
             .iter_mut()
             .find(|plan| plan.id == plan_id)
-    {
+        else {
+            return;
+        };
         if result.is_ok() {
             plan.last_run_at = Some(Utc::now().to_rfc3339());
         }
@@ -171,7 +174,13 @@ pub(crate) fn update_local_plan_result(
                 .local_collection_cursors
                 .insert(plan_id.to_owned(), started_at.to_rfc3339());
         }
-        let _ = persist_enterprise_config(&state.data_root, &config);
+        match persist_enterprise_config(&state.data_root, &config) {
+            Ok(()) => *current = config,
+            Err(_) => crate::diagnostics::write(
+                "local_plan_state_persist_failed",
+                "code=ARCHIVE_STORE_FAILED",
+            ),
+        }
     }
 }
 

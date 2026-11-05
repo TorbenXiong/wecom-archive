@@ -59,14 +59,23 @@ pub(crate) async fn import_enterprise(
         let result = ingest_export_blocking(&import_state, export);
         if let Ok(response) = &result
             && let Some(collector_id) = collector_id
-            && let Ok(mut config) = import_state.enterprise_config.lock()
-            && let Some(collector) = config
+            && let Ok(mut current) = import_state.enterprise_config.lock()
+        {
+            let mut config = current.clone();
+            if let Some(collector) = config
                 .collectors
                 .iter_mut()
                 .find(|collector| collector.collector_id == collector_id)
-        {
-            collector.last_upload_at = Some(response.0.completed_at.clone());
-            let _ = persist_enterprise_config(&import_state.data_root, &config);
+            {
+                collector.last_upload_at = Some(response.0.completed_at.clone());
+                match persist_enterprise_config(&import_state.data_root, &config) {
+                    Ok(()) => *current = config,
+                    Err(_) => crate::diagnostics::write(
+                        "collector_upload_state_persist_failed",
+                        "code=ARCHIVE_STORE_FAILED",
+                    ),
+                }
+            }
         }
         result
     })

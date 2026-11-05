@@ -1,6 +1,6 @@
 use crate::{
     AccessTokenRequest, AccessTokenResponse, ApiError, AppState, HealthResponse,
-    RegeneratedAccessTokenResponse, authorize, embedded_asset, persist_access_token,
+    RegeneratedAccessTokenResponse, authorize_token_hash, embedded_asset, persist_access_token,
     random_access_token,
 };
 use axum::Json;
@@ -30,15 +30,16 @@ pub(crate) async fn update_access_token(
     headers: HeaderMap,
     Json(request): Json<AccessTokenRequest>,
 ) -> Result<Json<AccessTokenResponse>, ApiError> {
-    authorize(&headers, &state.token_sha256)?;
+    // Serialize authentication, file replacement and the active hash switch.
+    let mut expected = state.token_sha256.lock().map_err(|_| ApiError::store())?;
+    authorize_token_hash(&headers, &expected)?;
     let token = request.access_token.trim();
     if token.len() < 24 {
         return Err(ApiError::invalid_query());
     }
     persist_access_token(&state.access_token_path, token.as_bytes())
         .map_err(|_| ApiError::store())?;
-    *state.token_sha256.lock().map_err(|_| ApiError::store())? =
-        Sha256::digest(token.as_bytes()).into();
+    *expected = Sha256::digest(token.as_bytes()).into();
     Ok(Json(AccessTokenResponse { updated: true }))
 }
 
@@ -46,12 +47,12 @@ pub(crate) async fn regenerate_access_token(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<RegeneratedAccessTokenResponse>, ApiError> {
-    authorize(&headers, &state.token_sha256)?;
+    let mut expected = state.token_sha256.lock().map_err(|_| ApiError::store())?;
+    authorize_token_hash(&headers, &expected)?;
     let token = random_access_token();
     persist_access_token(&state.access_token_path, token.as_bytes())
         .map_err(|_| ApiError::store())?;
-    *state.token_sha256.lock().map_err(|_| ApiError::store())? =
-        Sha256::digest(token.as_bytes()).into();
+    *expected = Sha256::digest(token.as_bytes()).into();
     Ok(Json(RegeneratedAccessTokenResponse {
         access_token: token,
     }))
