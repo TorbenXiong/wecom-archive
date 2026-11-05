@@ -140,6 +140,74 @@ fn run() -> Result<()> {
     let store = ArchiveStore::open_read_only(&path)?;
     let mut metrics = BTreeMap::new();
     let mut plans = BTreeMap::new();
+    if std::env::args().nth(2).as_deref() == Some("ordered-probe") {
+        let mut metrics = BTreeMap::new();
+        let mut plans = BTreeMap::new();
+        // Restrict the ordered prefix before testing text, but fall back when
+        // it cannot fill the page. No candidate outside the prefix is discarded.
+        let probe_sql = "WITH window AS MATERIALIZED (
+            SELECT rowid AS message_rowid, sent_at, stable_message_id FROM messages
+            ORDER BY sent_at DESC, stable_message_id DESC LIMIT 4096
+         ) SELECT m.payload_json FROM window w JOIN messages m ON m.rowid=w.message_rowid
+         WHERE CASE WHEN m.body_text LIKE ?2 ESCAPE '\\' THEN 1
+           WHEN m.stable_message_id IN (
+             SELECT stable_message_id FROM message_fts WHERE message_fts MATCH ?1
+           ) THEN 1 ELSE m.stable_message_id IN (
+             SELECT mm.stable_message_id FROM message_media mm
+             WHERE mm.media_id IN (SELECT media_id FROM media WHERE original_name LIKE ?2 ESCAPE '\\')
+           ) END
+         ORDER BY w.sent_at DESC, w.stable_message_id DESC LIMIT 50";
+        for term in [
+            "synthetic",
+            "thetic",
+            "synthetic-file",
+            "benchmarkneedle",
+            "absentneedle",
+        ] {
+            let parameters = [format!("\"{term}\""), format!("%{term}%")];
+            let query = MessageQuery {
+                text: Some(term.into()),
+                limit: 50,
+                ..Default::default()
+            };
+            let expected = store.query_messages(&query)?;
+            let probe = || -> Result<Vec<MessageV1>> {
+                let page = ids(
+                    &connection,
+                    probe_sql,
+                    params![parameters[0], parameters[1]],
+                )?
+                .into_iter()
+                .map(|text| serde_json::from_str(&text))
+                .collect::<std::result::Result<Vec<MessageV1>, _>>()?;
+                if page.len() == 50 {
+                    Ok(page)
+                } else {
+                    Ok(store.query_messages(&query)?)
+                }
+            };
+            assert_eq!(probe()?, expected);
+            plans.insert(
+                term,
+                plan(
+                    &connection,
+                    probe_sql,
+                    params![parameters[0], parameters[1]],
+                )?,
+            );
+            metrics.insert(
+                format!("{term}_current"),
+                sample(|| Ok(store.query_messages(&query)?))?,
+            );
+            metrics.insert(format!("{term}_probe_with_fallback"), sample(probe)?);
+        }
+        println!(
+            "{}",
+            json!({"messages": count, "metrics": metrics, "plans": plans,
+            "notes": "synthetic SQL fixture; includes deserialization and insufficient-prefix fallback; no HTTP"})
+        );
+        return Ok(());
+    }
     let fts_sql = "SELECT stable_message_id FROM message_fts WHERE message_fts MATCH ?1";
     let media_sql = "SELECT mm.stable_message_id FROM media media_search
         JOIN message_media mm ON mm.media_id = media_search.media_id

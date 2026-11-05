@@ -2,11 +2,13 @@ import { ArrowRight, Download, HardDriveDownload, LoaderCircle, MessageSquareTex
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type { ConversationSummary, MessageType } from "../domain/types";
 import { conversationKindLabel } from "../domain/conversations";
+import { ConversationLoadMore, type ConversationPaging } from "./ConversationLoadMore";
 import { listConversationParticipants, searchMessages, type CollectedUser, type GlobalSearchResult, type ServerParticipant } from "../lib/server-api";
 
 interface ConversationListProps {
   token: string;
   conversations: ConversationSummary[];
+  paging?: ConversationPaging;
   selectedId: string;
   messageSortAscending?: boolean;
   superAdminEnabled?: boolean;
@@ -24,6 +26,7 @@ interface ConversationListProps {
 export function ConversationList({
   token,
   conversations,
+  paging,
   selectedId,
   messageSortAscending = false,
   onSelect,
@@ -60,6 +63,9 @@ export function ConversationList({
   const [showCollectedUsers, setShowCollectedUsers] = useState(false);
   const searchKey = useRef("");
   const locateController = useRef<AbortController | undefined>(undefined);
+  const selectedFilterConversation = useRef<ConversationSummary | undefined>(undefined);
+  const filterConversation = conversations.find((item) => item.id === searchConversation);
+  if (filterConversation) selectedFilterConversation.current = filterConversation;
   const hasFilters = Boolean(searchConversation || searchParticipant || searchType || searchMediaOnly || searchStartsAt || searchEndsAt);
   const hasCriteria = Boolean(deferredSearch || hasFilters);
 
@@ -215,7 +221,11 @@ export function ConversationList({
         </div>}
       </div>
 
-      <div className="conversation-scroll">
+      <div className="conversation-scroll" onScroll={(event) => {
+        const element = event.currentTarget;
+        if (paging?.hasMore && !paging.loading && !paging.error && element.clientHeight > 0
+          && element.scrollHeight - element.scrollTop - element.clientHeight < 240) paging.onLoadMore();
+      }}>
         <button className="collected-users-summary" type="button" onClick={() => setShowCollectedUsers(true)}><Users size={15} /><span>已收集 <strong>{collectedUsers.length.toLocaleString("zh-CN")}</strong> 位用户聊天记录</span></button>
         {conversations.length === 0 ? <div className="conversation-empty">尚无归档数据，可采集本机或使用专属采集端。</div> : conversations.map((conversation) => (
           <button
@@ -233,10 +243,11 @@ export function ConversationList({
             {conversation.unread > 0 && <span className="unread-count">{conversation.unread}</span>}
           </button>
         ))}
+        <ConversationLoadMore paging={paging} />
       </div>
 
       <div className="conversation-footer">
-        <span>共 {conversations.length} 个会话</span>
+        <span>共 {paging?.total ?? conversations.length} 个会话</span>
         <div className="conversation-footer-actions">
           {localCollectionAvailable && <div className="collection-action-wrap">
             <button className="conversation-footer-action" disabled={collectingLocal} onClick={onOpenLocalCollection} type="button">
@@ -262,10 +273,11 @@ export function ConversationList({
           <button className="global-search-close" type="button" aria-label="关闭全局搜索" onClick={closeSearch}><X size={20} /></button>
         </header>
         <div className="global-search-filters" aria-label="搜索筛选">
-          <label className="global-search-filter">会话<select aria-label="筛选会话" value={searchConversation} onChange={(event) => { setSearchConversation(event.target.value); setSearchParticipant(""); setSearchOffset(0); }}>
+          <div className="global-search-filter"><div className="global-search-conversation-label"><span>会话</span><ConversationLoadMore paging={paging} compact /></div><select aria-label="筛选会话" value={searchConversation} onChange={(event) => { setSearchConversation(event.target.value); setSearchParticipant(""); setSearchOffset(0); }}>
             <option value="">全部会话</option>
+            {searchConversation && !filterConversation && <option value={searchConversation}>{selectedFilterConversation.current?.title ?? "已选择的会话"}</option>}
             {conversations.map((conversation) => <option key={conversation.id} value={conversation.id}>{conversation.title}</option>)}
-          </select></label>
+          </select></div>
           <label className="global-search-filter">发送人<select aria-label="筛选发送人" value={searchParticipant} disabled={!searchConversation || searchParticipants.length === 0} onChange={(event) => { setSearchParticipant(event.target.value); setSearchOffset(0); }}>
             <option value="">{!searchConversation ? "先选择会话" : "全部发送人"}</option>
             {searchParticipants.map((participant, index) => <option key={participant.participant_id} value={participant.participant_id}>{participant.display_name?.trim() || `成员 ${index + 1}`}</option>)}

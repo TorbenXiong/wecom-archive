@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 浏览、全局搜索和导出会话，展示成员名称、引用消息、群公告、图片和文件；搜索结果可直接定位到原消息。
+- 按需加载、全局搜索和导出会话，展示成员名称、引用消息、群公告、图片和文件；搜索结果与引用消息均可跨页定位到原消息。
 - 立即采集本机文本或完整内容，也可导入专属采集端生成的 `.wca` 文件。
 - 自动读取当前 Windows 用户的企业微信存储目录设置；找不到数据时，可在工作台采集或快速导出中填写本机目录，采集成功后加密记住。
 - 在“采集端管理”中维护本机和远程采集计划，查看在线状态、最近成功、下次执行和配置同步状态。
@@ -41,7 +41,7 @@ crates/export/        JSON/CSV/HTML/Markdown 导出
 
 详细设计见 [`docs/architecture.md`](docs/architecture.md)，安全边界见 [`docs/privacy-security.md`](docs/privacy-security.md)，当前能力见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，验证状态见 [`docs/implementation-status.md`](docs/implementation-status.md)。
 
-本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；当前版本操作见 [0.0.12 人工验收](docs/acceptance-0.0.12.md)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
+本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；当前版本变化见 [0.0.13 版本说明](docs/release-0.0.13.md)，升级操作见 [0.0.13 人工验收](docs/acceptance-0.0.13.md)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
 
 合成数据性能基准见 [`docs/benchmarks.md`](docs/benchmarks.md)，使用 PowerShell 运行 `./scripts/benchmark-archive.ps1`。
 

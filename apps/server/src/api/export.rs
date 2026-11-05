@@ -173,31 +173,43 @@ async fn execute_archive_export(
         };
         let (file_name, target) = next_export_file(&export_root, extension);
         task_for_run.update(35, "写入导出文件");
-        let result = archive_export::export_streamed_with_progress(
-            &package,
-            &source,
-            &target,
-            &task_for_run.cancelled,
-            &mut |done, total, stage| {
-                let percent = if stage == "writing" {
-                    35 + (done.saturating_mul(60) / total.max(1)).min(60) as u8
+        let mut progress = |done: u64, total: u64, stage: &str| {
+            let percent = if stage == "writing" {
+                35 + (done.saturating_mul(60) / total.max(1)).min(60) as u8
+            } else {
+                97
+            };
+            task_for_run.update(
+                percent,
+                if stage == "writing" {
+                    "正在写入导出文件"
                 } else {
-                    97
-                };
-                task_for_run.update(
-                    percent,
-                    if stage == "writing" {
-                        "正在写入导出文件"
-                    } else {
-                        "正在校验并完成文件"
-                    },
-                );
-                if let Ok(mut progress) = task_for_run.progress.lock() {
-                    progress.processed_messages = done;
-                    progress.total_messages = Some(total);
-                }
-            },
-        )
+                    "正在校验并完成文件"
+                },
+            );
+            if let Ok(mut progress) = task_for_run.progress.lock() {
+                progress.processed_messages = done;
+                progress.total_messages = Some(total);
+            }
+        };
+        let result = if matches!(format, ExportFormat::Json) && !request.simplify {
+            crate::service::export_importable_json(
+                &store,
+                &source,
+                &target,
+                request.pretty,
+                &task_for_run.cancelled,
+                &mut progress,
+            )
+        } else {
+            archive_export::export_streamed_with_progress(
+                &package,
+                &source,
+                &target,
+                &task_for_run.cancelled,
+                &mut progress,
+            )
+        }
         .map_err(ApiError::from_export)?;
         Ok::<_, ApiError>((file_name, result))
     })

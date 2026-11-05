@@ -22,6 +22,28 @@ afterEach(() => {
 });
 
 describe("global message search", () => {
+  it("loads the next conversation page near the bottom and pauses automatic retries after failure", () => {
+    const onLoadMore = vi.fn();
+    const props = {
+      token: "synthetic-token", conversations, selectedId: "conversation-1", onSelect: vi.fn(),
+      onOpenSearchResult: vi.fn(), onExport: vi.fn(), localCollectionAvailable: false,
+      collectingLocal: false, onOpenLocalCollection: vi.fn(), importing: false, onImport: vi.fn(),
+    };
+    const paging = { hasMore: true, loading: false, error: "", total: 51, onLoadMore };
+    const { container, rerender } = render(<ConversationList {...props} paging={paging} />);
+    const scroll = container.querySelector(".conversation-scroll")!;
+    Object.defineProperties(scroll, { clientHeight: { value: 400 }, scrollHeight: { value: 1000 } });
+    fireEvent.scroll(scroll, { target: { scrollTop: 100 } });
+    expect(onLoadMore).not.toHaveBeenCalled();
+    fireEvent.scroll(scroll, { target: { scrollTop: 500 } });
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+    rerender(<ConversationList {...props} paging={{ ...paging, error: "synthetic page failure" }} />);
+    fireEvent.scroll(scroll, { target: { scrollTop: 550 } });
+    expect(onLoadMore).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByText("重试加载会话"));
+    expect(onLoadMore).toHaveBeenCalledTimes(2);
+  });
+
   it("selects a sender by name, validates dates and keeps the dialog open after failed positioning", async () => {
     const result = { stable_message_id: "synthetic-result", conversation_id: "conversation-1", sender_name: "测试成员", sent_at: "2026-10-13T00:00:00Z", message_type: "text", body_text: "合成搜索结果", media: [] };
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => String(input).includes("/participants")

@@ -263,15 +263,20 @@ pub fn create_export_with_media(
 fn sanitize_batches(batches: &mut [ArchiveBatchV1]) {
     for batch in batches {
         for message in &mut batch.messages {
-            sanitize_json(&mut message.raw_payload, None);
-            for media in &mut message.media {
-                media.source_locator = media
-                    .content_hash
-                    .as_deref()
-                    .map(|hash| format!("sha256:{hash}"))
-                    .unwrap_or_else(|| "unavailable".into());
-            }
+            sanitize_export_message(message);
         }
+    }
+}
+
+/// Applies the same path sanitization to in-memory and streamed exports.
+pub fn sanitize_export_message(message: &mut archive_domain::MessageV1) {
+    sanitize_json(&mut message.raw_payload, None);
+    for media in &mut message.media {
+        media.source_locator = media
+            .content_hash
+            .as_deref()
+            .map(|hash| format!("sha256:{hash}"))
+            .unwrap_or_else(|| "unavailable".into());
     }
 }
 
@@ -1069,6 +1074,11 @@ fn sanitize_json(value: &mut serde_json::Value, key: Option<&str>) {
                 key.contains("path") || key.contains("local_uri")
             }) =>
         {
+            if text.strip_prefix("redacted:sha256:").is_some_and(|hash| {
+                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                return;
+            }
             let digest = hex::encode(Sha256::digest(text.as_bytes()));
             *text = format!("redacted:sha256:{digest}");
         }
