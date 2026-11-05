@@ -240,13 +240,35 @@ pub(super) fn default_collector_enabled() -> bool {
     true
 }
 
-pub(super) fn load_enterprise_config(root: &Path) -> EnterpriseConfig {
+pub(super) fn load_enterprise_config(root: &Path) -> Result<EnterpriseConfig, String> {
     let path = root.join(ENTERPRISE_CONFIG_FILE);
-    let Some(mut config) = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-    else {
-        return new_enterprise_config();
+    let mut config: EnterpriseConfig = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
+            "服务端配置损坏，已停止启动以保留采集端身份和密钥。请按备份恢复说明恢复 enterprise-config.json。".to_owned()
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for existing in [
+                path.with_extension("json.bak"),
+                path.with_extension("json.partial"),
+                root.join("collectors"),
+            ] {
+                if existing.try_exists().map_err(|_| "无法检查服务端配置恢复状态。")? {
+                    return Err("已有配置副本或采集端，但主配置缺失，已停止启动。请按备份恢复说明恢复 enterprise-config.json。".into());
+                }
+            }
+            // Older local-only installations did not persist the default
+            // enterprise configuration. archive.db alone is not proof of loss.
+            let config = new_enterprise_config();
+            if config.private_key_protected_hex.is_empty()
+                || config.signing_private_key_protected_hex.is_empty()
+            {
+                return Err("服务端密钥初始化失败，未保存新配置。".into());
+            }
+            persist_enterprise_config(root, &config)
+                .map_err(|_| "服务端配置初始化失败，请检查数据目录权限。")?;
+            return Ok(config);
+        }
+        Err(_) => return Err("服务端配置不可读取，请检查数据目录权限。".into()),
     };
     let mut migrated = discard_unused_historical_keys(&mut config);
     if config.collection_notice == LEGACY_COLLECTION_NOTICE {
@@ -273,9 +295,10 @@ pub(super) fn load_enterprise_config(root: &Path) -> EnterpriseConfig {
         migrated = true;
     }
     if migrated {
-        let _ = persist_enterprise_config(root, &config);
+        persist_enterprise_config(root, &config)
+            .map_err(|_| "服务端配置迁移保存失败，原配置已保留。")?;
     }
-    config
+    Ok(config)
 }
 
 pub(super) fn new_enterprise_config() -> EnterpriseConfig {
@@ -417,13 +440,19 @@ pub(super) fn persist_enterprise_config(
     config: &EnterpriseConfig,
 ) -> Result<(), ApiError> {
     let path = root.join(ENTERPRISE_CONFIG_FILE);
-    let partial = path.with_extension("json.partial");
     let bytes = serde_json::to_vec_pretty(config).map_err(|_| ApiError::store())?;
-    std::fs::write(&partial, bytes).map_err(|_| ApiError::store())?;
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|_| ApiError::store())?;
-    }
-    std::fs::rename(&partial, &path).map_err(|_| ApiError::store())
+    let previous = match std::fs::read(&path) {
+        Ok(previous) => {
+            // Do not replace a readable recovery copy with corrupted input.
+            serde_json::from_slice::<EnterpriseConfig>(&previous).map_err(|_| ApiError::store())?;
+            previous
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => bytes.clone(),
+        Err(_) => return Err(ApiError::store()),
+    };
+    source_windows::atomic_file::write(&path.with_extension("json.bak"), &previous)
+        .map_err(|_| ApiError::store())?;
+    source_windows::atomic_file::write(&path, &bytes).map_err(|_| ApiError::store())
 }
 
 pub(super) fn discard_unused_historical_keys(config: &mut EnterpriseConfig) -> bool {
@@ -458,14 +487,28 @@ pub(super) fn preserve_current_key_if_used(config: &mut EnterpriseConfig) {
 }
 
 pub(super) fn load_or_generate_access_token(path: &Path) -> Result<Zeroizing<String>, String> {
-    if path.is_file() {
-        let protected = std::fs::read(path).map_err(|_| "access token file is unavailable")?;
-        let token = dpapi_protect::unprotect(&protected)?;
-        let token = String::from_utf8(token).map_err(|_| "access token file is invalid")?;
-        if token.len() < 24 {
-            return Err("access token is too short".into());
+    match std::fs::read(path) {
+        Ok(protected) => {
+            let token = dpapi_protect::unprotect(&protected)?;
+            let token = String::from_utf8(token).map_err(|_| "access token file is invalid")?;
+            if token.len() < 24 {
+                return Err("access token is too short".into());
+            }
+            return Ok(Zeroizing::new(token));
         }
-        return Ok(Zeroizing::new(token));
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let archive = path.with_file_name("archive.db");
+            let partial = path.with_extension("dpapi.partial");
+            for existing in [archive, partial] {
+                if existing
+                    .try_exists()
+                    .map_err(|_| "access token recovery check failed")?
+                {
+                    return Err("access token is missing; restore it from backup".into());
+                }
+            }
+        }
+        Err(_) => return Err("access token file is unavailable".into()),
     }
     let token = random_access_token();
     persist_access_token(path, token.as_bytes())?;
@@ -489,12 +532,8 @@ pub(super) fn persist_access_token(path: &Path, token: &[u8]) -> Result<(), Stri
         return Err("access token is too short".into());
     }
     let protected = dpapi_protect::protect(token)?;
-    let partial = path.with_extension("dpapi.partial");
-    std::fs::write(&partial, protected).map_err(|_| "access token write failed")?;
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|_| "access token replacement failed")?;
-    }
-    std::fs::rename(partial, path).map_err(|_| "access token publish failed".to_owned())
+    source_windows::atomic_file::write(path, &protected)
+        .map_err(|_| "access token publish failed".to_owned())
 }
 
 pub(super) fn default_data_root() -> PathBuf {

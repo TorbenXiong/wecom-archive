@@ -19,9 +19,26 @@ use source_windows::secrets as dpapi_protect;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::{Instant, timeout, timeout_at};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+const IMPORT_QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
+const IMPORT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const IMPORT_RECEIVE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+pub(crate) async fn acquire_import_slot(
+    state: &AppState,
+    wait: Duration,
+) -> Result<OwnedSemaphorePermit, ApiError> {
+    timeout(wait, Arc::clone(&state.import_slots).acquire_owned())
+        .await
+        .map_err(|_| ApiError::import_busy())?
+        .map_err(|_| ApiError::store())
+}
 
 pub(crate) async fn import_enterprise(
     State(state): State<AppState>,
@@ -30,10 +47,7 @@ pub(crate) async fn import_enterprise(
 ) -> Result<Json<ImportResponse>, ApiError> {
     let collector_id =
         authorize_enterprise_upload(&headers, &state.token_sha256, &state.enterprise_config)?;
-    let permit = Arc::clone(&state.import_slots)
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::store())?;
+    let permit = acquire_import_slot(&state, IMPORT_QUEUE_TIMEOUT).await?;
     let file = ImportFile(receive_package(&state.data_root, body).await?);
     let import_state = state.clone();
     tokio::task::spawn_blocking(move || {
@@ -128,10 +142,7 @@ pub(crate) async fn import_json(
     body: Body,
 ) -> Result<Json<ImportResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
-    let permit = Arc::clone(&state.import_slots)
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::store())?;
+    let permit = acquire_import_slot(&state, IMPORT_QUEUE_TIMEOUT).await?;
     let file = ImportFile(receive_json(&state.data_root, body).await?);
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -321,18 +332,36 @@ pub(crate) async fn receive_json_with_limit(
     body: Body,
     limit: u64,
 ) -> Result<PathBuf, ApiError> {
-    receive_file(root, body, "json", limit).await
+    receive_file(
+        root,
+        body,
+        "json",
+        limit,
+        IMPORT_IDLE_TIMEOUT,
+        IMPORT_RECEIVE_TIMEOUT,
+    )
+    .await
 }
 
 pub(crate) async fn receive_package(root: &Path, body: Body) -> Result<PathBuf, ApiError> {
-    receive_file(root, body, "wca", MAX_CLIENT_EXPORT_BYTES).await
+    receive_file(
+        root,
+        body,
+        "wca",
+        MAX_CLIENT_EXPORT_BYTES,
+        IMPORT_IDLE_TIMEOUT,
+        IMPORT_RECEIVE_TIMEOUT,
+    )
+    .await
 }
 
-async fn receive_file(
+pub(crate) async fn receive_file(
     root: &Path,
     body: Body,
     extension: &str,
     limit: u64,
+    idle_timeout: Duration,
+    total_timeout: Duration,
 ) -> Result<PathBuf, ApiError> {
     let import_root = root.join("imports");
     tokio::fs::create_dir_all(&import_root)
@@ -350,8 +379,24 @@ async fn receive_file(
     let _partial_cleanup = ImportFile(partial.clone());
     let mut received = 0_u64;
     let mut stream = body.into_data_stream();
-    while let Some(next) = stream.next().await {
+    let total_deadline = Instant::now() + total_timeout;
+    let mut idle_deadline = Instant::now() + idle_timeout;
+    loop {
+        let deadline = idle_deadline.min(total_deadline);
+        if Instant::now() >= deadline {
+            return Err(ApiError::import_receive_timeout());
+        }
+        let Some(next) = timeout_at(deadline, stream.next())
+            .await
+            .map_err(|_| ApiError::import_receive_timeout())?
+        else {
+            break;
+        };
         let chunk = next.map_err(|_| ApiError::invalid_export())?;
+        // Empty frames do not count as upload progress.
+        if chunk.is_empty() {
+            continue;
+        }
         received = received.saturating_add(chunk.len() as u64);
         if received > limit {
             return Err(ApiError::too_large());
@@ -360,6 +405,7 @@ async fn receive_file(
             .write_all(&chunk)
             .await
             .map_err(|_| ApiError::store())?;
+        idle_deadline = Instant::now() + idle_timeout;
     }
     if received == 0 || output.sync_all().await.is_err() {
         return Err(ApiError::invalid_export());

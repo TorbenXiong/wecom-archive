@@ -25,15 +25,7 @@ pub fn store_current_user(path: &Path, plaintext: &[u8]) -> Result<(), DpapiErro
         return Err(DpapiError::Empty);
     }
     let protected = protect(plaintext)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let partial = path.with_extension("dpapi.partial");
-    fs::write(&partial, &protected)?;
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
-    fs::rename(partial, path)?;
+    crate::atomic_file::write(path, &protected)?;
     Ok(())
 }
 

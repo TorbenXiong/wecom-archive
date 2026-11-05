@@ -1,3 +1,4 @@
+pub mod atomic_file;
 pub mod enterprise_crypto;
 pub mod secrets;
 mod snapshot;

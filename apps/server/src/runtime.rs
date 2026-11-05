@@ -159,10 +159,10 @@ fn prepare_server(
         .map_err(|error| format!("服务端数据目录不可用（{}），请检查目录权限。", error.kind()))?;
     diagnostics::init(&data_root);
     diagnostics::write("server_prepare_started", "");
+    let enterprise_config = load_enterprise_config(&data_root)?;
     let access_token_path = data_root.join(ACCESS_TOKEN_FILE);
     let token = load_or_generate_access_token(&access_token_path)
-        .map_err(|_| "服务端访问令牌初始化失败，请检查 serverData 目录权限。".to_owned())?;
-    let enterprise_config = load_enterprise_config(&data_root);
+        .map_err(|_| "服务端访问令牌不可用，已停止启动。请检查目录权限、当前 Windows 用户，或按备份恢复说明恢复 access-token.dpapi。".to_owned())?;
     diagnostics::set_level(&enterprise_config.server_log_level);
     let (address, automatic_remote) = std::env::var(LISTEN_ENV)
         .ok()
