@@ -56,7 +56,9 @@ export function MessageTimeline({
   const [locatingQuote, setLocatingQuote] = useState(false);
   const [quoteError, setQuoteError] = useState("");
   const quoteController = useRef<AbortController | undefined>(undefined);
+  const highlightTimer = useRef<number | undefined>(undefined);
   const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => () => window.clearTimeout(highlightTimer.current), []);
   useEffect(() => {
     quoteController.current?.abort();
     setLocatingQuote(false);
@@ -84,8 +86,9 @@ export function MessageTimeline({
     const target = scrollRef.current?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(messageId)}"]`);
     if (target) {
       target.scrollIntoView({ behavior: "smooth", block: "center" });
+      window.clearTimeout(highlightTimer.current);
       setHighlightedMessageId(messageId);
-      window.setTimeout(() => setHighlightedMessageId((current) => current === messageId ? undefined : current), 1800);
+      highlightTimer.current = window.setTimeout(() => setHighlightedMessageId((current) => current === messageId ? undefined : current), 1800);
     } else if (onLocateQuote) {
       const controller = new AbortController();
       quoteController.current = controller;
@@ -141,9 +144,11 @@ export function MessageTimeline({
       .find((item) => item.dataset.messageId === targetMessageId);
     if (!target) return;
     target.scrollIntoView({ behavior: "smooth", block: "center" });
+    // An earlier navigation to the same message must not clear its new highlight.
+    window.clearTimeout(highlightTimer.current);
     setHighlightedMessageId(targetMessageId);
     onTargetLocated?.();
-    window.setTimeout(() => setHighlightedMessageId((current) => current === targetMessageId ? undefined : current), 2200);
+    highlightTimer.current = window.setTimeout(() => setHighlightedMessageId((current) => current === targetMessageId ? undefined : current), 2200);
   }, [ordered, onTargetLocated, targetMessageId]);
 
   return (
