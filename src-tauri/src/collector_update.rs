@@ -1,7 +1,14 @@
-use super::*;
+use crate::collector_config::EnterpriseCollectorConfig;
+use crate::collector_control::server_base_url;
+use crate::state::{AppState, CollectionRunGuard};
+use crate::update;
 use archive_transfer::software_update::{
     MAX_EXECUTABLE_BYTES, SignedSoftwareUpdate, newer, signing_payload, valid_hash,
 };
+use chrono::Utc;
+use std::fs;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 pub(super) fn verify(
     envelope: &SignedSoftwareUpdate,

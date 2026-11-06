@@ -22,7 +22,8 @@
 
 - 支持固定间隔和每日定时。采集端启动时已启用计划，或运行中从未启用改为启用，均会先采集并上传一次，再按计划执行；远程修改通过心跳同步后生效。
 - 远程“最近成功”只记录上传成功时间；准备数据、保存配置、失败尝试和无变化跳过上传均不更新。本机计划记录成功采集时间。
-- 采集与上传共用任务锁；启用计划后的首次任务遇到忙碌会等待，不跳过。首次上传允许空结果，普通周期无消息变化时跳过上传。
+- 采集与上传共用任务锁；启用计划后的首次任务遇到忙碌会等待，不跳过。首次上传允许空结果，普通周期无消息、目录或成员资料变化时跳过上传。
+- 远程计划首次全量读取，随后从上次成功扫描的开始时间前移 5 分钟读取，仅上传新增或变化的消息及相关附件；进度持久化，失败不推进，重启后可继续。每隔 24 小时在下一次任务中全量核对旧消息修订和附件补齐。开启离线导出时保留全量本地读取，上传仍按变化筛选。数据库快照和媒体目录索引仍完整处理，不代表采集过程所有阶段均已增量化。
 - 关闭采集端窗口会收起到托盘；右键选择“退出采集端”停止运行。窗口和托盘分别展示状态、最近成功和下次执行。
 
 ## 工程结构
@@ -41,9 +42,11 @@ crates/export/        JSON/CSV/HTML/Markdown 导出
 
 详细设计见 [`docs/architecture.md`](docs/architecture.md)，安全边界见 [`docs/privacy-security.md`](docs/privacy-security.md)，当前能力见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，验证状态见 [`docs/implementation-status.md`](docs/implementation-status.md)。
 
-本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；当前版本变化见 [0.0.14 版本说明](docs/release-0.0.14.md)，升级操作见 [升级功能测试方案](docs/update-test-plan.md)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
+本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；当前版本变化见 [0.0.15 版本说明](docs/release-0.0.15.md)，升级操作见 [升级功能测试方案](docs/update-test-plan.md)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
 
 合成数据性能基准见 [`docs/benchmarks.md`](docs/benchmarks.md)，使用 PowerShell 运行 `./scripts/benchmark-archive.ps1`。
+
+大包内存分配对照见 [`docs/package-memory.md`](docs/package-memory.md)，覆盖 JSON 导入、加密包编码和密文字段解码；数据均为合成内容，默认离线，不使用真实密钥。
 
 ## 开发
 

@@ -49,7 +49,7 @@ pub(super) fn post_json(
     {
         return Err(io::Error::other("invalid request"));
     }
-    let root = super::collector_work_root("http")
+    let root = crate::paths::collector_work_root("http")
         .map_err(|_| io::Error::other("request directory unavailable"))?;
     let request = RequestFile(root.join("request.partial"));
     {
