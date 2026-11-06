@@ -7,7 +7,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::{CommandError, EnterpriseCollectorConfig, internal_error};
+use crate::collector_config::EnterpriseCollectorConfig;
+use crate::state::{CommandError, internal_error};
 
 const OVERLAP_MS: i64 = 5 * 60 * 1000;
 const FULL_SCAN_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -727,7 +728,7 @@ mod tests {
             ("context", cutoff - 1, "账号密码如下"),
             ("credential", cutoff, "user123跟secret456"),
         ]);
-        let redacted = crate::redact_sensitive_export(raw).unwrap();
+        let redacted = crate::collector_transfer::redact_sensitive_export(raw).unwrap();
         collector
             .upload(redacted, &plan, START + 60_000, false, |delta| {
                 assert_eq!(delta.message_count, 1);

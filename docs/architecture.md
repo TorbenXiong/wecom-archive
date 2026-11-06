@@ -20,6 +20,21 @@ source-windows → parser → MessageV1 / ClientExportV1
 
 项目发布 `WeComArchive.exe` 工作台。工作台运行归档服务并打开管理界面；服务端按需生成携带签名绑定配置的采集端文件，采集端仍复用工作台的采集运行时。
 
+采集宿主的公开入口集中在 `src-tauri/src/lib.rs`，通过重导出保留工作台使用的本机采集、密钥探针、采集端运行和升级 API。内部模块按职责组织：
+
+| 模块 | 职责 |
+| --- | --- |
+| `commands.rs`、`state.rs` | WebView 白名单命令、响应类型、共享状态、任务锁与脱敏错误 |
+| `collector_config.rs`、`collector_control.rs` | 绑定配置、签名校验、心跳同步与授权失效处理 |
+| `collector_schedule.rs`、`collector_runtime.rs` | 采集计划、任务结果、窗口、托盘和进程生命周期 |
+| `collector_transfer.rs`、`collector_http.rs`、`collector_incremental.rs` | 打包上传、HTTP 临时文件及增量检查点 |
+| `paths.rs`、`source_keys.rs` | 数据与工作目录、源目录记忆、密钥验证及隔离探针 |
+| `collection.rs` | 本机采集入口、只读快照读取及归档契约组装 |
+| `source_directory.rs`、`source_messages.rs` | 会话、成员资料和消息内容投影 |
+| `source_media.rs`、`source_protobuf.rs`、`source_sql.rs` | 媒体定位与校验、Protobuf 解码及源库字段适配 |
+
+模块使用显式导入，内部类型保持 crate 内可见；底层 Windows API 继续由 `source-windows` 提供。`tests.rs` 保留原有测试及名称，真实环境验收的 `tests::authorized_real_*` 精确入口沿用；拆分不新增 commands、权限、网络入口或依赖，也不改变归档契约与采集策略。离线导出的文件写入单独封装，只有成功独占创建 `.partial` 后才取得清理权；创建失败保留已有文件，发布通过硬链接拒绝覆盖已完成文件。
+
 React 只能调用白名单 Tauri commands。Windows API 和源数据适配集中在 `source-windows`；跨平台的 domain、parser、transfer、archive-store 和 export 不依赖 Windows API。
 
 服务端入口保留公开桌面启动 API，内部按 `runtime`、`state`、`config`、`api`、`collector`、`service`、`auth` 和 `error` 拆分。HTTP 请求与响应类型集中在 `api/types.rs`，采集控制与本机调度分别位于 `collector/control.rs` 和 `collector/local.rs`。Windows 加密、DPAPI 和默认应用打开通过 `source-windows` 的 crate API 调用，不再通过路径包含其他 crate 的源码。
