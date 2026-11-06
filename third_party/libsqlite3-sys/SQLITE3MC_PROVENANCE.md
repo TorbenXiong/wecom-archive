@@ -11,19 +11,28 @@
 - Upstream `sqlite3/sqlite3.c` SHA-256 before the local bridge:
   `59e30889a7b0106152e6d4fc3c18ac1592f252cb4defbb0a7e618fdecf1a221c`
 - Current `sqlite3/sqlite3.c` SHA-256:
-  `f41ea1060e10e521352270d422e43c621608e891500937514568b627acdcc51f`
+  `0680c7effa3cbb3f0688fce567ec1888fa4507867c9d735ed4b32453624b0708`
 - `sqlite3/sqlite3.h` SHA-256: `919e7f2e8ed1d8f56ac17b412b8971c76aa5d1a879752cc6058f75e7d5910e1d`
-- `sqlite3/sqlite3ext.h` SHA-256: `ac9645e5c9ff0cf176efd6e75cb5e98f46295d38e02db5c4d208826a39ab4be`
+- `sqlite3/sqlite3ext.h` SHA-256: `ac9645e5c9ff0cf176efdd6e75cb5e98f46295d38e02db5c4d208826a39ab4be`
+
+The current vendored-file hashes refer to the Git-tracked bytes with LF line
+endings. The source hash includes all local helpers described below.
 
 The surrounding Rust crate is a locally patched copy of `libsqlite3-sys
 0.38.2`. Its original MIT license remains in `LICENSE`. The upstream
 SQLite3MultipleCiphers MIT license is preserved in `SQLITE3MC_LICENSE`.
 
-The build-script change selects `CODEC_TYPE_AES128` as the default cipher. A
-small local C bridges named `sqlite3mc_key_aes128_derived` and
+The build-script change selects `CODEC_TYPE_AES128` as the default cipher.
+Two local C bridges named `sqlite3mc_key_aes128_derived` and
 `sqlite3mc_key_aes256_derived` are appended to the amalgamation. They initialize
 the upstream wxSQLite3 AES codec and replace its read/write key buffers with an
 already-derived 16- or 32-byte key before the first SQL statement. The bridges
 do not change page encryption, IV derivation, or cipher implementation behavior.
+
+The appended `sqlite3mc_verify_wxsqlite3_raw_key` and
+`sqlite3mc_decrypt_wxsqlite3_raw_page` helpers verify a recovered key against
+the first-page fragment and decrypt raw wxSQLite3 AES-128-CBC snapshot pages.
+They operate on supplied byte buffers and do not open or modify source database
+files.
 
 No source from the separately referenced application is present here.
