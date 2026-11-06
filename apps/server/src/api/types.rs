@@ -374,7 +374,7 @@ pub(crate) struct OpenMediaQuery {
     pub(crate) name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub(crate) struct MessagesQuery {
     pub(crate) conversation_id: String,
     pub(crate) participant_id: Option<String>,
@@ -384,6 +384,9 @@ pub(crate) struct MessagesQuery {
     pub(crate) limit: Option<u32>,
     pub(crate) offset: Option<u64>,
     pub(crate) sort: Option<String>,
+    pub(crate) anchor_message_id: Option<String>,
+    pub(crate) anchor_shift: Option<i32>,
+    pub(crate) anchor_revision: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]

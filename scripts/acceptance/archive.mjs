@@ -48,6 +48,23 @@ async function searchCases(c, main, auth, check) {
   const positioned = await request(`/api/v1/messages/${encodeURIComponent(results[0].stable_message_id)}/position?sort=desc`);
   const position = await positioned.json();
   check("search-http-position", positioned.ok && Number.isSafeInteger(position.offset_in_conversation));
+  const deepResponse = await request('/api/v1/messages/acceptance-00000/position?sort=desc');
+  const deep = await deepResponse.json();
+  const summary = await (await request('/api/v1/archive/summary')).json();
+  const start = Math.floor(deep.offset_in_conversation / 100) * 100;
+  const page = new URLSearchParams({ conversation_id: deep.conversation_id, limit: '100', offset: String(start), sort: 'desc' });
+  const expectedResponse = await request(`/api/v1/messages?${page}`), expected = await expectedResponse.json();
+  const anchor = new URLSearchParams(page);
+  anchor.set('offset', '0'); // Prove that the anchor path actually overrides the deep OFFSET.
+  anchor.set('anchor_message_id', 'acceptance-00000');
+  anchor.set('anchor_shift', String(-(deep.offset_in_conversation % 100)));
+  anchor.set('anchor_revision', String(summary.revision));
+  const anchoredResponse = await request(`/api/v1/messages?${anchor}`), anchored = await anchoredResponse.json();
+  const ids = rows => JSON.stringify(rows.map(row => row.stable_message_id));
+  check('message-anchor-http-deep-page', deepResponse.ok && start > 0 && expectedResponse.ok && anchoredResponse.ok && ids(expected) === ids(anchored) && anchored.some(row => row.stable_message_id === 'acceptance-00000'));
+  anchor.set('offset', String(start)); anchor.set('anchor_revision', String(summary.revision + 1));
+  const staleResponse = await request(`/api/v1/messages?${anchor}`), stale = await staleResponse.json();
+  check('message-anchor-http-stale-fallback', staleResponse.ok && ids(expected) === ids(stale));
   await c.evaluate("window.dispatchEvent(new KeyboardEvent('keydown',{key:'f',ctrlKey:true,altKey:true}))");
   await c.wait("!!document.querySelector('.global-search-overlay')");
   await c.evaluate("window.__acceptance.set(document.querySelector('[aria-label=\"全局搜索聊天记录\"]'),'项目')");

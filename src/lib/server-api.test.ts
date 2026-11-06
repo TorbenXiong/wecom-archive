@@ -1,9 +1,24 @@
 import { afterEach, vi } from "vitest";
-import { createServerExport, listConversations, type ServerConversation } from "./server-api";
+import { createServerExport, listConversations, listMessages, type ServerConversation } from "./server-api";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it("serializes revision-bound anchors while retaining the legacy offset request", async () => {
+  const mock = vi.fn(async (_input: RequestInfo | URL) => Response.json([]));
+  vi.stubGlobal("fetch", mock);
+  await listMessages("token", { conversationId: "synthetic", limit: 100, offset: 9000 });
+  let parameters = new URL(String(mock.mock.calls[0][0]), "http://localhost").searchParams;
+  expect(parameters.get("offset")).toBe("9000");
+  expect(parameters.has("anchor_message_id")).toBe(false);
+  await listMessages("token", { conversationId: "synthetic", limit: 100, offset: 9000, anchorMessageId: "message & #?", anchorShift: 0, anchorRevision: 0 });
+  parameters = new URL(String(mock.mock.calls[1][0]), "http://localhost").searchParams;
+  expect(parameters.get("anchor_message_id")).toBe("message & #?");
+  expect(parameters.get("anchor_shift")).toBe("0");
+  expect(parameters.get("anchor_revision")).toBe("0");
+  expect(parameters.get("offset")).toBe("9000");
 });
 
 it("waits for confirmed cleanup after cancellation and preserves a completed publication", async () => {

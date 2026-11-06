@@ -46,6 +46,8 @@ crates/export/        JSON/CSV/HTML/Markdown 导出
 
 合成数据性能基准见 [`docs/benchmarks.md`](docs/benchmarks.md)，使用 PowerShell 运行 `./scripts/benchmark-archive.ps1`。
 
+会话消息相邻翻页与定位后的取页使用消息锚点，随机页码及失效锚点保留 OFFSET；兼容性、存储层对照和限制见 [深分页与消息定位](docs/message-pagination.md)。
+
 大包内存分配对照见 [`docs/package-memory.md`](docs/package-memory.md)，覆盖 JSON 导入、加密包编码和密文字段解码；数据均为合成内容，默认离线，不使用真实密钥。
 
 ## 开发

@@ -99,6 +99,21 @@ pub(crate) async fn list_messages(
         .map(parse_message_type)
         .transpose()?;
     let sort_ascending = parse_sort_ascending(query.sort.as_deref())?;
+    let anchor = match (
+        query.anchor_message_id,
+        query.anchor_shift,
+        query.anchor_revision,
+    ) {
+        (None, None, None) => None,
+        (Some(id), Some(shift), Some(revision))
+            if !id.trim().is_empty()
+                && shift >= -(query.limit.unwrap_or(100).clamp(1, 50_000) as i32)
+                && shift <= 1 =>
+        {
+            Some((id, shift, revision))
+        }
+        _ => return Err(ApiError::invalid_query()),
+    };
     let message_query = MessageQuery {
         conversation_id: Some(query.conversation_id),
         participant_id: query.participant_id,
@@ -114,9 +129,20 @@ pub(crate) async fn list_messages(
     let archive_path = Arc::clone(&state.archive_path);
     let messages = tokio::task::spawn_blocking(move || {
         let store = ArchiveStore::open_read_only(&archive_path).map_err(|_| ApiError::store())?;
-        let messages = store
-            .query_messages(&message_query)
-            .map_err(|_| ApiError::store())?;
+        let _snapshot = store.read_snapshot().map_err(|_| ApiError::store())?;
+        let anchored = anchor
+            .map(|(id, shift, revision)| {
+                store.query_messages_at_anchor(&message_query, &id, shift, revision)
+            })
+            .transpose()
+            .map_err(|_| ApiError::store())?
+            .flatten();
+        let messages = match anchored {
+            Some(messages) => messages,
+            None => store
+                .query_messages(&message_query)
+                .map_err(|_| ApiError::store())?,
+        };
         let participants = store
             .list_conversation_participants(
                 message_query.conversation_id.as_deref().unwrap_or_default(),
@@ -389,6 +415,7 @@ pub(crate) async fn message_position(
     let archive_path = Arc::clone(&state.archive_path);
     let response = tokio::task::spawn_blocking(move || {
         let store = ArchiveStore::open_read_only(&archive_path).map_err(|_| ApiError::store())?;
+        let _snapshot = store.read_snapshot().map_err(|_| ApiError::store())?;
         let message = store
             .get_message(&stable_message_id)
             .map_err(|_| ApiError::store())?

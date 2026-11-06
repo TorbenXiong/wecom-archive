@@ -2,6 +2,8 @@
 
 > 历史诊断记录，以下“尚未实现”描述指当时的代码。当前源码已实现搜索 `locate=false` 后点击定位、请求内会话缓存及无筛选会话计数复用；会话目录也已改为首批 50 条、后续按需加载。消息页搜索现先检查有界的有序窗口，不足时再完整查询。当前搜索接口基准见 [`search-api-benchmark.md`](search-api-benchmark.md)，不得将本页历史 SQL 测量直接视为当前 HTTP 性能。
 
+相邻消息页与定位后的取页现已提供锚点路径，随机页码继续兼容 OFFSET；当前实现、存储层对照及精确位置计数的限制见 [深分页与消息定位](message-pagination.md)。
+
 本轮审查以第三轮优化后的代码为基准，重点是用户操作的完整成本。原有规模基准中的 `fts_search` 只测 `ArchiveStore::query_messages`，不包含搜索接口的结果定位、目录查询及 HTTP 响应构造。原有搜索词每 10,000 条消息才出现一次，不能代表常见词搜索。
 
 新增诊断程序：[`query-performance-review.rs`](../crates/archive-store/examples/query-performance-review.rs)。使用项目当前的 SQLite 和现有依赖，构建与运行全部离线；实验索引仅添加到本进程生成的合成数据库。业务代码、依赖与锁文件未在本轮修改。

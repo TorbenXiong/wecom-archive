@@ -39,6 +39,11 @@ import "./styles.css";
 
 type Section = "conversations" | "local-export" | "server-config" | "settings";
 
+type PageAnchor = { context: string; page: number; id: string; shift: number };
+function messagePageContext(token: string | undefined, conversation: string, size: number, ascending: boolean, revision: number): string {
+  return JSON.stringify([token, conversation, size, ascending, revision]);
+}
+
 const emptySummary: ServerArchiveSummary = { conversation_count: 0, message_count: 0, media_count: 0, revision: 0, local_collection_available: false };
 const DEFAULT_MESSAGE_PAGE_SIZE = 200;
 const emptyConversation: ConversationSummary = {
@@ -91,6 +96,11 @@ export default function App() {
   const [showLocalCollectionSetup, setShowLocalCollectionSetup] = useState(false);
   const [collectionProgress, setCollectionProgress] = useState<LocalCollectionProgress>({ running: false, percent: 0, stage: "准备采集", detail: "正在初始化本机采集任务。" });
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const lastMessagePage = useRef<{ context: string; page: number; first: string; last: string } | undefined>(undefined);
+  const pendingPageAnchor = useRef<PageAnchor | undefined>(undefined);
+  const pageContext = messagePageContext(token, selectedId, messagePageSize, messageSortAscending, summary.revision);
+  const currentPageRequest = useRef({ context: pageContext, page: messagePage });
+  currentPageRequest.current = { context: pageContext, page: messagePage };
   const archiveRevision = useRef(0);
   const directoryRequest = useRef(0);
   const skipNextPageReset = useRef(false);
@@ -285,16 +295,33 @@ export default function App() {
     if (!token || !selectedId || !superAdminEnabled) {
       setMessages([]);
       setMessageTotal(0);
+      lastMessagePage.current = undefined;
+      pendingPageAnchor.current = undefined;
       return;
     }
     const controller = new AbortController();
     setMessageStatus("正在读取服务端归档…");
+    const isCurrentPage = () => !controller.signal.aborted
+      && currentPageRequest.current.context === pageContext && currentPageRequest.current.page === messagePage;
+    const pending = pendingPageAnchor.current;
+    const previous = lastMessagePage.current;
+    let anchor: Pick<PageAnchor, "id" | "shift"> | undefined;
+    if (pending?.context === pageContext && pending.page === messagePage) {
+      anchor = pending;
+    } else {
+      pendingPageAnchor.current = undefined;
+      if (previous?.context === pageContext) {
+        if (messagePage === previous.page + 1) anchor = { id: previous.last, shift: 1 };
+        else if (messagePage === previous.page - 1) anchor = { id: previous.first, shift: -messagePageSize };
+        else if (messagePage === previous.page) anchor = { id: previous.first, shift: 0 };
+      }
+    }
     const query = { conversationId: selectedId };
     Promise.all([
-      listMessages(token, { ...query, limit: messagePageSize, offset: messagePage * messagePageSize, sort: messageSortAscending ? "asc" : "desc" }, controller.signal),
+      listMessages(token, { ...query, limit: messagePageSize, offset: messagePage * messagePageSize, sort: messageSortAscending ? "asc" : "desc", ...(anchor ? { anchorMessageId: anchor.id, anchorShift: anchor.shift, anchorRevision: summary.revision } : {}) }, controller.signal),
       countMessages(token, query, controller.signal),
     ]).then(([rows, count]) => {
-      if (controller.signal.aborted) return;
+      if (!isCurrentPage()) return;
       const totalPages = Math.max(1, Math.ceil(count.total / messagePageSize));
       if (messagePage >= totalPages && messagePage > 0) {
         setMessageTotal(count.total);
@@ -303,15 +330,17 @@ export default function App() {
       }
       setMessageTotal(count.total);
       setMessages(rows.map(mapMessage));
+      lastMessagePage.current = rows.length > 0 ? { context: pageContext, page: messagePage, first: rows[0].stable_message_id, last: rows[rows.length - 1].stable_message_id } : undefined;
+      if (pendingPageAnchor.current === pending) pendingPageAnchor.current = undefined;
       setMessageStatus(rows.length === 0 ? "当前条件下没有消息" : "");
     }).catch((reason) => {
-      if (controller.signal.aborted || reason instanceof DOMException && reason.name === "AbortError") return;
+      if (!isCurrentPage() || reason instanceof DOMException && reason.name === "AbortError") return;
       setMessages([]);
       setMessageTotal(0);
       setMessageStatus(reason instanceof Error ? reason.message : "消息读取失败");
     });
     return () => controller.abort();
-  }, [messagePage, messagePageSize, messageSortAscending, refreshVersion, selectedId, superAdminEnabled, token]);
+  }, [messagePage, messagePageSize, messageSortAscending, pageContext, refreshVersion, selectedId, summary.revision, superAdminEnabled, token]);
 
   useEffect(() => {
     if (skipNextPageReset.current) {
@@ -360,10 +389,11 @@ export default function App() {
     const offset = result.offset_in_conversation ?? (await getMessagePosition(
       accessToken, result.stable_message_id, messageSortAscending ? "asc" : "desc", signal,
     )).offset_in_conversation;
-    if (signal?.aborted) return;
+    if (signal?.aborted || currentPageRequest.current.context !== pageContext || currentPageRequest.current.page !== messagePage) return;
     if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("无法定位原消息，请重试。");
     selectedConversationOverride.current = conversations.find((item) => item.id === result.conversation_id) ?? mapSearchConversation(result);
     skipNextPageReset.current = result.conversation_id !== selectedId;
+    pendingPageAnchor.current = { context: messagePageContext(token, result.conversation_id, messagePageSize, messageSortAscending, summary.revision), page: Math.floor(offset / messagePageSize), id: result.stable_message_id, shift: -(offset % messagePageSize) };
     setSelectedId(result.conversation_id);
     setMessagePage(Math.floor(offset / messagePageSize));
     setTargetMessageId(result.stable_message_id);
@@ -371,10 +401,11 @@ export default function App() {
   const openQuotedMessage = async (messageId: string, signal: AbortSignal) => {
     if (!token) return;
     const position = await getMessagePosition(token, messageId, messageSortAscending ? "asc" : "desc", signal);
-    if (signal.aborted) return;
+    if (signal.aborted || currentPageRequest.current.context !== pageContext || currentPageRequest.current.page !== messagePage) return;
     if (position.conversation_id !== selectedId || !Number.isSafeInteger(position.offset_in_conversation) || position.offset_in_conversation < 0) {
       throw new Error("无法在当前会话中找到原消息。");
     }
+    pendingPageAnchor.current = { context: pageContext, page: Math.floor(position.offset_in_conversation / messagePageSize), id: messageId, shift: -(position.offset_in_conversation % messagePageSize) };
     setMessagePage(Math.floor(position.offset_in_conversation / messagePageSize));
     setTargetMessageId(messageId);
   };

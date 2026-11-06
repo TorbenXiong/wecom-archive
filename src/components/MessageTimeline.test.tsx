@@ -60,6 +60,25 @@ afterEach(() => {
 });
 
 describe("message timeline", () => {
+  it("keeps a new quote lookup alive when an earlier highlight target is cleared", () => {
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
+    const locate = vi.fn<(id: string, signal: AbortSignal) => Promise<void>>().mockImplementation(() => new Promise(() => undefined));
+    const quoted = { ...messages[0], quote: { id: "outside-page", sender: "成员二", time: "", body: "另一页原消息" } };
+    const timeline = (targetMessageId?: string, pageIndex = 0) => <MessageTimeline token="test-token" conversation={conversation} messages={[quoted, messages[1]]} participants={[]} targetMessageId={targetMessageId} pageIndex={pageIndex} onLocateQuote={locate} />;
+    const view = render(timeline(messages[1].id));
+    fireEvent.click(screen.getByTitle("定位到原消息"));
+    const first = locate.mock.calls[0][1];
+    expect(first.aborted).toBe(false);
+    view.rerender(timeline());
+    expect(first.aborted).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "取消定位" }));
+    expect(first.aborted).toBe(true);
+    fireEvent.click(screen.getByTitle("定位到原消息"));
+    const second = locate.mock.calls[1][1];
+    view.rerender(timeline(undefined, 1));
+    expect(second.aborted).toBe(true);
+  });
+
   it("keeps same-page quote highlighting local and reports missing cross-page targets for retry", async () => {
     Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
     const locate = vi.fn<(id: string, signal: AbortSignal) => Promise<void>>().mockRejectedValue(new Error("原消息不存在。"));

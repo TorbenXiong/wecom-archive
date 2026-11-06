@@ -64,7 +64,15 @@ export function MessageTimeline({
     setLocatingQuote(false);
     setQuoteError("");
     return () => quoteController.current?.abort();
-  }, [conversation.id, pageIndex, pageSize, sortAscending, targetMessageId, token]);
+  }, [conversation.id, pageIndex, pageSize, sortAscending, token]);
+  useEffect(() => {
+    // A new navigation supersedes pending quotes. Clearing an acknowledged
+    // highlight is not navigation and must not cancel a newer user request.
+    if (!targetMessageId) return;
+    quoteController.current?.abort();
+    setLocatingQuote(false);
+    setQuoteError("");
+  }, [targetMessageId]);
   useEffect(() => {
     setPageInput(String(Math.min(pageIndex + 1, totalPages)));
   }, [pageIndex, totalPages]);
