@@ -26,6 +26,7 @@ use tauri::{Emitter, Manager, State};
 use zeroize::{Zeroize, Zeroizing};
 
 mod collector_http;
+mod collector_incremental;
 mod collector_update;
 mod diagnostics;
 mod sqlite3mc;
@@ -1696,14 +1697,20 @@ fn create_enterprise_package(
     export: &ClientExportV1,
     config: &EnterpriseCollectorConfig,
 ) -> Result<Vec<u8>, CommandError> {
-    let public_key = hex::decode(&config.public_key_hex).map_err(|_| internal_error())?;
     let redacted_export = if config.data_redaction {
         redact_sensitive_export(export)
     } else {
         export.clone()
     };
-    let plaintext =
-        Zeroizing::new(serde_json::to_vec(&redacted_export).map_err(|_| internal_error())?);
+    encrypt_enterprise_export(&redacted_export, config)
+}
+
+fn encrypt_enterprise_export(
+    export: &ClientExportV1,
+    config: &EnterpriseCollectorConfig,
+) -> Result<Vec<u8>, CommandError> {
+    let public_key = hex::decode(&config.public_key_hex).map_err(|_| internal_error())?;
+    let plaintext = Zeroizing::new(serde_json::to_vec(export).map_err(|_| internal_error())?);
     let encrypted =
         source_windows::enterprise_crypto::encrypt(&public_key, &plaintext).map_err(|_| {
             CommandError {
@@ -1713,7 +1720,7 @@ fn create_enterprise_package(
             }
         })?;
     archive_transfer::create_enterprise_package(
-        &redacted_export,
+        export,
         &config.organization_id,
         &config.key_id,
         &encrypted.wrapped_dek,
@@ -2443,7 +2450,27 @@ fn read_snapshot_export_with_options(
         "正在整理会话、发送人及群成员信息。",
     );
 
-    let inferred_self_sender_id = infer_self_sender_id(&messages);
+    let inferred_self_sender_id = if since_unix_ms.is_some() {
+        // Inferring the employee from only the recent window can turn a direct
+        // conversation into an ambiguous pair. Read just distinct directory keys
+        // from the snapshot, without parsing historical message bodies or media.
+        let table = if has_normalized {
+            "messages"
+        } else {
+            "message_table"
+        };
+        let mut statement = connection
+            .prepare(&format!("SELECT DISTINCT conversation_id FROM {table}"))
+            .map_err(|_| unsupported_source_schema())?;
+        let ids = statement
+            .query_map([], |row| Ok(sqlite_value_to_string(row.get_ref(0)?)))
+            .map_err(|_| unsupported_source_schema())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| unsupported_source_schema())?;
+        infer_self_from_conversations(ids.iter().map(String::as_str))
+    } else {
+        infer_self_sender_id(&messages)
+    };
     if let Some(self_sender_id) = inferred_self_sender_id.as_deref() {
         for message in &mut messages {
             if message.direction == archive_domain::MessageDirection::Unknown {
@@ -2821,13 +2848,23 @@ impl DisplayNameIndex {
 }
 
 fn infer_self_sender_id(messages: &[archive_domain::MessageV1]) -> Option<String> {
+    infer_self_from_conversations(
+        messages
+            .iter()
+            .map(|message| message.conversation_id.as_str()),
+    )
+}
+
+fn infer_self_from_conversations<'a>(
+    conversations: impl Iterator<Item = &'a str>,
+) -> Option<String> {
     let mut counts = BTreeMap::<String, usize>::new();
     let mut seen = std::collections::BTreeSet::new();
-    for message in messages {
-        if !seen.insert(&message.conversation_id) {
+    for conversation in conversations {
+        if !seen.insert(conversation) {
             continue;
         }
-        let Some(members) = message.conversation_id.strip_prefix("S:") else {
+        let Some(members) = conversation.strip_prefix("S:") else {
             continue;
         };
         for member in members.split('_').filter(|member| !member.is_empty()) {
@@ -4887,7 +4924,7 @@ fn collector_scheduler(state: AppState) {
                 if let Ok(mut status) = state.schedule_status.lock() {
                     status.manual_collection_attempted_id = Some(request_id.clone());
                 }
-                if let Some(result) = run_collection_and_record(&state, &latest, false) {
+                if let Some(result) = run_collection_and_record(&state, &latest, false, true) {
                     if result.is_ok()
                         && let Ok(mut status) = state.schedule_status.lock()
                     {
@@ -4921,7 +4958,7 @@ fn collector_scheduler(state: AppState) {
         if Local::now() < due_at {
             continue;
         }
-        if run_collection_and_record(&state, &latest, timer.activation_pending).is_none() {
+        if run_collection_and_record(&state, &latest, timer.activation_pending, false).is_none() {
             continue;
         }
         if state.scheduler_shutdown.load(Ordering::Acquire) {
@@ -4936,6 +4973,7 @@ fn run_collection_and_record(
     state: &AppState,
     config: &EnterpriseCollectorConfig,
     force_upload: bool,
+    force_full_scan: bool,
 ) -> Option<Result<ScheduledCollectionOutcome, CommandError>> {
     if state
         .collection_running
@@ -4946,7 +4984,7 @@ fn run_collection_and_record(
     }
     let _guard = CollectionRunGuard(Arc::clone(&state.collection_running));
     begin_collector_attempt(state);
-    let result = scheduled_collect_and_upload(state, config, force_upload);
+    let result = scheduled_collect_and_upload(state, config, force_upload, force_full_scan);
     finish_collector_attempt(state, &result);
     if let Ok(outcome) = &result
         && let Ok(mut status) = state.schedule_status.lock()
@@ -5053,6 +5091,7 @@ fn scheduled_collect_and_upload(
     state: &AppState,
     config: &EnterpriseCollectorConfig,
     force_upload: bool,
+    force_full_scan: bool,
 ) -> Result<ScheduledCollectionOutcome, CommandError> {
     ensure_collector_config_fresh(config)?;
     let candidates = discover_local_sources();
@@ -5067,9 +5106,26 @@ fn scheduled_collect_and_upload(
             &collector_data_root()?,
         )
     })?;
+    let started_ms = Utc::now().timestamp_millis();
+    let progress_path = collector_incremental::progress_path(
+        &collector_data_root()?,
+        &config.collector_id,
+        &candidate.source_id,
+    );
+    let mut incremental = collector_incremental::IncrementalCollector::open(
+        &progress_path,
+        collector_incremental::scope_hash(config)?,
+    )?;
+    // Offline exports retain the complete local result. Their existing meaning
+    // must not change merely because scheduled uploads become incremental.
+    let plan = incremental.plan(
+        started_ms,
+        force_full_scan || config.offline_export_enabled,
+        config.data_redaction,
+    );
     let root = collector_work_root("scheduled")?;
     let result = (|| {
-        let export = collect_candidate_with_options(
+        let export = collect_candidate_with_options_since(
             candidate,
             root.join("work"),
             key.as_ref(),
@@ -5077,28 +5133,36 @@ fn scheduled_collect_and_upload(
                 notice_version: LOCAL_NOTICE_VERSION.into(),
                 notice_displayed_at: Utc::now(),
             },
-            media_options,
-            None,
-            None,
+            CollectionReadOptions {
+                media_options,
+                since_unix_ms: plan.read_since_unix_ms(),
+                ..Default::default()
+            },
         )?;
-        let changed = has_upload_changes(state, &export);
-        if !changed && !force_upload {
-            let summary = CollectionSummary::from(&export);
-            *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
-            return Ok(ScheduledCollectionOutcome {
-                summary,
-                completed_at: None,
-            });
+        // Preserve redaction context before removing unchanged or older messages.
+        let upload_export = if config.data_redaction {
+            redact_sensitive_export(&export)
+        } else {
+            export.clone()
+        };
+        let outcome =
+            incremental.upload(upload_export, &plan, started_ms, force_upload, |delta| {
+                let package = encrypt_enterprise_export(delta, config)?;
+                post_enterprise_package(
+                    &config.upload_url,
+                    config.upload_token.as_bytes(),
+                    &package,
+                )
+            })?;
+        if let Ok(mut status) = state.schedule_status.lock() {
+            status.uploaded_count = outcome.uploaded_count;
+            status.last_success_at = Some(outcome.last_upload_at);
         }
-        let package = create_enterprise_package(&export, config)?;
-        let completed_at =
-            post_enterprise_package(&config.upload_url, config.upload_token.as_bytes(), &package)?;
-        record_upload_success(state, &export);
         let summary = CollectionSummary::from(&export);
         *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
         Ok::<_, CommandError>(ScheduledCollectionOutcome {
             summary,
-            completed_at: Some(completed_at),
+            completed_at: outcome.completed_at,
         })
     })();
     let _ = fs::remove_dir_all(root);
@@ -5142,7 +5206,7 @@ mod tests {
         .unwrap();
         let state = AppState::default();
         assert!(matches!(
-            scheduled_collect_and_upload(&state, &config, false),
+            scheduled_collect_and_upload(&state, &config, false, false),
             Err(CommandError {
                 code: "ENTERPRISE_CONFIG_EXPIRED",
                 ..
@@ -6843,6 +6907,67 @@ mod tests {
         let serialized = serde_json::to_string(&export).unwrap();
         assert!(!serialized.contains("private"));
         assert_eq!(fs::read_dir(work_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn incremental_snapshot_keeps_employee_direction_from_historical_conversation_keys() {
+        let directory = TestDirectory::new();
+        let source_root = directory.0.join("source");
+        fs::create_dir(&source_root).unwrap();
+        let message_path = source_root.join("message.db");
+        let connection = Connection::open(&message_path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE messages (source_message_id TEXT, conversation_id TEXT, sender_id TEXT,
+             sent_at_unix_ms INTEGER, outgoing INTEGER, raw_type TEXT, payload_json TEXT, recalled INTEGER);
+             INSERT INTO messages VALUES ('old-a', 'S:self_a', 'self', 1700000000000, NULL, 'text', '{\"text\":\"old a\"}', 0);
+             INSERT INTO messages VALUES ('old-b', 'S:self_b', 'self', 1700000000000, NULL, 'text', '{\"text\":\"old b\"}', 0);
+             INSERT INTO messages VALUES ('recent', 'S:self_a', 'a', 1700003600000, NULL, 'text', '{\"text\":\"recent\"}', 0);"
+        ).unwrap();
+        drop(connection);
+        let candidate = WindowsSourceAdapter
+            .discover(Some(source_root))
+            .unwrap()
+            .remove(0);
+        let full = collect_candidate(
+            candidate.clone(),
+            directory.0.join("full"),
+            None,
+            authorization(),
+        )
+        .unwrap();
+        let incremental = collect_candidate_with_options_since(
+            candidate,
+            directory.0.join("incremental"),
+            None,
+            authorization(),
+            CollectionReadOptions {
+                since_unix_ms: Some(1_700_003_599_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(incremental.message_count, 1);
+        let message = &incremental.batches[0].messages[0];
+        assert_eq!(message.source_message_id, "recent");
+        assert_eq!(
+            message.direction,
+            archive_domain::MessageDirection::Incoming
+        );
+        assert_eq!(
+            message.direction,
+            full.batches[0]
+                .messages
+                .iter()
+                .find(|row| row.source_message_id == "recent")
+                .unwrap()
+                .direction
+        );
+        assert_eq!(
+            fs::read_dir(directory.0.join("incremental"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]
