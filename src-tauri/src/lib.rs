@@ -566,7 +566,7 @@ struct AppState {
     update_attempt: Arc<Mutex<Option<String>>>,
     software_update_error: Arc<Mutex<Option<String>>>,
     discovered_sources: Arc<Mutex<BTreeMap<String, SourceCandidate>>>,
-    latest_export: Arc<Mutex<Option<ClientExportV1>>>,
+    latest_export: Arc<Mutex<Option<Arc<ClientExportV1>>>>,
     collection_running: Arc<AtomicBool>,
     scheduler_shutdown: Arc<AtomicBool>,
     schedule_status: Arc<Mutex<CollectorScheduleStatus>>,
@@ -790,7 +790,7 @@ async fn collect_source(
     .unwrap_or_else(|_| Err(internal_error()));
     let result = result.and_then(|export| {
         let summary = CollectionSummary::from(&export);
-        *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
+        *state.latest_export.lock().map_err(|_| internal_error())? = Some(Arc::new(export));
         Ok(summary)
     });
     finish_collector_attempt(&state, &result);
@@ -915,7 +915,7 @@ fn collect_local_export_internal(
         )?;
         progress(88, "整理采集结果", "正在校验消息及媒体内容完整性。");
         Ok::<_, CommandError>(if data_redaction {
-            redact_sensitive_export(&export)
+            redact_sensitive_export(export)?
         } else {
             export
         })
@@ -1697,12 +1697,11 @@ fn create_enterprise_package(
     export: &ClientExportV1,
     config: &EnterpriseCollectorConfig,
 ) -> Result<Vec<u8>, CommandError> {
-    let redacted_export = if config.data_redaction {
-        redact_sensitive_export(export)
+    if config.data_redaction {
+        encrypt_enterprise_export(&redact_sensitive_export(export.clone())?, config)
     } else {
-        export.clone()
-    };
-    encrypt_enterprise_export(&redacted_export, config)
+        encrypt_enterprise_export(export, config)
+    }
 }
 
 fn encrypt_enterprise_export(
@@ -1719,6 +1718,9 @@ fn encrypt_enterprise_export(
                 recoverable: true,
             }
         })?;
+    // The envelope encoder hashes JSON incrementally. It does not need to keep
+    // the plaintext while emitting the much larger hexadecimal ciphertext.
+    drop(plaintext);
     archive_transfer::create_enterprise_package(
         export,
         &config.organization_id,
@@ -1735,30 +1737,28 @@ fn encrypt_enterprise_export(
     })
 }
 
-fn redact_sensitive_export(export: &ClientExportV1) -> ClientExportV1 {
-    let mut redacted = export.clone();
+fn redact_sensitive_export(mut redacted: ClientExportV1) -> Result<ClientExportV1, CommandError> {
     for batch in &mut redacted.batches {
         archive_transfer::redact_sensitive_messages(&mut batch.messages);
-        batch.content_sha256 = hex::encode(Sha256::digest(
-            serde_json::to_vec(&batch.messages).unwrap_or_default(),
-        ));
+        batch.content_sha256 =
+            archive_transfer::json_sha256(&batch.messages).map_err(|_| internal_error())?;
     }
     let checksum_value = if redacted.media_transport == "embedded_hex_v1" {
-        serde_json::to_vec(&(
+        archive_transfer::json_sha256(&(
             &redacted.conversations,
             &redacted.participants,
             &redacted.batches,
             &redacted.media_blobs,
         ))
     } else {
-        serde_json::to_vec(&(
+        archive_transfer::json_sha256(&(
             &redacted.conversations,
             &redacted.participants,
             &redacted.batches,
         ))
     };
-    redacted.content_sha256 = hex::encode(Sha256::digest(checksum_value.unwrap_or_default()));
-    redacted
+    redacted.content_sha256 = checksum_value.map_err(|_| internal_error())?;
+    Ok(redacted)
 }
 
 #[cfg(test)]
@@ -2728,9 +2728,7 @@ fn read_snapshot_export_with_options(
             participant_id,
         })
         .collect::<Vec<_>>();
-    let content_sha256 = hex::encode(Sha256::digest(
-        serde_json::to_vec(&messages).map_err(|_| internal_error())?,
-    ));
+    let content_sha256 = archive_transfer::json_sha256(&messages).map_err(|_| internal_error())?;
     report_collection_progress(
         progress,
         84,
@@ -5141,7 +5139,7 @@ fn scheduled_collect_and_upload(
         )?;
         // Preserve redaction context before removing unchanged or older messages.
         let upload_export = if config.data_redaction {
-            redact_sensitive_export(&export)
+            redact_sensitive_export(export.clone())?
         } else {
             export.clone()
         };
@@ -5159,7 +5157,7 @@ fn scheduled_collect_and_upload(
             status.last_success_at = Some(outcome.last_upload_at);
         }
         let summary = CollectionSummary::from(&export);
-        *state.latest_export.lock().map_err(|_| internal_error())? = Some(export);
+        *state.latest_export.lock().map_err(|_| internal_error())? = Some(Arc::new(export));
         Ok::<_, CommandError>(ScheduledCollectionOutcome {
             summary,
             completed_at: outcome.completed_at,
@@ -5747,7 +5745,7 @@ mod tests {
         assert_eq!(profile["mobile"], "13800000000");
         assert_eq!(profile["phone"], "010-12345678");
         assert_eq!(profile["office_phone"], "010-00000000");
-        let redacted = redact_sensitive_export(&export);
+        let redacted = redact_sensitive_export(export.clone()).unwrap();
         let profile = &redacted.batches[0].messages[0].raw_payload["participant_profiles"]["42"];
         for key in ["mobile", "phone", "office_phone"] {
             assert_eq!(profile[key], "[敏感数据已脱敏]");

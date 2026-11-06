@@ -1791,6 +1791,68 @@ fn concurrent_media_persistence_is_idempotent() {
     );
 }
 
+#[test]
+fn chunked_media_validates_boundaries_and_cleans_late_corruption() {
+    let directory = TestDirectory::new();
+    for size in [0, 1, 65_535, 65_536, 65_537, 131_073] {
+        let bytes = (0..size).map(|index| index as u8).collect::<Vec<_>>();
+        let blob = MediaBlobV1 {
+            content_hash: encode_hex(&Sha256::digest(&bytes)),
+            original_name: Some("synthetic.bin".into()),
+            mime_type: None,
+            size_bytes: size as u64,
+            content_hex: encode_hex(&bytes),
+        };
+        persist_media_blobs(&directory.0, std::slice::from_ref(&blob)).unwrap();
+        let target = directory.0.join("media").join(&blob.content_hash);
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        // Even an existing hash must not let a malformed incoming blob bypass validation.
+        if size > 0 {
+            let mut invalid = blob.clone();
+            invalid
+                .content_hex
+                .replace_range(invalid.content_hex.len() - 2.., "zz");
+            assert_eq!(
+                persist_media_blobs(&directory.0, &[invalid])
+                    .unwrap_err()
+                    .body
+                    .code,
+                "INVALID_CLIENT_EXPORT"
+            );
+            assert_eq!(std::fs::read(target).unwrap(), bytes);
+        }
+    }
+    let bytes = vec![42_u8; 131_073];
+    let mut blob = MediaBlobV1 {
+        content_hash: encode_hex(&Sha256::digest(&bytes)),
+        original_name: Some("synthetic.bin".into()),
+        mime_type: None,
+        size_bytes: bytes.len() as u64,
+        content_hex: encode_hex(&bytes),
+    };
+    let target = directory.0.join("media").join(&blob.content_hash);
+    blob.content_hex
+        .replace_range(blob.content_hex.len() - 2.., "zz");
+    assert!(persist_media_blobs(&directory.0, std::slice::from_ref(&blob)).is_err());
+    assert!(!target.exists());
+    blob.content_hex = encode_hex(&bytes);
+    blob.content_hex
+        .replace_range(blob.content_hex.len() - 2.., "00");
+    assert!(persist_media_blobs(&directory.0, std::slice::from_ref(&blob)).is_err());
+    assert!(!target.exists());
+    blob.content_hex.pop();
+    assert!(persist_media_blobs(&directory.0, &[blob]).is_err());
+    assert!(
+        std::fs::read_dir(directory.0.join("media"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".partial"))
+    );
+}
+
 #[tokio::test]
 async fn export_options_reach_both_writers_and_keep_full_json_importable() {
     let directory = TestDirectory::new();

@@ -100,11 +100,8 @@ fn decode_enterprise_export(
         .lock()
         .map_err(|_| ApiError::store())?
         .clone();
-    let mut package = {
-        let bytes = std::fs::read(path).map_err(|_| ApiError::invalid_export())?;
-        archive_transfer::parse_enterprise_package_for_organization(&bytes, &config.organization_id)
-            .map_err(|_| ApiError::invalid_export())?
-    };
+    let mut package = archive_transfer::read_enterprise_package(path, &config.organization_id)
+        .map_err(|_| ApiError::invalid_export())?;
     let protected_private_key_hex = config
         .collectors
         .iter()
@@ -129,19 +126,19 @@ fn decode_enterprise_export(
     let private_key = Zeroizing::new(
         dpapi_protect::unprotect(&protected_private_key).map_err(|_| ApiError::store())?,
     );
-    let wrapped_dek =
-        decode_hex(&package.wrapped_dek_hex).map_err(|_| ApiError::invalid_export())?;
-    let nonce = decode_hex(&package.nonce_hex).map_err(|_| ApiError::invalid_export())?;
-    let ciphertext = decode_hex(&std::mem::take(&mut package.ciphertext_hex))
-        .map_err(|_| ApiError::invalid_export())?;
-    let tag =
-        decode_hex(&package.authentication_tag_hex).map_err(|_| ApiError::invalid_export())?;
+    let ciphertext = std::mem::take(&mut package.ciphertext);
     let plaintext = Zeroizing::new(
-        enterprise_crypto::decrypt(&private_key, &wrapped_dek, &nonce, &ciphertext, &tag)
-            .map_err(|_| ApiError::invalid_export())?,
+        enterprise_crypto::decrypt(
+            &private_key,
+            &package.wrapped_dek,
+            &package.nonce,
+            &ciphertext,
+            &package.authentication_tag,
+        )
+        .map_err(|_| ApiError::invalid_export())?,
     );
     drop(ciphertext);
-    archive_transfer::validate_enterprise_plaintext(&package, &plaintext)
+    archive_transfer::validate_decoded_enterprise_plaintext(&package, &plaintext)
         .map_err(|_| ApiError::invalid_export())
 }
 
@@ -186,15 +183,18 @@ fn ingest_export_blocking(
     let batches = export.batches;
     let media_blobs = export.media_blobs;
     let (summary, revision) = {
-        persist_media_blobs(&state.data_root, &media_blobs)?;
+        // Release each large hexadecimal attachment as soon as it is durable.
+        for blob in media_blobs {
+            persist_media_blobs(&state.data_root, std::slice::from_ref(&blob))?;
+        }
         let mut store = ArchiveStore::open(&state.archive_path).map_err(ApiError::from_store)?;
         let mut total = IngestSummary {
             inserted: 0,
             unchanged: 0,
             revised: 0,
         };
-        for batch in &batches {
-            let current = store.ingest_batch(batch).map_err(ApiError::from_store)?;
+        for batch in batches {
+            let current = store.ingest_batch(&batch).map_err(ApiError::from_store)?;
             total.inserted += current.inserted;
             total.unchanged += current.unchanged;
             total.revised += current.revised;
@@ -235,28 +235,45 @@ pub(crate) fn persist_media_blobs(
         if !is_valid_content_hash(&blob.content_hash) {
             return Err(ApiError::invalid_export());
         }
-        let bytes = decode_hex(&blob.content_hex).map_err(|_| ApiError::invalid_export())?;
-        if bytes.len() as u64 != blob.size_bytes
-            || encode_hex(&Sha256::digest(&bytes)) != blob.content_hash
-        {
+        if blob.size_bytes.checked_mul(2) != Some(blob.content_hex.len() as u64) {
             return Err(ApiError::invalid_export());
         }
         let target = media_root.join(&blob.content_hash);
-        if target.is_file() {
-            continue;
-        }
         let partial = media_root.join(format!(
             ".{}.{}.partial",
             blob.content_hash,
             Uuid::new_v4().simple()
         ));
-        let write_result = (|| -> Result<(), std::io::Error> {
-            let mut output = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&partial)?;
-            std::io::Write::write_all(&mut output, &bytes)?;
-            output.sync_all()?;
+        let mut owns_partial = false;
+        let write_result = (|| -> Result<(), ApiError> {
+            let mut output = if target.is_file() {
+                None
+            } else {
+                let file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&partial)
+                    .map_err(|_| ApiError::store())?;
+                owns_partial = true;
+                Some(file)
+            };
+            let mut hasher = Sha256::new();
+            for chunk in blob.content_hex.as_bytes().chunks(128 * 1024) {
+                let text = std::str::from_utf8(chunk).map_err(|_| ApiError::invalid_export())?;
+                let decoded = decode_hex(text).map_err(|_| ApiError::invalid_export())?;
+                hasher.update(&decoded);
+                if let Some(output) = &mut output {
+                    std::io::Write::write_all(output, &decoded).map_err(|_| ApiError::store())?;
+                }
+            }
+            if encode_hex(&hasher.finalize()) != blob.content_hash {
+                return Err(ApiError::invalid_export());
+            }
+            let Some(output) = output else {
+                return Ok(());
+            };
+            output.sync_all().map_err(|_| ApiError::store())?;
+            drop(output);
             match std::fs::hard_link(&partial, &target) {
                 Ok(()) => Ok(()),
                 Err(error)
@@ -264,11 +281,13 @@ pub(crate) fn persist_media_blobs(
                 {
                     Ok(())
                 }
-                Err(error) => Err(error),
+                Err(_) => Err(ApiError::store()),
             }
         })();
-        let _ = std::fs::remove_file(&partial);
-        write_result.map_err(|_| ApiError::store())?;
+        if owns_partial {
+            let _ = std::fs::remove_file(&partial);
+        }
+        write_result?;
     }
     Ok(())
 }

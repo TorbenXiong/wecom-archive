@@ -410,9 +410,7 @@ impl IncrementalCollector {
 }
 
 fn hash_value(value: &impl Serialize) -> Result<String, CommandError> {
-    serde_json::to_vec(value)
-        .map(|bytes| hash_bytes(&bytes))
-        .map_err(|_| internal_error())
+    archive_transfer::json_sha256(value).map_err(|_| internal_error())
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -729,7 +727,7 @@ mod tests {
             ("context", cutoff - 1, "账号密码如下"),
             ("credential", cutoff, "user123跟secret456"),
         ]);
-        let redacted = crate::redact_sensitive_export(&raw);
+        let redacted = crate::redact_sensitive_export(raw).unwrap();
         collector
             .upload(redacted, &plan, START + 60_000, false, |delta| {
                 assert_eq!(delta.message_count, 1);

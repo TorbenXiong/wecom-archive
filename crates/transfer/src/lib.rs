@@ -13,6 +13,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod enterprise;
+mod json;
+pub use enterprise::{DecodedEnterprisePackage, read_enterprise_package};
+pub use json::json_sha256;
+
 #[derive(Debug, Error)]
 pub enum TransferError {
     #[error("target already exists")]
@@ -120,21 +125,43 @@ pub fn create_enterprise_package(
     {
         return Err(TransferError::InvalidEnterprisePackage);
     }
-    let plaintext = serde_json::to_vec(export)?;
-    let plaintext_sha256 = hex::encode(Sha256::digest(&plaintext));
-    let package = EnterprisePackageV1 {
-        schema_version: ENTERPRISE_PACKAGE_SCHEMA_VERSION.into(),
-        organization_id: organization_id.into(),
-        key_id: key_id.into(),
+    #[derive(Serialize)]
+    struct Package<'a> {
+        schema_version: &'a str,
+        organization_id: &'a str,
+        key_id: &'a str,
+        export_id: Uuid,
+        encryption: &'a str,
+        wrapped_dek_hex: enterprise::Hex<'a>,
+        nonce_hex: enterprise::Hex<'a>,
+        ciphertext_hex: enterprise::Hex<'a>,
+        plaintext_sha256: String,
+        authentication_tag_hex: enterprise::Hex<'a>,
+    }
+    let mut package = Package {
+        schema_version: ENTERPRISE_PACKAGE_SCHEMA_VERSION,
+        organization_id,
+        key_id,
         export_id: export.export_id,
-        encryption: "aes-256-gcm+rsa-oaep-sha256".into(),
-        wrapped_dek_hex: hex::encode(wrapped_dek),
-        nonce_hex: hex::encode(nonce),
-        ciphertext_hex: hex::encode(ciphertext),
-        plaintext_sha256,
-        authentication_tag_hex: hex::encode(authentication_tag),
+        encryption: "aes-256-gcm+rsa-oaep-sha256",
+        wrapped_dek_hex: enterprise::Hex(wrapped_dek),
+        nonce_hex: enterprise::Hex(nonce),
+        ciphertext_hex: enterprise::Hex(&[]),
+        plaintext_sha256: json_sha256(export)?,
+        authentication_tag_hex: enterprise::Hex(authentication_tag),
     };
-    Ok(serde_json::to_vec(&package)?)
+    // Reserve the final size before emitting ciphertext so Vec growth cannot
+    // temporarily retain two envelope-sized allocations.
+    let header_len = serde_json::to_vec(&package)?.len();
+    let size = ciphertext
+        .len()
+        .checked_mul(2)
+        .and_then(|size| size.checked_add(header_len))
+        .ok_or(TransferError::InvalidEnterprisePackage)?;
+    let mut output = Vec::with_capacity(size);
+    package.ciphertext_hex = enterprise::Hex(ciphertext);
+    serde_json::to_writer(&mut output, &package)?;
+    Ok(output)
 }
 
 pub fn parse_enterprise_package(
@@ -162,15 +189,22 @@ pub fn parse_enterprise_package_for_organization(
     {
         return Err(TransferError::EnterpriseKeyMismatch);
     }
-    let wrapped_dek = hex::decode(&package.wrapped_dek_hex)
-        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
-    let nonce =
-        hex::decode(&package.nonce_hex).map_err(|_| TransferError::InvalidEnterprisePackage)?;
-    let ciphertext = hex::decode(&package.ciphertext_hex)
-        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
-    let tag = hex::decode(&package.authentication_tag_hex)
-        .map_err(|_| TransferError::InvalidEnterprisePackage)?;
-    if wrapped_dek.is_empty() || nonce.len() != 12 || ciphertext.is_empty() || tag.len() != 16 {
+    let valid_hex = |value: &str| {
+        value.len().is_multiple_of(2) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    if ![
+        &package.wrapped_dek_hex,
+        &package.nonce_hex,
+        &package.ciphertext_hex,
+        &package.authentication_tag_hex,
+    ]
+    .into_iter()
+    .all(|value| valid_hex(value))
+        || package.wrapped_dek_hex.is_empty()
+        || package.nonce_hex.len() != 24
+        || package.ciphertext_hex.is_empty()
+        || package.authentication_tag_hex.len() != 32
+    {
         return Err(TransferError::InvalidEnterprisePackage);
     }
     Ok(package)
@@ -180,11 +214,26 @@ pub fn validate_enterprise_plaintext(
     package: &EnterprisePackageV1,
     plaintext: &[u8],
 ) -> Result<ClientExportV1, TransferError> {
-    if hex::encode(Sha256::digest(plaintext)) != package.plaintext_sha256 {
+    validate_enterprise_payload(package.export_id, &package.plaintext_sha256, plaintext)
+}
+
+pub fn validate_decoded_enterprise_plaintext(
+    package: &DecodedEnterprisePackage,
+    plaintext: &[u8],
+) -> Result<ClientExportV1, TransferError> {
+    validate_enterprise_payload(package.export_id, &package.plaintext_sha256, plaintext)
+}
+
+fn validate_enterprise_payload(
+    export_id: Uuid,
+    plaintext_sha256: &str,
+    plaintext: &[u8],
+) -> Result<ClientExportV1, TransferError> {
+    if hex::encode(Sha256::digest(plaintext)) != plaintext_sha256 {
         return Err(TransferError::EnterpriseAuthenticationFailed);
     }
     let export: ClientExportV1 = serde_json::from_slice(plaintext)?;
-    if export.export_id != package.export_id {
+    if export.export_id != export_id {
         return Err(TransferError::InvalidEnterprisePackage);
     }
     export.validate()?;
@@ -1660,9 +1709,9 @@ pub fn write_csv(export: &ClientExportV1, target: &Path) -> Result<(), TransferE
 
 pub fn read_json(path: &Path) -> Result<ClientExportV1, TransferError> {
     let reader = BufReader::new(File::open(path)?);
-    let mut document: serde_json::Value = serde_json::from_reader(reader)?;
-    normalize_export_timestamps(&mut document, false);
-    let export: ClientExportV1 = serde_json::from_value(document)?;
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let export = json::deserialize_export(&mut deserializer)?;
+    deserializer.end()?;
     export.validate()?;
     verify_checksum(&export)?;
     Ok(export)
@@ -1807,9 +1856,9 @@ fn is_emoji(code: u32) -> bool {
 }
 
 pub fn read_json_slice(bytes: &[u8]) -> Result<ClientExportV1, TransferError> {
-    let mut document: serde_json::Value = serde_json::from_slice(bytes)?;
-    normalize_export_timestamps(&mut document, false);
-    let export: ClientExportV1 = serde_json::from_value(document)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let export = json::deserialize_export(&mut deserializer)?;
+    deserializer.end()?;
     export.validate()?;
     verify_checksum(&export)?;
     Ok(export)
@@ -1902,8 +1951,7 @@ fn hash_content(
     participants: &[ParticipantV1],
     batches: &[ArchiveBatchV1],
 ) -> Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(&(conversations, participants, batches))?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    json_sha256(&(conversations, participants, batches))
 }
 
 fn hash_content_with_media(
@@ -1912,8 +1960,7 @@ fn hash_content_with_media(
     batches: &[ArchiveBatchV1],
     media_blobs: &[MediaBlobV1],
 ) -> Result<String, serde_json::Error> {
-    let bytes = serde_json::to_vec(&(conversations, participants, batches, media_blobs))?;
-    Ok(hex::encode(Sha256::digest(bytes)))
+    json_sha256(&(conversations, participants, batches, media_blobs))
 }
 
 fn atomic_write<F>(target: &Path, action: F) -> Result<(), TransferError>
@@ -2091,6 +2138,136 @@ mod tests {
             verify_checksum(&export),
             Err(TransferError::ChecksumMismatch)
         ));
+    }
+
+    #[test]
+    fn streamed_hash_and_enterprise_envelope_preserve_exact_legacy_bytes() {
+        let export = message_export();
+        let expected_hash = hex::encode(Sha256::digest(serde_json::to_vec(&export).unwrap()));
+        assert_eq!(json_sha256(&export).unwrap(), expected_hash);
+        let ciphertext: Vec<u8> = (0..131_073).map(|index| index as u8).collect();
+        let wrapped = [42_u8; 384];
+        let nonce = [7_u8; 12];
+        let tag = [9_u8; 16];
+        let bytes = create_enterprise_package(
+            &export,
+            "synthetic-organization",
+            "synthetic-key",
+            &wrapped,
+            &nonce,
+            &ciphertext,
+            &tag,
+        )
+        .unwrap();
+        let expected = EnterprisePackageV1 {
+            schema_version: ENTERPRISE_PACKAGE_SCHEMA_VERSION.into(),
+            organization_id: "synthetic-organization".into(),
+            key_id: "synthetic-key".into(),
+            export_id: export.export_id,
+            encryption: "aes-256-gcm+rsa-oaep-sha256".into(),
+            wrapped_dek_hex: hex::encode(wrapped),
+            nonce_hex: hex::encode(nonce),
+            ciphertext_hex: hex::encode(&ciphertext),
+            plaintext_sha256: expected_hash,
+            authentication_tag_hex: hex::encode(tag),
+        };
+        assert_eq!(bytes, serde_json::to_vec(&expected).unwrap());
+        assert_eq!(
+            parse_enterprise_package(&bytes, "synthetic-organization", "synthetic-key").unwrap(),
+            expected
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.wca");
+        fs::write(&path, &bytes).unwrap();
+        let decoded = read_enterprise_package(&path, "synthetic-organization").unwrap();
+        assert_eq!(decoded.ciphertext, ciphertext);
+        assert_eq!(decoded.wrapped_dek, wrapped);
+        assert_eq!(decoded.nonce, nonce);
+        assert_eq!(decoded.authentication_tag, tag);
+        let plaintext = serde_json::to_vec(&export).unwrap();
+        assert_eq!(
+            validate_decoded_enterprise_plaintext(&decoded, &plaintext).unwrap(),
+            export
+        );
+        let mut tampered = plaintext;
+        tampered[0] ^= 1;
+        assert!(validate_decoded_enterprise_plaintext(&decoded, &tampered).is_err());
+    }
+
+    #[test]
+    fn decoded_envelopes_reject_malformed_hex_parameters_and_wrong_organizations() {
+        let export = message_export();
+        let package = create_enterprise_package(
+            &export,
+            "synthetic-organization",
+            "synthetic-key",
+            &[1],
+            &[2; 12],
+            &[3; 10],
+            &[4; 16],
+        )
+        .unwrap();
+        let original: serde_json::Value = serde_json::from_slice(&package).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.wca");
+        for (field, value) in [
+            ("ciphertext_hex", "0"),
+            ("ciphertext_hex", "zz"),
+            ("ciphertext_hex", ""),
+            ("wrapped_dek_hex", ""),
+            ("nonce_hex", "00"),
+            ("authentication_tag_hex", "00"),
+            ("organization_id", "another-organization"),
+            ("encryption", "unknown"),
+            ("schema_version", "unknown"),
+        ] {
+            let mut document = original.clone();
+            document[field] = value.into();
+            let bytes = serde_json::to_vec(&document).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            assert!(read_enterprise_package(&path, "synthetic-organization").is_err());
+            assert!(
+                parse_enterprise_package_for_organization(&bytes, "synthetic-organization")
+                    .is_err()
+            );
+        }
+        fs::write(&path, [package.as_slice(), b" trailing"].concat()).unwrap();
+        assert!(read_enterprise_package(&path, "synthetic-organization").is_err());
+    }
+
+    #[test]
+    fn typed_json_import_matches_recursive_legacy_timestamp_normalization() {
+        let mut export = message_export();
+        export.batches[0].messages[0].raw_payload = serde_json::json!({
+            "sent_at": "2026-01-02 03:04:05",
+            "nested": [{"expires_at": "2026-01-02 03:04:05", "keep": "2026-01-02 03:04:05"}],
+            "starts_at": ["2026-01-02 03:04:05"], "ends_at": null,
+        });
+        let mut document = serde_json::to_value(&export).unwrap();
+        normalize_export_timestamps(&mut document, true);
+        let mut legacy = document.clone();
+        normalize_export_timestamps(&mut legacy, false);
+        let mut expected: ClientExportV1 = serde_json::from_value(legacy).unwrap();
+        expected.content_sha256 = hash_content(
+            &expected.conversations,
+            &expected.participants,
+            &expected.batches,
+        )
+        .unwrap();
+        document["content_sha256"] = expected.content_sha256.clone().into();
+        // Extra reading views are ignored without constructing their Value trees.
+        document["reading_view"] = serde_json::json!({"messages": ["synthetic".repeat(100_000)]});
+        let bytes = serde_json::to_vec(&document).unwrap();
+        assert_eq!(read_json_slice(&bytes).unwrap(), expected);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.json");
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(read_json(&path).unwrap(), expected);
+        assert!(read_json_slice(&[bytes.as_slice(), b" trailing"].concat()).is_err());
+        let mut tampered = document;
+        tampered["batches"][0]["messages"][0]["raw_payload"]["nested"][0]["keep"] =
+            "changed".into();
+        assert!(read_json_slice(&serde_json::to_vec(&tampered).unwrap()).is_err());
     }
 
     fn message_export() -> ClientExportV1 {
