@@ -9,6 +9,14 @@ pub(super) fn authorize(
     headers: &HeaderMap,
     expected: &Arc<Mutex<[u8; 32]>>,
 ) -> Result<(), ApiError> {
+    let expected = expected.lock().map_err(|_| ApiError::store())?;
+    authorize_token_hash(headers, &expected)
+}
+
+pub(super) fn authorize_token_hash(
+    headers: &HeaderMap,
+    expected: &[u8; 32],
+) -> Result<(), ApiError> {
     let Some(value) = headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
@@ -17,7 +25,6 @@ pub(super) fn authorize(
         return Err(ApiError::unauthorized());
     };
     let actual: [u8; 32] = Sha256::digest(value.as_bytes()).into();
-    let expected = expected.lock().map_err(|_| ApiError::store())?;
     let difference = actual
         .iter()
         .zip(expected.iter())

@@ -41,7 +41,7 @@ crates/export/        JSON/CSV/HTML/Markdown 导出
 
 详细设计见 [`docs/architecture.md`](docs/architecture.md)，安全边界见 [`docs/privacy-security.md`](docs/privacy-security.md)，当前能力见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，验证状态见 [`docs/implementation-status.md`](docs/implementation-status.md)。
 
-本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；当前版本变化见 [0.0.13 版本说明](docs/release-0.0.13.md)，升级操作见 [0.0.13 人工验收](docs/acceptance-0.0.13.md)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
+本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；当前版本变化见 [0.0.14 版本说明](docs/release-0.0.14.md)，升级操作见 [升级功能测试方案](docs/update-test-plan.md)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
 
 合成数据性能基准见 [`docs/benchmarks.md`](docs/benchmarks.md)，使用 PowerShell 运行 `./scripts/benchmark-archive.ps1`。
 
@@ -61,7 +61,21 @@ cargo build --release --locked --offline --bin WeComArchive
 `build:client` 生成采集端界面资源，`build:server` 生成归档工作台资源；采集端文件由服务端配置页按需生成。
 前端构建完成后再编译 Rust，避免嵌入旧资源。以上命令要求工具链和依赖已在本机准备好；`--offline` 不下载缺失依赖。
 
+验收和打包使用 PowerShell，仅使用已有工具与依赖：
+
+```powershell
+./scripts/verify-desktop.ps1
+./scripts/verify-real-environment.ps1 -Authorized
+./scripts/package-release.ps1 -IncludeRealEnvironment
+```
+
+桌面验收使用现有 `target/release/WeComArchive.exe` 和隔离合成数据；真实验收需要已登录的企业微信，默认检查源发现、探针、群资料和媒体采集，可用 `-Cases media` 单独重跑，单项默认等待 15 分钟。
+
+打包入口执行测试、类型与格式检查、Clippy、前端构建、Windows Release 构建及桌面验收；`-IncludeRealEnvironment` 启用真实验收。可通过 `-PackageName` 指定全新交付目录，`-Cargo`、`-Node` 指定本机工具。交付目录仅含一个 `WeComArchive.exe`，检查版本、x64 架构和哈希；不覆盖旧包，不生成验收报告，不执行 Git 提交或对外发布。
+
 ## 运行数据
+
+完整备份范围、离线备份方法、配置异常恢复和 DPAPI 跨机限制见 [备份与恢复](docs/backup-recovery.md)。完整 JSON 导出不包含服务端附件字节，不能替代完整备份。
 
 - 自动发现合并企业微信注册表配置、记住的目录及原有默认目录；优先当前账号数据，历史 `Backup` 数据作为后备候选。工作台、采集端发现和后台任务复用记忆目录。
 - 手动填写目录重试时只扫描该目录，避免默认目录中的其他账号被误选。目录须是本机磁盘上的子目录；不接受整盘根目录、网络路径或父目录跳转。目录配置缺失、损坏或失效时，自动发现仍可回退到默认目录。

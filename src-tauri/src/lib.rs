@@ -236,6 +236,14 @@ struct MediaCollectionOptions {
     include_images: bool,
 }
 
+#[derive(Default)]
+struct CollectionReadOptions<'a> {
+    media_options: MediaCollectionOptions,
+    media_sink: Option<&'a wecom_archive_server::LocalCollectionMediaSink>,
+    progress: Option<&'a wecom_archive_server::LocalCollectionProgressReporter>,
+    since_unix_ms: Option<i64>,
+}
+
 struct MediaResolver {
     roots: Vec<PathBuf>,
     files_by_key: BTreeMap<String, Vec<PathBuf>>,
@@ -894,13 +902,15 @@ fn collect_local_export_internal(
                 notice_version: LOCAL_NOTICE_VERSION.into(),
                 notice_displayed_at: Utc::now(),
             },
-            MediaCollectionOptions {
-                include_files: include_media,
-                include_images: include_media,
+            CollectionReadOptions {
+                media_options: MediaCollectionOptions {
+                    include_files: include_media,
+                    include_images: include_media,
+                },
+                media_sink,
+                progress: Some(&progress),
+                since_unix_ms,
             },
-            media_sink,
-            Some(&progress),
-            since_unix_ms,
         )?;
         progress(88, "整理采集结果", "正在校验消息及媒体内容完整性。");
         Ok::<_, CommandError>(if data_redaction {
@@ -2042,10 +2052,12 @@ fn collect_candidate_with_options(
         work_root,
         key,
         authorization,
-        media_options,
-        media_sink,
-        progress,
-        None,
+        CollectionReadOptions {
+            media_options,
+            media_sink,
+            progress,
+            since_unix_ms: None,
+        },
     )
 }
 
@@ -2054,10 +2066,7 @@ fn collect_candidate_with_options_since(
     work_root: PathBuf,
     key: Option<&SourceKey>,
     authorization: CollectionAuthorization,
-    media_options: MediaCollectionOptions,
-    media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
-    progress: Option<&wecom_archive_server::LocalCollectionProgressReporter>,
-    since_unix_ms: Option<i64>,
+    options: CollectionReadOptions<'_>,
 ) -> Result<ClientExportV1, CommandError> {
     if candidate
         .databases
@@ -2072,7 +2081,7 @@ fn collect_candidate_with_options_since(
         });
     }
     report_collection_progress(
-        progress,
+        options.progress,
         30,
         "创建快照",
         "正在复制数据库、WAL 和 SHM 文件。",
@@ -2085,21 +2094,13 @@ fn collect_candidate_with_options_since(
             recoverable: true,
         })?;
     report_collection_progress(
-        progress,
+        options.progress,
         42,
         "打开快照",
         "数据库快照已完成，正在安全打开副本。",
     );
-    let result = read_snapshot_export_with_options(
-        &candidate,
-        &receipt,
-        key,
-        authorization,
-        media_options,
-        media_sink,
-        progress,
-        since_unix_ms,
-    );
+    let result =
+        read_snapshot_export_with_options(&candidate, &receipt, key, authorization, options);
     cleanup_snapshot(&work_root, &receipt.snapshot_root);
     result
 }
@@ -2109,11 +2110,14 @@ fn read_snapshot_export_with_options(
     receipt: &archive_domain::SnapshotReceipt,
     key: Option<&SourceKey>,
     authorization: CollectionAuthorization,
-    media_options: MediaCollectionOptions,
-    media_sink: Option<&wecom_archive_server::LocalCollectionMediaSink>,
-    progress: Option<&wecom_archive_server::LocalCollectionProgressReporter>,
-    since_unix_ms: Option<i64>,
+    options: CollectionReadOptions<'_>,
 ) -> Result<ClientExportV1, CommandError> {
+    let CollectionReadOptions {
+        media_options,
+        media_sink,
+        progress,
+        since_unix_ms,
+    } = options;
     report_collection_progress(
         progress,
         46,
@@ -2392,13 +2396,12 @@ fn read_snapshot_export_with_options(
             let mut payload = readable_message_payload(&raw_type, &content);
             if raw_type.trim() == "16"
                 && let Some(transcription) = voice_text.as_deref().and_then(clean_message_text)
+                && let serde_json::Value::Object(object) = &mut payload
             {
-                if let serde_json::Value::Object(object) = &mut payload {
-                    object.insert(
-                        "transcription".into(),
-                        serde_json::Value::String(transcription),
-                    );
-                }
+                object.insert(
+                    "transcription".into(),
+                    serde_json::Value::String(transcription),
+                );
             }
             let local_paths = local_media_paths_from_extras(
                 &raw_type,
@@ -4647,10 +4650,10 @@ pub fn run() {
             if let Ok(mut tray_app) = app_state.tray_app.lock() {
                 *tray_app = Some(app.handle().clone());
             }
-            if !hidden_mode_enabled {
-                if let Some(config) = collector_config.as_ref() {
-                    create_collector_tray(&app.handle(), config)?;
-                }
+            if !hidden_mode_enabled
+                && let Some(config) = collector_config.as_ref()
+            {
+                create_collector_tray(app.handle(), config)?;
             }
             let tray_app = app.handle().clone();
             let tray_state = app_state.clone();
@@ -4989,14 +4992,9 @@ fn collector_tray_icon() -> tauri::image::Image<'static> {
     let mut pixels = Vec::with_capacity(32 * 32 * 4);
     for y in 0..32_u32 {
         for x in 0..32_u32 {
-            let edge = x < 3 || x > 28 || y < 3 || y > 28;
-            let paper = x >= 8 && x <= 23 && y >= 6 && y <= 26;
-            let line = paper && (y == 13 || y == 17 || y == 21) && x >= 11 && x <= 21;
-            let (r, g, b, a) = if edge {
-                (22, 128, 60, 255)
-            } else if line {
-                (22, 128, 60, 255)
-            } else if paper {
+            let paper = (8..=23).contains(&x) && (6..=26).contains(&y);
+            let line = paper && (y == 13 || y == 17 || y == 21) && (11..=21).contains(&x);
+            let (r, g, b, a) = if paper && !line {
                 (255, 255, 255, 255)
             } else {
                 (22, 128, 60, 255)
@@ -6373,74 +6371,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires explicitly authorized local Voice cache and a known resource MD5"]
-    fn authorized_real_voice_digest_enters_media_archive_without_exposing_content() {
-        let root = std::env::var_os("WECOM_ARCHIVE_TEST_VOICE_ROOT")
-            .map(PathBuf::from)
-            .expect("explicit Voice root is required");
-        let digest = std::env::var("WECOM_ARCHIVE_TEST_VOICE_MD5")
-            .expect("explicit resource digest is required");
-        assert!(root.is_absolute() && root.is_dir());
-        assert!(
-            root.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case("Voice"))
-        );
-        let candidate = SourceCandidate {
-            source_id: "authorized-voice-review".into(),
-            display_path: "authorized cache".into(),
-            root_path: root.clone(),
-            databases: vec![],
-            media_roots: vec![root],
-            client_version: None,
-            capability: SourceCapability::Supported,
-        };
-        let payload =
-            readable_message_payload("16", &test_protobuf_bytes(&[(10, digest.as_bytes())]));
-        let mut message = normalize(
-            RawMessageRow {
-                source_instance_id: "fixture".into(),
-                source_message_id: "1".into(),
-                conversation_id: "fixture".into(),
-                sender_id: None,
-                sent_at_unix_ms: 1700000000000,
-                outgoing: None,
-                raw_type: "16".into(),
-                payload,
-                recalled: false,
-            },
-            uuid::Uuid::nil(),
-        )
-        .unwrap();
-        let options = MediaCollectionOptions {
-            include_files: true,
-            include_images: false,
-        };
-        let resolver = MediaResolver::new(&candidate, options);
-        let blobs = resolve_media_metadata_with_local_paths(
-            &candidate,
-            &resolver,
-            &mut message,
-            options,
-            None,
-            &[],
-        )
-        .unwrap();
-        assert!(blobs.len() == 1, "authorized voice file was not collected");
-        assert!(message.media[0].integrity == MediaIntegrity::Verified);
-        let bytes = hex::decode(&blobs[0].content_hex).unwrap();
-        assert!(bytes.starts_with(b"#!SILK_V3") || bytes.starts_with(b"\x02#!SILK_V3"));
-        assert!(
-            message.media[0].content_hash.as_deref()
-                == Some(hex::encode(Sha256::digest(&bytes)).as_str())
-        );
-        println!(
-            "voice_integrity=verified; media_blobs=1; bytes={}",
-            bytes.len()
-        );
-    }
-
-    #[test]
     fn native_recall_uses_explicit_flags_without_matching_arbitrary_event_values() {
         let directory = TestDirectory::new();
         let source_root = directory.0.join("WXWork");
@@ -6899,10 +6829,10 @@ mod tests {
             directory.0.join("work-incremental"),
             None,
             authorization(),
-            MediaCollectionOptions::default(),
-            None,
-            None,
-            Some(1_700_000_000_500),
+            CollectionReadOptions {
+                since_unix_ms: Some(1_700_000_000_500),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(incremental.message_count, 1);

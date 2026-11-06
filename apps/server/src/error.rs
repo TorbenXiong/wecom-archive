@@ -92,6 +92,28 @@ impl ApiError {
         }
     }
 
+    pub(super) fn import_busy() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: ErrorResponse {
+                code: "IMPORT_BUSY",
+                message: "导入等待超时，服务端正在处理其他导入，请稍后重试。".into(),
+                recoverable: true,
+            },
+        }
+    }
+
+    pub(super) fn import_receive_timeout() -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            body: ErrorResponse {
+                code: "IMPORT_RECEIVE_TIMEOUT",
+                message: "导入文件接收超时，未完成文件已清理，请检查连接后重试。".into(),
+                recoverable: true,
+            },
+        }
+    }
+
     pub(super) fn invalid_query() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

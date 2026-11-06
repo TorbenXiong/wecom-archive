@@ -23,10 +23,11 @@ pub(crate) async fn request_collector_update(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
     require_super_admin(&state)?;
-    let mut config = state
+    let mut current = state
         .enterprise_config
         .lock()
         .map_err(|_| ApiError::store())?;
+    let mut config = current.clone();
     let collector = config
         .collectors
         .iter_mut()
@@ -45,6 +46,7 @@ pub(crate) async fn request_collector_update(
     collector.software_update_error = None;
     let response = serde_json::json!({"status":"queued","version":env!("CARGO_PKG_VERSION")});
     persist_enterprise_config(&state.data_root, &config)?;
+    *current = config;
     Ok(Json(response))
 }
 

@@ -106,9 +106,11 @@ pub fn export_package(
     let parent = target.parent().ok_or(ExportError::UnsafePath)?;
     fs::create_dir_all(parent)?;
     let partial = partial_path(target)?;
-    if partial.exists() {
-        fs::remove_file(&partial)?;
-    }
+    // Only clean up a partial that this call created; another export may own it.
+    let file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&partial)?;
 
     let result = (|| {
         let export_id = Uuid::new_v4();
@@ -127,7 +129,7 @@ pub fn export_package(
                 )
             });
         check_cancelled(cancelled)?;
-        render_payload(package, &partial, cancelled)?;
+        render_payload(package, file, cancelled)?;
         check_cancelled(cancelled)?;
         publish_without_overwrite(&partial, target)?;
         Ok(ExportResult {
@@ -148,23 +150,23 @@ pub fn export_package(
 
 fn render_payload(
     package: &ExportPackage,
-    target: &Path,
+    file: File,
     cancelled: &AtomicBool,
 ) -> Result<(), ExportError> {
     match package.format {
-        ExportFormat::Json => write_json(target, package, cancelled),
-        ExportFormat::Csv => write_csv(target, package, cancelled),
-        ExportFormat::Html => write_html(target, package, cancelled, false),
-        ExportFormat::Md => write_markdown(target, package, cancelled),
+        ExportFormat::Json => write_json(file, package, cancelled),
+        ExportFormat::Csv => write_csv(file, package, cancelled),
+        ExportFormat::Html => write_html(file, package, cancelled, false),
+        ExportFormat::Md => write_markdown(file, package, cancelled),
     }
 }
 
 fn write_json(
-    target: &Path,
+    file: File,
     package: &ExportPackage,
     cancelled: &AtomicBool,
 ) -> Result<(), ExportError> {
-    let mut output = streaming::JsonStream::new(File::create(target)?, package.pretty)?;
+    let mut output = streaming::JsonStream::new(file, package.pretty)?;
     let names = ExportNames::new(package);
     for conversation in selected_conversations(package) {
         check_cancelled(cancelled)?;
@@ -327,11 +329,12 @@ impl<'a> ExportNames<'a> {
 }
 
 fn write_csv(
-    target: &Path,
+    mut file: File,
     package: &ExportPackage,
     cancelled: &AtomicBool,
 ) -> Result<(), ExportError> {
-    let mut output = csv_writer(target)?;
+    file.write_all(&[0xEF, 0xBB, 0xBF])?;
+    let mut output = csv::WriterBuilder::new().from_writer(file);
     let names = ExportNames::new(package);
     csv_header(&mut output, package)?;
     for conversation in selected_conversations(package) {
@@ -343,12 +346,6 @@ fn write_csv(
     }
     output.flush()?;
     Ok(())
-}
-
-fn csv_writer(path: &Path) -> Result<csv::Writer<File>, ExportError> {
-    let mut file = File::create(path)?;
-    file.write_all(&[0xEF, 0xBB, 0xBF])?;
-    Ok(csv::WriterBuilder::new().from_writer(file))
 }
 
 fn safe_csv(value: &str) -> String {
@@ -363,12 +360,12 @@ fn safe_csv(value: &str) -> String {
 }
 
 fn write_html(
-    target: &Path,
+    file: File,
     package: &ExportPackage,
     cancelled: &AtomicBool,
     for_print: bool,
 ) -> Result<(), ExportError> {
-    let mut output = BufWriter::new(File::create(target)?);
+    let mut output = BufWriter::new(file);
     let names = ExportNames::new(package);
     let conversations = selected_conversations(package);
     html_header(
@@ -405,11 +402,11 @@ fn html_document_start(title: &str, for_print: bool, pretty: bool) -> String {
 }
 
 fn write_markdown(
-    target: &Path,
+    file: File,
     package: &ExportPackage,
     cancelled: &AtomicBool,
 ) -> Result<(), ExportError> {
-    let mut output = BufWriter::new(File::create(target)?);
+    let mut output = BufWriter::new(file);
     let names = ExportNames::new(package);
     let conversations = selected_conversations(package);
     markdown_header(
@@ -974,7 +971,13 @@ mod tests {
                 for for_print in [false, true] {
                     let package = fixture(ExportFormat::Html, simplify, pretty);
                     let path = directory.path().join("render.html");
-                    write_html(&path, &package, &AtomicBool::new(false), for_print).unwrap();
+                    write_html(
+                        File::create(&path).unwrap(),
+                        &package,
+                        &AtomicBool::new(false),
+                        for_print,
+                    )
+                    .unwrap();
                     let html = fs::read_to_string(path).unwrap();
                     assert!(html.contains("&lt;script&gt;"));
                     assert!(!html.contains("<script>"));
@@ -1132,6 +1135,59 @@ mod tests {
         ));
         assert!(!cancelled.exists());
         assert!(!partial_path(&cancelled).unwrap().exists());
+    }
+
+    #[test]
+    fn existing_partials_are_preserved_in_all_formats() {
+        let directory = tempfile::tempdir().unwrap();
+        for format in [
+            ExportFormat::Json,
+            ExportFormat::Csv,
+            ExportFormat::Html,
+            ExportFormat::Md,
+        ] {
+            for cancelled in [false, true] {
+                let target = directory.path().join(format!("{format:?}-{cancelled}"));
+                let partial = partial_path(&target).unwrap();
+                fs::write(&partial, b"another export's incomplete data").unwrap();
+                let package = fixture(format, false, false);
+
+                assert!(matches!(
+                    export_package(&package, &target, &AtomicBool::new(cancelled)),
+                    Err(ExportError::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists
+                ));
+                assert_eq!(
+                    fs::read(&partial).unwrap(),
+                    b"another export's incomplete data"
+                );
+                assert!(!target.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_export_cleans_its_partial_and_can_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        for format in [
+            ExportFormat::Json,
+            ExportFormat::Csv,
+            ExportFormat::Html,
+            ExportFormat::Md,
+        ] {
+            let target = directory.path().join(format!("{format:?}"));
+            let package = fixture(format, false, false);
+            assert!(matches!(
+                export_package(&package, &target, &AtomicBool::new(true)),
+                Err(ExportError::Cancelled)
+            ));
+            assert!(!target.exists());
+            assert!(!partial_path(&target).unwrap().exists());
+
+            let result = export_package(&package, &target, &AtomicBool::new(false)).unwrap();
+            assert_eq!(result.message_count, package.messages.len() as u64);
+            assert_eq!(hash_file(&target).unwrap(), result.manifest_sha256);
+            assert!(!partial_path(&target).unwrap().exists());
+        }
     }
 
     #[test]

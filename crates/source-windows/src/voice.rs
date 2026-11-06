@@ -109,11 +109,11 @@ mod tests {
 
     #[test]
     fn system_md5_matches_known_vectors_and_streams_multiple_chunks() {
-        for (data, expected) in [
+        for (mut data, expected) in [
             (b"".as_slice(), "d41d8cd98f00b204e9800998ecf8427e"),
             (b"abc".as_slice(), "900150983cd24fb0d6963f7d28e17f72"),
         ] {
-            assert_eq!(md5(&mut data.as_ref()).unwrap(), expected);
+            assert_eq!(md5(&mut data).unwrap(), expected);
         }
         assert_eq!(
             md5(&mut vec![b'a'; 1_000_000].as_slice()).unwrap(),
@@ -130,9 +130,10 @@ mod tests {
             b"\x02#!SILK_V3 synthetic",
         ] {
             std::fs::write(&path, bytes).unwrap();
+            let mut input = bytes;
             assert_eq!(
                 silk_file_md5(&path).unwrap(),
-                Some((md5(&mut bytes.as_ref()).unwrap(), bytes.len() as u64))
+                Some((md5(&mut input).unwrap(), bytes.len() as u64))
             );
         }
         for bytes in [b"not a voice file".as_slice(), b"#!SILK", b""] {

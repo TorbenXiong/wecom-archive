@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, vi } from "vitest";
 import { MessageTimeline } from "./MessageTimeline";
 import type { ConversationSummary, MessageItem } from "../domain/types";
@@ -73,6 +73,35 @@ describe("message timeline", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("原消息不存在。");
     fireEvent.click(screen.getByTitle("定位到原消息"));
     await waitFor(() => expect(locate).toHaveBeenCalledTimes(2));
+  });
+
+  it.each([
+    { mode: "same-page quote", duration: 1800 },
+    { mode: "search target", duration: 2200 },
+  ])("keeps a repeated $mode highlight for the full new duration", ({ mode, duration }) => {
+    vi.useFakeTimers();
+    try {
+      Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
+      const localQuote = { ...messages[0], quote: { id: messages[1].id, sender: "成员二", time: "", body: "本页原消息" } };
+      const timeline = (targetMessageId?: string) => <MessageTimeline token="test-token" conversation={conversation} messages={[localQuote, messages[1]]} participants={[]} targetMessageId={targetMessageId} />;
+      const isSearch = mode === "search target";
+      const view = render(timeline(isSearch ? messages[1].id : undefined));
+      const target = view.container.querySelector('[data-message-id="older-message"]');
+      if (isSearch) view.rerender(timeline());
+      else fireEvent.click(screen.getByTitle("定位到原消息"));
+      expect(target).toHaveClass("highlighted");
+
+      act(() => vi.advanceTimersByTime(1000));
+      if (isSearch) view.rerender(timeline(messages[1].id));
+      else fireEvent.click(screen.getByTitle("定位到原消息"));
+      act(() => vi.advanceTimersByTime(duration - 1000));
+      expect(target).toHaveClass("highlighted");
+
+      act(() => vi.advanceTimersByTime(1000));
+      expect(target).not.toHaveClass("highlighted");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   beforeEach(() => {

@@ -18,6 +18,8 @@ use uuid::Uuid;
 
 use super::*;
 
+mod settings;
+
 #[test]
 fn only_source_discovery_failures_offer_a_custom_root_retry() {
     assert!(is_local_source_not_found(
@@ -47,6 +49,260 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 const TEST_TOKEN: &str = "0123456789abcdefghijklmnop";
+
+#[cfg(windows)]
+#[tokio::test]
+async fn failed_setting_save_preserves_runtime_and_disk_until_retry_succeeds() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let directory = TestDirectory::new();
+    let app_state = state(&directory);
+    let before = app_state.enterprise_config.lock().unwrap().clone();
+    persist_enterprise_config(&directory.0, &before).unwrap();
+    let path = directory.0.join(ENTERPRISE_CONFIG_FILE);
+    let disk_before = std::fs::read(&path).unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&path)
+        .unwrap();
+    let error = update_super_admin(
+        State(app_state.clone()),
+        authorized_headers(),
+        Json(SuperAdminRequest { enabled: false }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        app_state
+            .enterprise_config
+            .lock()
+            .unwrap()
+            .super_admin_enabled,
+        "failed save changed the active setting"
+    );
+    assert!(std::fs::read(&path).unwrap() == disk_before);
+    drop(locked);
+    let response = update_super_admin(
+        State(app_state.clone()),
+        authorized_headers(),
+        Json(SuperAdminRequest { enabled: false }),
+    )
+    .await
+    .unwrap();
+    assert!(!response.super_admin_enabled);
+    assert!(
+        !app_state
+            .enterprise_config
+            .lock()
+            .unwrap()
+            .super_admin_enabled
+    );
+    assert!(
+        !load_enterprise_config(&directory.0)
+            .unwrap()
+            .super_admin_enabled
+    );
+}
+
+#[test]
+fn enterprise_config_initialization_and_recovery_preserve_identity() {
+    let directory = TestDirectory::new();
+    let path = directory.0.join(ENTERPRISE_CONFIG_FILE);
+    let backup = path.with_extension("json.bak");
+    let first = load_enterprise_config(&directory.0).unwrap();
+    assert!(path.is_file());
+    assert!(backup.is_file());
+    let mut changed = first.clone();
+    changed.organization_name = "synthetic organization".into();
+    persist_enterprise_config(&directory.0, &changed).unwrap();
+    let reloaded = load_enterprise_config(&directory.0).unwrap();
+    assert_eq!(reloaded.organization_id, first.organization_id);
+    assert_eq!(reloaded.organization_name, changed.organization_name);
+    let recovery: EnterpriseConfig =
+        serde_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+    assert_eq!(recovery.organization_name, first.organization_name);
+    assert!(recovery.private_key_protected_hex == first.private_key_protected_hex);
+    let recovery_bytes = std::fs::read(&backup).unwrap();
+    std::fs::write(&path, b"invalid configuration").unwrap();
+    assert!(load_enterprise_config(&directory.0).is_err());
+    assert!(persist_enterprise_config(&directory.0, &changed).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"invalid configuration");
+    assert!(std::fs::read(&backup).unwrap() == recovery_bytes);
+    // Recovery is explicit, so startup cannot silently restore stale settings.
+    source_windows::atomic_file::write(&path, &recovery_bytes).unwrap();
+    let restored = load_enterprise_config(&directory.0).unwrap();
+    assert_eq!(restored.organization_id, first.organization_id);
+    assert!(restored.private_key_protected_hex == first.private_key_protected_hex);
+}
+
+#[test]
+fn missing_or_unreadable_configuration_is_not_treated_as_a_new_installation() {
+    for marker in [
+        "enterprise-config.json.bak",
+        "enterprise-config.json.partial",
+        "collectors",
+    ] {
+        let directory = TestDirectory::new();
+        std::fs::write(directory.0.join(marker), b"synthetic recovery marker").unwrap();
+        assert!(load_enterprise_config(&directory.0).is_err());
+        assert!(!directory.0.join(ENTERPRISE_CONFIG_FILE).exists());
+    }
+    let directory = TestDirectory::new();
+    std::fs::create_dir(directory.0.join(ENTERPRISE_CONFIG_FILE)).unwrap();
+    assert!(load_enterprise_config(&directory.0).is_err());
+    assert!(!directory.0.join("enterprise-config.json.bak").exists());
+}
+
+#[test]
+fn legacy_local_archive_can_initialize_a_persistent_default_configuration() {
+    let directory = TestDirectory::new();
+    let archive = directory.0.join("archive.db");
+    drop(ArchiveStore::open(&archive).unwrap());
+    let original = std::fs::read(&archive).unwrap();
+    let first = load_enterprise_config(&directory.0).unwrap();
+    let second = load_enterprise_config(&directory.0).unwrap();
+    assert_eq!(first.organization_id, second.organization_id);
+    assert!(first.private_key_protected_hex == second.private_key_protected_hex);
+    assert!(std::fs::read(&archive).unwrap() == original);
+}
+
+#[test]
+fn missing_or_corrupted_access_token_does_not_reset_an_existing_archive() {
+    let directory = TestDirectory::new();
+    let path = directory.0.join(ACCESS_TOKEN_FILE);
+    std::fs::write(directory.0.join("archive.db"), b"synthetic archive marker").unwrap();
+    assert!(load_or_generate_access_token(&path).is_err());
+    assert!(!path.exists());
+    std::fs::write(&path, b"invalid protected token").unwrap();
+    assert!(load_or_generate_access_token(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"invalid protected token");
+}
+
+#[cfg(windows)]
+#[test]
+fn failed_configuration_and_token_replacement_preserve_readable_files() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let directory = TestDirectory::new();
+    let mut config = load_enterprise_config(&directory.0).unwrap();
+    let path = directory.0.join(ENTERPRISE_CONFIG_FILE);
+    let original = std::fs::read(&path).unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&path)
+        .unwrap();
+    config.organization_name = "synthetic rejected change".into();
+    assert!(persist_enterprise_config(&directory.0, &config).is_err());
+    assert!(std::fs::read(&path).unwrap() == original);
+    assert!(
+        load_enterprise_config(&directory.0)
+            .unwrap()
+            .organization_name
+            .is_empty()
+    );
+    drop(locked);
+
+    let token_path = directory.0.join(ACCESS_TOKEN_FILE);
+    persist_access_token(&token_path, TEST_TOKEN.as_bytes()).unwrap();
+    let locked = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&token_path)
+        .unwrap();
+    assert!(persist_access_token(&token_path, b"synthetic-replacement-token-value").is_err());
+    assert!(load_or_generate_access_token(&token_path).unwrap().as_str() == TEST_TOKEN);
+    drop(locked);
+    assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 3);
+}
+
+#[tokio::test]
+async fn import_queue_timeout_preserves_the_active_slot_and_allows_retry() {
+    use std::time::Duration;
+    let directory = TestDirectory::new();
+    let app_state = state(&directory);
+    let active = acquire_import_slot(&app_state, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let error = acquire_import_slot(&app_state, Duration::from_millis(40))
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.body.code, "IMPORT_BUSY");
+    assert!(error.body.recoverable);
+    assert_eq!(app_state.import_slots.available_permits(), 0);
+    assert!(!directory.0.join("imports").exists());
+    drop(active);
+    let retry = acquire_import_slot(&app_state, Duration::from_secs(1))
+        .await
+        .unwrap();
+    drop(retry);
+    assert_eq!(app_state.import_slots.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn import_receive_timeouts_clean_partial_files_and_release_the_slot() {
+    use axum::body::Bytes;
+    use futures_util::StreamExt;
+    use std::time::Duration;
+    for extension in ["json", "wca"] {
+        for total_timeout in [false, true] {
+            let directory = TestDirectory::new();
+            let app_state = state(&directory);
+            let body = if total_timeout {
+                Body::from_stream(futures_util::stream::unfold((), |_| async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Some((Ok::<_, std::io::Error>(Bytes::from_static(b"progress")), ()))
+                }))
+            } else {
+                Body::from_stream(
+                    futures_util::stream::once(async {
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"partial"))
+                    })
+                    .chain(futures_util::stream::pending()),
+                )
+            };
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                let _permit = acquire_import_slot(&app_state, Duration::from_secs(1)).await?;
+                receive_file(
+                    &directory.0,
+                    body,
+                    extension,
+                    1024 * 1024,
+                    if total_timeout {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::from_millis(60)
+                    },
+                    if total_timeout {
+                        Duration::from_millis(75)
+                    } else {
+                        Duration::from_secs(5)
+                    },
+                )
+                .await
+            })
+            .await
+            .unwrap();
+            let error = result.unwrap_err();
+            assert_eq!(error.status, StatusCode::REQUEST_TIMEOUT);
+            assert_eq!(error.body.code, "IMPORT_RECEIVE_TIMEOUT");
+            assert!(error.body.recoverable);
+            assert_eq!(app_state.import_slots.available_permits(), 1);
+            assert_eq!(
+                std::fs::read_dir(directory.0.join("imports"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            let retry = receive_json(&directory.0, Body::from("retry body"))
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&retry).unwrap(), b"retry body");
+            std::fs::remove_file(retry).unwrap();
+        }
+    }
+}
 
 #[test]
 fn opening_media_uses_verified_independent_copies_and_preserves_names() {
@@ -437,7 +693,11 @@ async fn super_admin_setting_is_persisted() {
     .await
     .unwrap();
     assert!(response.super_admin_enabled);
-    assert!(load_enterprise_config(&directory.0).super_admin_enabled);
+    assert!(
+        load_enterprise_config(&directory.0)
+            .unwrap()
+            .super_admin_enabled
+    );
 }
 
 #[test]
@@ -526,7 +786,7 @@ async fn local_collection_plans_are_independent_and_persisted() {
     .unwrap();
     assert_eq!(second_response.local_plans.len(), 2);
 
-    let persisted = load_enterprise_config(&directory.0);
+    let persisted = load_enterprise_config(&directory.0).unwrap();
     assert_eq!(persisted.local_collection_plans.len(), 2);
     assert_eq!(
         persisted.local_collection_plans[1].schedule,
@@ -570,7 +830,7 @@ async fn local_plan_cursor_uses_successful_start_time_and_survives_failures() {
     assert_eq!(cutoffs.lock().unwrap().as_slice(), &[None]);
     let started = Utc::now() - chrono::TimeDelta::minutes(10);
     update_local_plan_result(&app_state, &id, started, &first);
-    let persisted = load_enterprise_config(&directory.0);
+    let persisted = load_enterprise_config(&directory.0).unwrap();
     assert_eq!(
         persisted.local_collection_cursors.get(&id),
         Some(&started.to_rfc3339())
@@ -590,14 +850,14 @@ async fn local_plan_cursor_uses_successful_start_time_and_survives_failures() {
         cutoffs.lock().unwrap()[1],
         Some(started.timestamp_millis() - 5 * 60 * 1000)
     );
-    let before_failure = load_enterprise_config(&directory.0);
+    let before_failure = load_enterprise_config(&directory.0).unwrap();
     app_state.local_collector = Some(Arc::new(|_, _, _, _, _, _| Err("synthetic failure".into())));
     assert!(
         run_local_collection_plan(&app_state, &id, false)
             .await
             .is_err()
     );
-    let after_failure = load_enterprise_config(&directory.0);
+    let after_failure = load_enterprise_config(&directory.0).unwrap();
     assert_eq!(
         after_failure.local_collection_cursors,
         before_failure.local_collection_cursors
@@ -612,6 +872,7 @@ async fn local_plan_cursor_uses_successful_start_time_and_survives_failures() {
             .unwrap();
     assert!(
         !load_enterprise_config(&directory.0)
+            .unwrap()
             .local_collection_cursors
             .contains_key(&id)
     );
