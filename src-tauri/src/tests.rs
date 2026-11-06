@@ -1220,6 +1220,7 @@ fn voice_digest_lookup_rejects_wrong_content_size_ambiguity_and_changed_files() 
     };
     let resolver = MediaResolver::new(&candidate, options);
     assert!(resolver.resolve_voice_by_md5(digest, None).is_none());
+    assert!(resolver.files_by_key.get().is_none());
     assert!(
         resolver
             .resolve_voice_by_md5("not a digest", None)
@@ -1231,6 +1232,7 @@ fn voice_digest_lookup_rejects_wrong_content_size_ambiguity_and_changed_files() 
         resolver.resolve_voice_by_md5(digest, Some(bytes.len() as u64)),
         Some(timestamped.canonicalize().unwrap())
     );
+    assert!(resolver.files_by_key.get().is_none());
     assert!(
         resolver
             .resolve_voice_by_md5(digest, Some(bytes.len() as u64 + 1))
@@ -1424,6 +1426,64 @@ fn local_media_hints_ignore_urls_network_paths_parent_traversal_and_broken_envel
     assert!(local_media_paths("14", &[], &extra).is_empty());
     assert!(local_media_paths("14", &[], &[0x42, 0xff]).is_empty());
     assert!(local_media_paths("text", &[], &extra).is_empty());
+}
+
+#[test]
+fn media_lookup_defers_directory_index_until_fallback_and_rebuilds_next_collection() {
+    let directory = TestDirectory::new();
+    let source = directory.0.join("Data");
+    let media = directory.0.join("Media");
+    let nested = media.join("nested");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&nested).unwrap();
+    let direct = media.join("direct.png");
+    let fallback = nested.join("fallback.dat");
+    fs::write(&direct, b"synthetic direct image").unwrap();
+    fs::write(&fallback, b"synthetic fallback image").unwrap();
+    let candidate = SourceCandidate {
+        source_id: "fixture".into(),
+        display_path: "fixture".into(),
+        root_path: source.clone(),
+        databases: vec![],
+        media_roots: vec![media],
+        client_version: None,
+        capability: SourceCapability::Supported,
+    };
+    let options = MediaCollectionOptions {
+        include_files: true,
+        include_images: true,
+    };
+    let resolver = MediaResolver::new(&candidate, options);
+    // Empty/text-only incremental results never pay for recursive traversal.
+    assert!(resolver.files_by_key.get().is_none());
+    assert_eq!(
+        resolver.resolve(&source, "direct.png"),
+        Some(direct.canonicalize().unwrap())
+    );
+    assert!(resolver.files_by_key.get().is_none());
+    assert_eq!(
+        resolver.resolve(&source, "fallback.dat"),
+        Some(fallback.canonicalize().unwrap())
+    );
+    let index = resolver.files_by_key.get().unwrap();
+    assert_eq!(
+        resolver.resolve(&source, "fallback"),
+        Some(fallback.canonicalize().unwrap())
+    );
+    assert!(std::ptr::eq(index, resolver.files_by_key.get().unwrap()));
+    assert!(resolver.resolve(&source, "downloaded-later.dat").is_none());
+    let downloaded = nested.join("downloaded-later.dat");
+    fs::write(&downloaded, b"synthetic later download").unwrap();
+    let next = MediaResolver::new(&candidate, options);
+    assert!(next.files_by_key.get().is_none());
+    assert_eq!(
+        next.resolve(&source, "downloaded-later.dat"),
+        Some(downloaded.canonicalize().unwrap())
+    );
+    fs::remove_file(&fallback).unwrap();
+    assert!(resolver.resolve(&source, "fallback.dat").is_none());
+    let disabled = MediaResolver::new(&candidate, MediaCollectionOptions::default());
+    assert!(disabled.resolve(&source, "downloaded-later.dat").is_none());
 }
 
 #[test]
@@ -1762,13 +1822,16 @@ fn synthetic_plain_source_runs_through_snapshot_and_export_contract() {
         )
         .unwrap();
     drop(connection);
+    let snapshot_cache_root = directory.0.join("snapshot-cache");
+    let incremental_work = directory.0.join("work-incremental");
     let incremental = collect_candidate_with_options_since(
-        candidate,
-        directory.0.join("work-incremental"),
+        candidate.clone(),
+        incremental_work.clone(),
         None,
         authorization(),
         CollectionReadOptions {
             since_unix_ms: Some(1_700_000_000_500),
+            snapshot_cache_root: Some(&snapshot_cache_root),
             ..Default::default()
         },
     )
@@ -1778,6 +1841,35 @@ fn synthetic_plain_source_runs_through_snapshot_and_export_contract() {
         incremental.batches[0].messages[0].body_text.as_deref(),
         Some("增量消息")
     );
+    for damaged in [false, true, false] {
+        let original = fs::read(&message_path).unwrap();
+        if damaged {
+            fs::write(&message_path, b"synthetic invalid database").unwrap();
+        }
+        let repeated = collect_candidate_with_options_since(
+            candidate.clone(),
+            incremental_work.clone(),
+            None,
+            authorization(),
+            CollectionReadOptions {
+                since_unix_ms: Some(1_700_000_000_500),
+                snapshot_cache_root: Some(&snapshot_cache_root),
+                ..Default::default()
+            },
+        );
+        if damaged {
+            assert!(repeated.is_err());
+            fs::write(&message_path, original).unwrap();
+        } else {
+            let repeated = repeated.unwrap();
+            assert_eq!(repeated.message_count, incremental.message_count);
+            assert_eq!(
+                repeated.batches[0].messages[0].stable_message_id,
+                incremental.batches[0].messages[0].stable_message_id
+            );
+        }
+        assert_eq!(fs::read_dir(&incremental_work).unwrap().count(), 0);
+    }
     let serialized = serde_json::to_string(&export).unwrap();
     assert!(!serialized.contains("private"));
     assert_eq!(fs::read_dir(work_root).unwrap().count(), 0);

@@ -30,7 +30,7 @@ use archive_domain::{
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-pub use snapshot::{SnapshotOptions, create_consistent_snapshot};
+pub use snapshot::{CachedSnapshot, SnapshotOptions, create_consistent_snapshot};
 
 pub const ADAPTER_ID: &str = "windows-local-v1";
 const DATABASE_NAMES: &[(&str, &str)] = &[

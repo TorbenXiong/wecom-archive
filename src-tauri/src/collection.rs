@@ -43,6 +43,10 @@ pub(super) const LOCAL_NOTICE_VERSION: &str = "client-notice.v1";
 
 pub(super) const LOCAL_NOTICE_TEXT: &str = "加密传输本机企业微信聊天记录到服务端";
 
+pub(super) fn snapshot_cache_enabled() -> bool {
+    std::env::var("WECOM_ARCHIVE_SNAPSHOT_CACHE").as_deref() == Ok("1")
+}
+
 #[derive(Debug)]
 pub(super) struct CollectionAuthorization {
     pub(super) notice_version: String,
@@ -61,11 +65,12 @@ pub(super) struct CollectionReadOptions<'a> {
     pub(super) media_sink: Option<&'a wecom_archive_server::LocalCollectionMediaSink>,
     pub(super) progress: Option<&'a wecom_archive_server::LocalCollectionProgressReporter>,
     pub(super) since_unix_ms: Option<i64>,
+    pub(super) snapshot_cache_root: Option<&'a Path>,
 }
 
 /// Collects the currently signed-in local WeCom profile for the embedded
-/// enterprise server. The snapshot and key-probe files only live under the
-/// server data directory and are removed before returning.
+/// enterprise server. Working snapshots and key-probe files are removed before
+/// returning; periodic calls may retain raw copies in the advisory cache.
 pub fn collect_local_export(
     include_media: bool,
     data_redaction: bool,
@@ -144,6 +149,7 @@ pub(super) fn collect_local_export_internal(
         std::env::var_os("WECOM_ARCHIVE_SERVER_DATA").map(PathBuf::from),
     );
     let temporary_root = create_work_root(&data_root, "local").map_err(|error| error.message)?;
+    let snapshot_cache_root = data_root.join("snapshot-cache");
     let result = (|| {
         let (candidate, key) = choose_collectable_source(candidates, &mut |source| {
             resolve_collection_key(
@@ -169,6 +175,8 @@ pub(super) fn collect_local_export_internal(
                 media_sink,
                 progress: Some(&progress),
                 since_unix_ms,
+                snapshot_cache_root: (since_unix_ms.is_some() && snapshot_cache_enabled())
+                    .then_some(snapshot_cache_root.as_path()),
             },
         )?;
         progress(88, "整理采集结果", "正在校验消息及媒体内容完整性。");
@@ -225,6 +233,7 @@ pub(super) fn collect_candidate_with_options(
             media_sink,
             progress,
             since_unix_ms: None,
+            snapshot_cache_root: None,
         },
     )
 }
@@ -254,13 +263,39 @@ pub(super) fn collect_candidate_with_options_since(
         "创建快照",
         "正在复制数据库、WAL 和 SHM 文件。",
     );
-    let receipt = WindowsSourceAdapter
-        .snapshot(&candidate, work_root.clone())
+    let cached = options
+        .snapshot_cache_root
+        .map(|root| {
+            source_windows::CachedSnapshot::create(
+                &candidate,
+                &work_root,
+                root,
+                source_windows::SnapshotOptions::default(),
+            )
+        })
+        .transpose()
         .map_err(|error| CommandError {
             code: "SOURCE_SNAPSHOT_FAILED",
             message: sanitize_error(&error.to_string()),
             recoverable: true,
         })?;
+    let uncached;
+    let receipt = if let Some(snapshot) = &cached {
+        diagnostics::verbose(
+            "snapshot_copy",
+            &format!("written_bytes={}", snapshot.written_bytes()),
+        );
+        snapshot.receipt()
+    } else {
+        uncached = WindowsSourceAdapter
+            .snapshot(&candidate, work_root.clone())
+            .map_err(|error| CommandError {
+                code: "SOURCE_SNAPSHOT_FAILED",
+                message: sanitize_error(&error.to_string()),
+                recoverable: true,
+            })?;
+        &uncached
+    };
     report_collection_progress(
         options.progress,
         42,
@@ -268,8 +303,10 @@ pub(super) fn collect_candidate_with_options_since(
         "数据库快照已完成，正在安全打开副本。",
     );
     let result =
-        read_snapshot_export_with_options(&candidate, &receipt, key, authorization, options);
-    cleanup_snapshot(&work_root, &receipt.snapshot_root);
+        read_snapshot_export_with_options(&candidate, receipt, key, authorization, options);
+    if cached.is_none() {
+        cleanup_snapshot(&work_root, &receipt.snapshot_root);
+    }
     result
 }
 
@@ -285,6 +322,7 @@ pub(super) fn read_snapshot_export_with_options(
         media_sink,
         progress,
         since_unix_ms,
+        snapshot_cache_root: _,
     } = options;
     report_collection_progress(
         progress,
@@ -338,8 +376,8 @@ pub(super) fn read_snapshot_export_with_options(
         report_collection_progress(
             progress,
             52,
-            "扫描媒体目录",
-            "正在建立图片和文件索引，不会修改源目录。",
+            "准备媒体查找",
+            "优先使用消息本地路径，需要时再扫描媒体目录。",
         );
     }
     let media_resolver = MediaResolver::new(candidate, media_options);
