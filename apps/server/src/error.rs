@@ -103,6 +103,19 @@ impl ApiError {
         }
     }
 
+    pub(super) fn export_task_capacity() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: ErrorResponse {
+                code: "EXPORT_TASK_CAPACITY_REACHED",
+                message:
+                    "导出任务记录已满，已有结果仍保留；请先查询原任务，待记录过期后再创建导出。"
+                        .into(),
+                recoverable: true,
+            },
+        }
+    }
+
     pub(super) fn import_receive_timeout() -> Self {
         Self {
             status: StatusCode::REQUEST_TIMEOUT,

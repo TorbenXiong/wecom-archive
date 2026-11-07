@@ -695,7 +695,11 @@ export async function createServerExport(token: string, exportRequest: ServerExp
       if (error instanceof ServerApiError && error.status === 404) return request<ServerExportResult>("/api/v1/exports", token, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(exportRequest), signal,
       });
-      if (error instanceof ServerApiError && error.code && error.code !== "TASK_ALREADY_EXISTS") throw error;
+      // Capacity is a confirmed refusal before registration. Other coded 5xx
+      // replies may come from a gateway after the original task was accepted.
+      if (error instanceof ServerApiError && error.code && error.code !== "TASK_ALREADY_EXISTS"
+        && ((error.status >= 400 && error.status < 500 && ![408, 409, 429].includes(error.status))
+          || (error.status === 503 && error.code === "EXPORT_TASK_CAPACITY_REACHED"))) throw error;
       throw new ExportStatusUnknownError(requestedTaskId, Boolean(signal?.aborted));
     }
   }

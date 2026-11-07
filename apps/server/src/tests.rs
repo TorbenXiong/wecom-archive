@@ -20,6 +20,7 @@ use super::*;
 
 mod collector_uploads;
 mod export_queue;
+mod export_retention;
 mod long_tasks;
 mod maintenance;
 mod settings;

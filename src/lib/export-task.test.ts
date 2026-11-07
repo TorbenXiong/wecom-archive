@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, vi } from "vitest";
 import { ExportDialog } from "../components/Overlays";
-import { createServerExport, ExportStatusUnknownError } from "./server-api";
+import { createServerExport, ExportStatusUnknownError, ServerApiError } from "./server-api";
 
 const result = { exportId: "synthetic-export", fileName: "synthetic.json", messageCount: 1 };
 const exportRequest = { scope: "entire_archive" as const, format: "json" as const };
@@ -62,6 +62,67 @@ it("treats a duplicate export start identity as an existing task and preserves a
       ? { code: "EXPORT_STATUS_UNKNOWN", taskId: requestedId }
       : { code: "SUPER_ADMIN_REQUIRED", status: 403 });
     expect(mock).toHaveBeenCalledTimes(1);
+  }
+});
+
+it("returns a capacity refusal without querying or falling back to another export POST", async () => {
+  const mock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => Response.json({
+    code: "EXPORT_TASK_CAPACITY_REACHED", message: "合成导出记录容量已满",
+  }, { status: 503 }));
+  vi.stubGlobal("fetch", mock);
+
+  const refusal: unknown = await createServerExport("synthetic-token", exportRequest).catch((error: unknown) => error);
+  expect(refusal).toBeInstanceOf(ServerApiError);
+  expect(refusal).not.toBeInstanceOf(ExportStatusUnknownError);
+  expect(refusal).toMatchObject({ status: 503, code: "EXPORT_TASK_CAPACITY_REACHED" });
+  expect(mock).toHaveBeenCalledOnce();
+  expect(mock.mock.calls[0][0]).toBe("/api/v1/exports/start");
+  expect(mock.mock.calls[0][1]).toMatchObject({ method: "POST" });
+});
+
+it("keeps coded uncertain start failures unknown and confirms the original ID with GET only", async () => {
+  for (const [status, code] of [
+    [503, "UPSTREAM_TIMEOUT"], [500, "ARCHIVE_STORE_FAILED"],
+    [408, "REQUEST_TIMEOUT"], [409, "UPSTREAM_CONFLICT"], [429, "TOO_MANY_REQUESTS"],
+  ] as const) {
+    let requestedId = "";
+    const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/start")) {
+        requestedId = new Headers(init?.headers).get("X-Archive-Task-Id") || "";
+        return Response.json({ code, message: "合成响应不能确认任务结果" }, { status });
+      }
+      expect(String(input)).toBe(`/api/v1/exports/${requestedId}`);
+      expect(init?.method ?? "GET").toBe("GET");
+      return Response.json({ status: "completed", result });
+    });
+    vi.stubGlobal("fetch", mock);
+
+    const unknown: unknown = await createServerExport("synthetic-token", exportRequest).catch((error: unknown) => error);
+    expect(requestedId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(unknown).toBeInstanceOf(ExportStatusUnknownError);
+    expect(unknown).toMatchObject({ taskId: requestedId, cancellationRequested: false });
+    expect(mock).toHaveBeenCalledOnce();
+    await expect(createServerExport("synthetic-token", exportRequest, undefined, undefined, requestedId)).resolves.toEqual(result);
+    expect(mock.mock.calls.map(([url]) => String(url))).toEqual([
+      "/api/v1/exports/start", `/api/v1/exports/${requestedId}`,
+    ]);
+  }
+});
+
+it("keeps expired or missing export queries unknown without submitting another export", async () => {
+  const taskId = crypto.randomUUID();
+  for (const [status, code] of [[400, "INVALID_QUERY"], [404, "TASK_NOT_FOUND"]] as const) {
+    const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe(`/api/v1/exports/${taskId}`);
+      expect(init?.method ?? "GET").toBe("GET");
+      return Response.json({ code, message: "合成旧任务已不可查询" }, { status });
+    });
+    vi.stubGlobal("fetch", mock);
+
+    await expect(createServerExport("synthetic-token", exportRequest, undefined, undefined, taskId)).rejects.toMatchObject({
+      code: "EXPORT_STATUS_UNKNOWN", taskId, cancellationRequested: false,
+    });
+    expect(mock).toHaveBeenCalledOnce();
   }
 });
 

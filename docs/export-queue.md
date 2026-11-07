@@ -40,4 +40,6 @@
 
 任务查询与超时协调见 [长任务状态与超时协调](long-tasks.md)。
 
+后台导出记录的 1 小时终态保留、64 条容量保护及创建错误分类见 [导出结果保留与容量保护](export-result-retention.md)。
+
 验证结果见 [2026-11-07 导出目录隔离验收](acceptance/export-directory-lock-2026-11-07.md)。

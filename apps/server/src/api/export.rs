@@ -255,12 +255,7 @@ async fn execute_archive_export(
         missing_media_count: result.1.missing_media_count,
         manifest_sha256: result.1.manifest_sha256,
     };
-    if let Ok(mut progress) = task.progress.lock() {
-        progress.status = "completed".into();
-        progress.stage = "已完成".into();
-        progress.percent = 100;
-        progress.result = Some(response.clone());
-    }
+    task.finish(&Ok(response.clone()));
     Ok(response)
 }
 
@@ -275,37 +270,19 @@ pub(crate) async fn start_export_job(
     let task = Arc::new(ExportTask::new());
     {
         let mut tasks = state.export_tasks.lock().map_err(|_| ApiError::store())?;
+        tasks.retain(|_, task| !task.expired());
         if tasks.contains_key(&task_id) {
             return Err(crate::tasks::duplicate_id());
         }
         if tasks.len() >= 64 {
-            tasks.retain(|_, task| {
-                task.progress
-                    .lock()
-                    .is_ok_and(|p| matches!(p.status.as_str(), "queued" | "running" | "cancelling"))
-            });
-        }
-        if tasks.len() >= 64 {
-            return Err(ApiError::invalid_query());
+            return Err(ApiError::export_task_capacity());
         }
         tasks.insert(task_id.clone(), Arc::clone(&task));
     }
     let run_id = task_id.clone();
     tokio::spawn(async move {
         let result = execute_archive_export(state, request, Arc::clone(&task), run_id).await;
-        if let Err(error) = result
-            && let Ok(mut progress) = task.progress.lock()
-        {
-            if task.cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                progress.status = "cancelled".into();
-                progress.stage = "已取消，未完成文件已清理".into();
-            } else {
-                progress.status = "failed".into();
-                progress.stage = "导出失败".into();
-                progress.error = Some(error.body.message);
-                progress.error_code = Some(error.body.code.into());
-            }
-        }
+        task.finish(&result);
     });
     Ok(Json(ExportStartResponse {
         task_id,
@@ -320,13 +297,7 @@ pub(crate) async fn export_status(
 ) -> Result<Json<ExportTaskProgress>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
     require_super_admin(&state)?;
-    let task = state
-        .export_tasks
-        .lock()
-        .map_err(|_| ApiError::store())?
-        .get(&export_id)
-        .cloned()
-        .ok_or_else(ApiError::invalid_query)?;
+    let task = find_export_task(&state, &export_id)?;
     let progress = task.progress.lock().map_err(|_| ApiError::store())?.clone();
     Ok(Json(progress))
 }
@@ -338,16 +309,18 @@ pub(crate) async fn cancel_export(
 ) -> Result<Json<ExportTaskProgress>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
     require_super_admin(&state)?;
-    let task = state
-        .export_tasks
-        .lock()
-        .map_err(|_| ApiError::store())?
-        .get(&export_id)
-        .cloned()
-        .ok_or_else(ApiError::invalid_query)?;
+    let task = find_export_task(&state, &export_id)?;
     task.cancel();
     let progress = task.progress.lock().map_err(|_| ApiError::store())?.clone();
     Ok(Json(progress))
+}
+
+fn find_export_task(state: &AppState, id: &str) -> Result<Arc<ExportTask>, ApiError> {
+    let mut tasks = state.export_tasks.lock().map_err(|_| ApiError::store())?;
+    if tasks.get(id).is_some_and(|task| task.expired()) {
+        tasks.remove(id);
+    }
+    tasks.get(id).cloned().ok_or_else(ApiError::invalid_query)
 }
 
 /// Export the current local WeCom snapshot directly. This keeps the fast
