@@ -1,7 +1,3 @@
-use std::sync::Mutex;
-
-static EXPORT_FILE_LOCK: Mutex<()> = Mutex::new(());
-
 mod diagnostics;
 
 const DATA_ROOT_ENV: &str = "WECOM_ARCHIVE_SERVER_DATA";

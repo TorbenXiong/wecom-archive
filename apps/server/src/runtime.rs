@@ -229,6 +229,7 @@ fn prepare_server(
         },
         listen_address: address.to_string(),
         export_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        export_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         import_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         tasks: Arc::new(Mutex::new(Default::default())),
         collector_uploads: Arc::new(Mutex::new(Default::default())),

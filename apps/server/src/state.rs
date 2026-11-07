@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 
 #[derive(Clone)]
 pub(super) struct AppState {
@@ -25,6 +25,7 @@ pub(super) struct AppState {
     pub(super) network_mode: &'static str,
     pub(super) listen_address: String,
     pub(super) export_tasks: Arc<Mutex<HashMap<String, Arc<ExportTask>>>>,
+    pub(super) export_slots: Arc<Semaphore>,
     pub(super) import_slots: Arc<Semaphore>,
     pub(super) tasks: Arc<Mutex<crate::tasks::TaskRegistry>>,
     pub(super) collector_uploads: Arc<Mutex<crate::collector_uploads::UploadRegistry>>,
@@ -45,6 +46,7 @@ pub(crate) struct ExportTaskProgress {
 
 pub(crate) struct ExportTask {
     pub cancelled: AtomicBool,
+    pub(super) cancellation: Notify,
     pub progress: Mutex<ExportTaskProgress>,
 }
 
@@ -52,6 +54,7 @@ impl ExportTask {
     pub fn new() -> Self {
         Self {
             cancelled: AtomicBool::new(false),
+            cancellation: Notify::new(),
             progress: Mutex::new(ExportTaskProgress {
                 status: "queued".into(),
                 percent: 0,
@@ -75,6 +78,7 @@ impl ExportTask {
             self.cancelled.store(true, Ordering::Release);
             progress.status = "cancelling".into();
             progress.stage = "正在取消并清理临时文件".into();
+            self.cancellation.notify_one();
         }
     }
 

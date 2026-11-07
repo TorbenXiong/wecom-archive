@@ -19,6 +19,7 @@ use uuid::Uuid;
 use super::*;
 
 mod collector_uploads;
+mod export_queue;
 mod long_tasks;
 mod maintenance;
 mod settings;
@@ -503,6 +504,7 @@ fn state(directory: &TestDirectory) -> AppState {
         network_mode: "loopback_only",
         listen_address: "127.0.0.1:9812".into(),
         export_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        export_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         import_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         tasks: Arc::new(Mutex::new(Default::default())),
         collector_uploads: Arc::new(Mutex::new(Default::default())),
@@ -523,7 +525,6 @@ fn enable_super_admin(state: &AppState) {
 }
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn background_export_confirms_cleanup_and_cannot_cancel_a_completed_file() {
     let directory = TestDirectory::new();
     let app_state = state(&directory);
@@ -540,7 +541,10 @@ async fn background_export_confirms_cleanup_and_cannot_cancel_a_completed_file()
     };
     // Queue behind a writer, request cancellation, and ensure we only acknowledge
     // cleanup after the worker exits. Uses synthetic data and the actual handlers.
-    let guard = EXPORT_FILE_LOCK.lock().unwrap();
+    let guard = Arc::clone(&app_state.export_slots)
+        .acquire_owned()
+        .await
+        .unwrap();
     let started = start_export_job(
         State(app_state.clone()),
         authorized_headers(),
@@ -558,7 +562,6 @@ async fn background_export_confirms_cleanup_and_cannot_cancel_a_completed_file()
     .unwrap()
     .0;
     assert_eq!(cancelling.status, "cancelling");
-    drop(guard);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let progress = export_status(
@@ -579,6 +582,7 @@ async fn background_export_confirms_cleanup_and_cannot_cancel_a_completed_file()
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(!directory.0.join("exports").exists());
+    drop(guard);
     let completed = start_export_job(
         State(app_state.clone()),
         authorized_headers(),
