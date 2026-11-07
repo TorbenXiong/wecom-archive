@@ -598,8 +598,10 @@ export async function getMediaBlob(token: string, contentHash: string, signal?: 
   return response.blob();
 }
 
-export async function getMediaObjectUrl(token: string, contentHash: string): Promise<string> {
-  return URL.createObjectURL(await getMediaBlob(token, contentHash));
+export async function getMediaObjectUrl(token: string, contentHash: string, signal?: AbortSignal): Promise<string> {
+  const blob = await getMediaBlob(token, contentHash, signal);
+  signal?.throwIfAborted();
+  return URL.createObjectURL(blob);
 }
 
 export function openMediaFile(token: string, contentHash: string, name: string): Promise<{ opened: boolean }> {

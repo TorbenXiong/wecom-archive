@@ -1,9 +1,25 @@
 import { afterEach, vi } from "vitest";
-import { createServerExport, listConversations, listMessages, type ServerConversation } from "./server-api";
+import { createServerExport, getMediaObjectUrl, listConversations, listMessages, type ServerConversation } from "./server-api";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it("forwards media cancellation and avoids creating a URL after the body read was aborted", async () => {
+  const controller = new AbortController();
+  const blob = new Blob(["synthetic image"]);
+  let resolve!: (value: Blob) => void;
+  const mock = vi.fn(async () => ({ ok: true, blob: () => new Promise<Blob>((done) => { resolve = done; }) }));
+  vi.stubGlobal("fetch", mock);
+  const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:unexpected");
+  const pending = getMediaObjectUrl("synthetic-token", "synthetic-hash", controller.signal);
+  await vi.waitFor(() => expect(resolve).toBeDefined());
+  expect(mock).toHaveBeenCalledWith("/api/v1/media/synthetic-hash", { headers: { Authorization: "Bearer synthetic-token" }, signal: controller.signal });
+  controller.abort();
+  resolve(blob);
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  expect(create).not.toHaveBeenCalled();
 });
 
 it("serializes revision-bound anchors while retaining the legacy offset request", async () => {

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, createConnection } from "node:net";
+import { request as httpRequest } from "node:http";
 import { mkdir, readFile, writeFile, readdir, realpath, lstat } from "node:fs/promises";
 import { resolve, dirname, join, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +32,28 @@ export async function localFetch(origin, path, options = {}) {
   const url = new URL(path, origin);
   if (url.hostname !== "127.0.0.1" || url.origin !== origin || url.protocol !== "http:") throw fail("NONLOCAL_TEST_REQUEST");
   return fetch(url, { ...options, redirect: "error", signal: options.signal ?? AbortSignal.timeout(90_000) });
+}
+// Native HTTP honors the explicit deadline even when collection takes longer
+// than fetch's built-in five-minute response-header timeout. No redirects.
+export function localJsonRequest(origin, path, { method = "GET", headers = {}, body, timeout = 90_000 } = {}) {
+  const url = new URL(path, origin);
+  if (url.hostname !== "127.0.0.1" || url.origin !== origin || url.protocol !== "http:") return Promise.reject(fail("NONLOCAL_TEST_REQUEST"));
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, { method, headers, signal: AbortSignal.timeout(timeout) }, response => {
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        response.resume(); reject(fail(`REAL_API_STATUS_${response.statusCode}`)); return;
+      }
+      const chunks = [];
+      response.on("data", chunk => chunks.push(chunk));
+      response.on("error", reject);
+      response.on("end", () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks))); }
+        catch { reject(fail("INVALID_LOCAL_JSON_RESPONSE")); }
+      });
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
 }
 export async function availablePort() {
   const server = createServer();
