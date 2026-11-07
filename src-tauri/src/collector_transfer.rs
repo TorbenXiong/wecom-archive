@@ -1,17 +1,9 @@
 use crate::collector_config::EnterpriseCollectorConfig;
-use crate::collector_http;
 use crate::state::{AppState, CommandError, internal_error};
 use archive_domain::ClientExportV1;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct EnterpriseUploadResponse {
-    pub(super) completed_at: String,
-}
 
 pub(super) fn message_fingerprints(export: &ClientExportV1) -> BTreeMap<String, String> {
     export
@@ -58,38 +50,12 @@ pub(super) fn record_upload_success(state: &AppState, export: &ClientExportV1) {
 }
 
 pub(super) fn post_enterprise_package(
+    state: &AppState,
     endpoint: &str,
     token: &[u8],
     package: &[u8],
 ) -> Result<String, CommandError> {
-    let token = std::str::from_utf8(token).map_err(|_| internal_error())?;
-    let response = collector_http::post_json(
-        endpoint,
-        token,
-        package,
-        "application/octet-stream",
-        15,
-        300,
-    )
-    .map_err(|_| CommandError {
-        code: "ENTERPRISE_UPLOAD_FAILED",
-        message: "企业加密包上传失败，请检查服务端连接后重试。".into(),
-        recoverable: true,
-    })?;
-    if !response.is_success() {
-        return Err(CommandError {
-            code: "ENTERPRISE_UPLOAD_FAILED",
-            message: format!("服务端未接受企业加密包（HTTP {}）。", response.status),
-            recoverable: true,
-        });
-    }
-    serde_json::from_slice::<EnterpriseUploadResponse>(&response.body)
-        .map(|response| response.completed_at)
-        .map_err(|_| CommandError {
-            code: "ENTERPRISE_UPLOAD_FAILED",
-            message: "服务端未返回有效的上传完成时间。".into(),
-            recoverable: true,
-        })
+    crate::collector_upload::upload(state, endpoint, token, package)
 }
 
 pub(super) fn create_enterprise_package(

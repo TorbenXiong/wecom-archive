@@ -27,6 +27,7 @@ pub(super) struct AppState {
     pub(super) export_tasks: Arc<Mutex<HashMap<String, Arc<ExportTask>>>>,
     pub(super) import_slots: Arc<Semaphore>,
     pub(super) tasks: Arc<Mutex<crate::tasks::TaskRegistry>>,
+    pub(super) collector_uploads: Arc<Mutex<crate::collector_uploads::UploadRegistry>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

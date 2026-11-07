@@ -91,6 +91,8 @@ node scripts/acceptance/real-optimizations.mjs --authorized
 
 工作台导入、本机采集及归档导出支持请求响应丢失后的原任务续查；状态暂不可用时明确显示未知结果，避免重复执行。超时预算、记录保留和未覆盖边界见 [长任务状态与超时协调](docs/long-tasks.md)。
 
+远程采集端上传支持独立的设备结果确认；结果未知时保留原标识，不推进增量进度，继续确认不会重复发送原包。设备接口、旧端兼容及重启限制见 [采集端上传结果确认](docs/collector-upload-confirmation.md)。
+
 打包入口执行测试、类型与格式检查、Clippy、前端构建、Windows Release 构建及桌面验收；`-IncludeRealEnvironment` 启用真实验收。可通过 `-PackageName` 指定全新交付目录，`-Cargo`、`-Node` 指定本机工具。交付目录仅含一个 `WeComArchive.exe`，检查版本、x64 架构和哈希；不覆盖旧包，不生成验收报告，不执行 Git 提交或对外发布。
 
 ## 运行数据

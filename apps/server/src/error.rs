@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct ApiError {
     pub(super) status: StatusCode,
     pub(super) body: ErrorResponse,

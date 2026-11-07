@@ -109,9 +109,15 @@ impl Task {
                 "任务记录已满，请稍后重试。",
             ));
         }
+        let task = Self::create(id.clone(), kind);
+        tasks.0.insert(id, Arc::clone(&task));
+        Ok(Some(task))
+    }
+
+    pub(crate) fn create(id: String, kind: &'static str) -> Arc<Self> {
         let now = Utc::now().to_rfc3339();
-        let task = Arc::new(Self(Mutex::new(TaskProgress {
-            task_id: id.clone(),
+        Arc::new(Self(Mutex::new(TaskProgress {
+            task_id: id,
             kind,
             status: "queued",
             stage: "等待执行".into(),
@@ -123,9 +129,17 @@ impl Task {
             error_code: None,
             error_status: None,
             finished_at: None,
-        })));
-        tasks.0.insert(id, Arc::clone(&task));
-        Ok(Some(task))
+        })))
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<TaskProgress, ApiError> {
+        Ok(self.0.lock().map_err(|_| ApiError::store())?.clone())
+    }
+
+    pub(crate) fn expired(&self) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|p| p.finished_at.is_some_and(|at| at.elapsed() >= RETENTION))
     }
 
     pub fn update(&self, status: &'static str, stage: &str, received: Option<u64>) {

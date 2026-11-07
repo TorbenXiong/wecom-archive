@@ -275,6 +275,18 @@ pub(super) fn scheduled_collect_and_upload(
     force_full_scan: bool,
 ) -> Result<ScheduledCollectionOutcome, CommandError> {
     ensure_collector_config_fresh(config)?;
+    if let Some(confirmed) = crate::collector_upload::prepare_upload(
+        state,
+        &config.upload_url,
+        config.upload_token.as_bytes(),
+    )? && let Ok(mut status) = state.schedule_status.lock()
+    {
+        // The previous upload succeeded even if the new source scan fails.
+        // Its incremental checkpoint is still rebuilt by the new scan below.
+        status.last_success_at = Some(confirmed.completed_at);
+        status.last_message_count = Some(confirmed.message_count);
+        status.last_media_count = Some(confirmed.media_count);
+    }
     let candidates = discover_local_sources();
     let media_options = MediaCollectionOptions {
         include_files: config.include_files,
@@ -333,6 +345,7 @@ pub(super) fn scheduled_collect_and_upload(
             incremental.upload(upload_export, &plan, started_ms, force_upload, |delta| {
                 let package = encrypt_enterprise_export(delta, config)?;
                 post_enterprise_package(
+                    state,
                     &config.upload_url,
                     config.upload_token.as_bytes(),
                     &package,

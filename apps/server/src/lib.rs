@@ -22,6 +22,7 @@ include!(concat!(env!("OUT_DIR"), "/embedded_web.rs"));
 mod api;
 mod auth;
 mod collector;
+mod collector_uploads;
 mod config;
 mod error;
 mod files;

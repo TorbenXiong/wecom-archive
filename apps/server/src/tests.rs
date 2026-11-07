@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::*;
 
+mod collector_uploads;
 mod long_tasks;
 mod maintenance;
 mod settings;
@@ -504,6 +505,7 @@ fn state(directory: &TestDirectory) -> AppState {
         export_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         import_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         tasks: Arc::new(Mutex::new(Default::default())),
+        collector_uploads: Arc::new(Mutex::new(Default::default())),
     }
 }
 

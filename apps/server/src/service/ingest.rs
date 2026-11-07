@@ -85,7 +85,18 @@ async fn import_enterprise_work(
     } else {
         receive_package(&state.data_root, body).await?
     });
-    let import_state = state.clone();
+    process_enterprise_import(state, file, collector_id, task, permit, None).await
+}
+
+async fn process_enterprise_import(
+    state: AppState,
+    file: ImportFile,
+    collector_id: Option<String>,
+    task: Option<Arc<Task>>,
+    permit: OwnedSemaphorePermit,
+    identity: Option<crate::collector_uploads::UploadIdentity>,
+) -> Result<Json<ImportResponse>, ApiError> {
+    let import_state = state;
     tokio::task::spawn_blocking(move || {
         // A disconnected caller cannot release the slot while this worker is
         // still retaining the decrypted package or writing the archive.
@@ -93,7 +104,7 @@ async fn import_enterprise_work(
         if let Some(task) = &task {
             task.update("running", "解密并校验导入文件", None);
         }
-        let export = decode_enterprise_export(&import_state, &file.0)?;
+        let export = decode_enterprise_export(&import_state, &file.0, identity.as_ref())?;
         drop(file);
         let result = ingest_export_with_progress(&import_state, export, task.as_deref());
         if let Ok(response) = &result
@@ -122,6 +133,41 @@ async fn import_enterprise_work(
     .map_err(|_| ApiError::store())?
 }
 
+pub(crate) async fn receive_collector_upload(
+    state: AppState,
+    body: Body,
+    owner: String,
+    task: Arc<Task>,
+    identity: crate::collector_uploads::UploadIdentity,
+    accepted: tokio::sync::oneshot::Sender<Result<(), ApiError>>,
+) -> Result<Json<ImportResponse>, ApiError> {
+    let received = async {
+        let permit = acquire_import_slot(&state, IMPORT_QUEUE_TIMEOUT).await?;
+        task.update("receiving", "接收加密上传", Some(0));
+        let file = receive_file_with_progress(
+            &state.data_root,
+            body,
+            "wca",
+            MAX_CLIENT_EXPORT_BYTES,
+            IMPORT_IDLE_TIMEOUT,
+            IMPORT_RECEIVE_TIMEOUT,
+            Some(&task),
+        )
+        .await?;
+        Ok::<_, ApiError>((permit, ImportFile(file)))
+    }
+    .await;
+    let (permit, file) = match received {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = accepted.send(Err(error.clone()));
+            return Err(error);
+        }
+    };
+    let _ = accepted.send(Ok(()));
+    process_enterprise_import(state, file, Some(owner), Some(task), permit, Some(identity)).await
+}
+
 struct ImportFile(PathBuf);
 
 impl Drop for ImportFile {
@@ -133,6 +179,7 @@ impl Drop for ImportFile {
 fn decode_enterprise_export(
     state: &AppState,
     path: &Path,
+    identity: Option<&crate::collector_uploads::UploadIdentity>,
 ) -> Result<archive_domain::ClientExportV1, ApiError> {
     let config = state
         .enterprise_config
@@ -141,6 +188,12 @@ fn decode_enterprise_export(
         .clone();
     let mut package = archive_transfer::read_enterprise_package(path, &config.organization_id)
         .map_err(|_| ApiError::invalid_export())?;
+    if identity.is_some_and(|expected| {
+        expected.export_id != package.export_id
+            || expected.content_sha256 != package.plaintext_sha256
+    }) {
+        return Err(ApiError::invalid_export());
+    }
     let protected_private_key_hex = config
         .collectors
         .iter()
@@ -177,8 +230,12 @@ fn decode_enterprise_export(
         .map_err(|_| ApiError::invalid_export())?,
     );
     drop(ciphertext);
-    archive_transfer::validate_decoded_enterprise_plaintext(&package, &plaintext)
-        .map_err(|_| ApiError::invalid_export())
+    let export = archive_transfer::validate_decoded_enterprise_plaintext(&package, &plaintext)
+        .map_err(|_| ApiError::invalid_export())?;
+    if identity.is_some_and(|expected| expected.export_id != export.export_id) {
+        return Err(ApiError::invalid_export());
+    }
+    Ok(export)
 }
 
 pub(crate) async fn import_json(
