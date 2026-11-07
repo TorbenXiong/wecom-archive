@@ -305,6 +305,7 @@ pub(super) fn scheduled_collect_and_upload(
         config.data_redaction,
     );
     let root = collector_work_root("scheduled")?;
+    let snapshot_cache_root = collector_data_root()?.join("snapshot-cache");
     let result = (|| {
         let export = collect_candidate_with_options_since(
             candidate,
@@ -317,6 +318,8 @@ pub(super) fn scheduled_collect_and_upload(
             CollectionReadOptions {
                 media_options,
                 since_unix_ms: plan.read_since_unix_ms(),
+                snapshot_cache_root: crate::collection::snapshot_cache_enabled()
+                    .then_some(snapshot_cache_root.as_path()),
                 ..Default::default()
             },
         )?;

@@ -23,7 +23,7 @@
 - 支持固定间隔和每日定时。采集端启动时已启用计划，或运行中从未启用改为启用，均会先采集并上传一次，再按计划执行；远程修改通过心跳同步后生效。
 - 远程“最近成功”只记录上传成功时间；准备数据、保存配置、失败尝试和无变化跳过上传均不更新。本机计划记录成功采集时间。
 - 采集与上传共用任务锁；启用计划后的首次任务遇到忙碌会等待，不跳过。首次上传允许空结果，普通周期无消息、目录或成员资料变化时跳过上传。
-- 远程计划首次全量读取，随后从上次成功扫描的开始时间前移 5 分钟读取，仅上传新增或变化的消息及相关附件；进度持久化，失败不推进，重启后可继续。每隔 24 小时在下一次任务中全量核对旧消息修订和附件补齐。开启离线导出时保留全量本地读取，上传仍按变化筛选。数据库快照和媒体目录索引仍完整处理，不代表采集过程所有阶段均已增量化。
+- 远程计划首次全量读取，随后从上次成功扫描的开始时间前移 5 分钟读取，仅上传新增或变化的消息及相关附件；进度持久化，失败不推进，重启后可继续。每隔 24 小时在下一次任务中全量核对旧消息修订和附件补齐。开启离线导出时保留全量本地读取，上传仍按变化筛选。媒体目录索引按需建立：无附件或本地路径可直接命中时跳过通用索引，语音只扫描 Voice 相关分支；媒体索引仅在本次采集中复用。可选的跨周期数据库快照低写入模式通过 `WECOM_ARCHIVE_SNAPSHOT_CACHE=1` 启用，默认关闭；每周期完整比对源文件，只写变化块，缓存不可用时回退完整复制。缓存可能含未脱敏的原始源内容，可停机删除，详见[采集说明](docs/local-collection-fixes.md)。媒体回退查找仍可能扫描全部目录，不代表采集过程所有阶段均已增量化。
 - 关闭采集端窗口会收起到托盘；右键选择“退出采集端”停止运行。窗口和托盘分别展示状态、最近成功和下次执行。
 
 ## 工程结构
@@ -42,9 +42,13 @@ crates/export/        JSON/CSV/HTML/Markdown 导出
 
 详细设计见 [`docs/architecture.md`](docs/architecture.md)，安全边界见 [`docs/privacy-security.md`](docs/privacy-security.md)，当前能力见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，验证状态见 [`docs/implementation-status.md`](docs/implementation-status.md)。
 
-本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；当前版本变化见 [0.0.15 版本说明](docs/release-0.0.15.md)，升级操作见 [升级功能测试方案](docs/update-test-plan.md)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
+本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；当前版本变化见 [0.0.16 版本说明](docs/release-0.0.16.md)，升级操作见 [升级功能测试方案](docs/update-test-plan.md)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
 
 合成数据性能基准见 [`docs/benchmarks.md`](docs/benchmarks.md)，使用 PowerShell 运行 `./scripts/benchmark-archive.ps1`。
+
+会话消息相邻翻页与定位后的取页使用消息锚点，随机页码及失效锚点保留 OFFSET；兼容性、存储层对照和限制见 [深分页与消息定位](docs/message-pagination.md)。
+
+消息图片进入滚动视区附近时按需读取，点击预览复用已读取内容；资源生命周期与验证范围见 [图片按需加载](docs/image-loading.md)。
 
 大包内存分配对照见 [`docs/package-memory.md`](docs/package-memory.md)，覆盖 JSON 导入、加密包编码和密文字段解码；数据均为合成内容，默认离线，不使用真实密钥。
 
@@ -69,10 +73,13 @@ cargo build --release --locked --offline --bin WeComArchive
 ```powershell
 ./scripts/verify-desktop.ps1
 ./scripts/verify-real-environment.ps1 -Authorized
+node scripts/acceptance/real-optimizations.mjs --authorized
 ./scripts/package-release.ps1 -IncludeRealEnvironment
 ```
 
 桌面验收使用现有 `target/release/WeComArchive.exe` 和隔离合成数据；真实验收需要已登录的企业微信，默认检查源发现、探针、群资料和媒体采集，可用 `-Cases media` 单独重跑，单项默认等待 15 分钟。
+
+`real-optimizations.mjs` 使用已有 Release 程序，在独立实例采集真实数据，验证三个本机计划周期、可选快照缓存复用、深页及定位对照、真实图片滚动加载与预览；仅在用户明确授权后运行，可能耗时较长。实例只监听本机，结束或失败均尝试清理本次真实测试数据并报告结果；不会更改已有工作台配置或源数据库。联合回归结果见 [优化验收记录](docs/acceptance/optimization-regression-2026-11-06.md)。
 
 打包入口执行测试、类型与格式检查、Clippy、前端构建、Windows Release 构建及桌面验收；`-IncludeRealEnvironment` 启用真实验收。可通过 `-PackageName` 指定全新交付目录，`-Cargo`、`-Node` 指定本机工具。交付目录仅含一个 `WeComArchive.exe`，检查版本、x64 架构和哈希；不覆盖旧包，不生成验收报告，不执行 Git 提交或对外发布。
 

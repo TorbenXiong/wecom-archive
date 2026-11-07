@@ -555,6 +555,128 @@ async fn background_export_confirms_cleanup_and_cannot_cancel_a_completed_file()
 }
 
 #[tokio::test]
+async fn message_anchor_requests_preserve_offset_fallback_and_position_contract() {
+    let directory = TestDirectory::new();
+    let app_state = state(&directory);
+    let mut export: ClientExportV1 =
+        serde_json::from_slice(&export_bytes("synthetic", Uuid::new_v4(), "anchor")).unwrap();
+    let template = export.batches[0].messages[0].clone();
+    export.batches[0].messages = (0..81)
+        .map(|index| {
+            let mut message = template.clone();
+            message.stable_message_id = format!("anchor-{index:03}");
+            message.source_message_id = message.stable_message_id.clone();
+            message.sent_at += chrono::TimeDelta::seconds(index / 3);
+            message
+        })
+        .collect();
+    let mut store = ArchiveStore::open(&app_state.archive_path).unwrap();
+    store.ingest_batch(&export.batches[0]).unwrap();
+    let revision = store.summary().unwrap().revision;
+    drop(store);
+    for ascending in [false, true] {
+        let base = || MessagesQuery {
+            conversation_id: "conversation-fixture".into(),
+            limit: Some(7),
+            offset: Some(14),
+            sort: Some(if ascending { "asc" } else { "desc" }.into()),
+            ..Default::default()
+        };
+        let expected = list_messages(
+            State(app_state.clone()),
+            authorized_headers(),
+            Query(base()),
+        )
+        .await
+        .unwrap()
+        .0;
+        let target = &expected[3].message.stable_message_id;
+        let position = message_position(
+            State(app_state.clone()),
+            authorized_headers(),
+            AxumPath(target.clone()),
+            Query(PositionQuery { sort: base().sort }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(position.offset_in_conversation, 17);
+        assert_eq!(
+            serde_json::to_value(&position)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        let anchored = || MessagesQuery {
+            anchor_message_id: Some(target.clone()),
+            anchor_shift: Some(-3),
+            anchor_revision: Some(revision),
+            ..base()
+        };
+        let actual = list_messages(
+            State(app_state.clone()),
+            authorized_headers(),
+            Query(MessagesQuery {
+                offset: Some(0),
+                ..anchored()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        for query in [
+            MessagesQuery {
+                anchor_revision: Some(revision + 1),
+                ..anchored()
+            },
+            MessagesQuery {
+                anchor_message_id: Some("missing".into()),
+                ..anchored()
+            },
+        ] {
+            let actual =
+                list_messages(State(app_state.clone()), authorized_headers(), Query(query))
+                    .await
+                    .unwrap()
+                    .0;
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+        }
+        for query in [
+            MessagesQuery {
+                anchor_shift: Some(2),
+                ..anchored()
+            },
+            MessagesQuery {
+                anchor_revision: None,
+                ..anchored()
+            },
+        ] {
+            let error = list_messages(State(app_state.clone()), authorized_headers(), Query(query))
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+        let error = list_messages(
+            State(app_state.clone()),
+            HeaderMap::new(),
+            Query(anchored()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
 async fn lightweight_search_combines_filters_and_locates_the_selected_message() {
     let directory = TestDirectory::new();
     let app_state = state(&directory);
@@ -648,6 +770,7 @@ async fn super_admin_defaults_to_enabled_and_can_be_disabled_for_server_export()
             limit: None,
             offset: None,
             sort: None,
+            ..Default::default()
         }),
     )
     .await

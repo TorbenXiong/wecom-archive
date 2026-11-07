@@ -140,6 +140,103 @@ fn run() -> Result<()> {
     let store = ArchiveStore::open_read_only(&path)?;
     let mut metrics = BTreeMap::new();
     let mut plans = BTreeMap::new();
+    if std::env::args().nth(2).as_deref() == Some("anchor-probe") {
+        let mut metrics = BTreeMap::new();
+        let revision = store.summary()?.revision;
+        let conversation = "R:synthetic-hot";
+        let total = store.count_messages(&MessageQuery {
+            conversation_id: Some(conversation.into()),
+            ..Default::default()
+        })?;
+        for ascending in [false, true] {
+            let order = if ascending { "asc" } else { "desc" };
+            let query = MessageQuery {
+                conversation_id: Some(conversation.into()),
+                limit: 100,
+                offset: total * 4 / 5,
+                sort_ascending: ascending,
+                ..Default::default()
+            };
+            let expected = store.query_messages(&query)?;
+            let anchor = store
+                .query_messages(&MessageQuery {
+                    limit: 1,
+                    offset: query.offset - 1,
+                    ..query.clone()
+                })?
+                .remove(0)
+                .stable_message_id;
+            metrics.insert(
+                format!("offset_page_{order}"),
+                sample(|| {
+                    let _snapshot = store.read_snapshot()?;
+                    let page = store.query_messages(&query)?;
+                    assert_eq!(page, expected);
+                    Ok(page)
+                })?,
+            );
+            metrics.insert(
+                format!("anchor_page_{order}"),
+                sample(|| {
+                    let _snapshot = store.read_snapshot()?;
+                    let page = store
+                        .query_messages_at_anchor(&query, &anchor, 1, revision)?
+                        .ok_or("anchor unexpectedly expired")?;
+                    assert_eq!(page, expected);
+                    Ok(page)
+                })?,
+            );
+            let target = &expected[37].stable_message_id;
+            metrics.insert(
+                format!("located_page_{order}"),
+                sample(|| {
+                    let _snapshot = store.read_snapshot()?;
+                    let page = store
+                        .query_messages_at_anchor(&query, target, -37, revision)?
+                        .ok_or("target unexpectedly expired")?;
+                    assert_eq!(page, expected);
+                    Ok(page)
+                })?,
+            );
+            for rank in [10, total * 4 / 5] {
+                let id = store
+                    .query_messages(&MessageQuery {
+                        limit: 1,
+                        offset: rank,
+                        ..query.clone()
+                    })?
+                    .remove(0)
+                    .stable_message_id;
+                metrics.insert(
+                    format!("position_original_{order}_{rank}"),
+                    sample(|| {
+                        let value = original_offset(&connection, &id, ascending)?;
+                        assert_eq!(value, rank);
+                        Ok(value)
+                    })?,
+                );
+                metrics.insert(
+                    format!("position_tuple_{order}_{rank}"),
+                    sample(|| {
+                        let value = store
+                            .message_offset_in_conversation(&id, ascending)?
+                            .ok_or("target missing")?;
+                        assert_eq!(value, rank);
+                        Ok(value)
+                    })?,
+                );
+            }
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "scope": "store_pages_and_exact_position_not_http", "message_count": count,
+                "conversation_messages": total, "anchor_acquisition_included": false,
+                "metrics": metrics
+            }))?
+        );
+        return Ok(());
+    }
     if std::env::args().nth(2).as_deref() == Some("ordered-probe") {
         let mut metrics = BTreeMap::new();
         let mut plans = BTreeMap::new();
@@ -388,6 +485,24 @@ fn run() -> Result<()> {
     });
     println!("{report}");
     Ok(())
+}
+
+fn original_offset(connection: &Connection, id: &str, ascending: bool) -> Result<u64> {
+    let (conversation, time): (String, String) = connection.query_row(
+        "SELECT conversation_id, sent_at FROM messages WHERE stable_message_id = ?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let comparison = if ascending {
+        "sent_at < ?2 OR (sent_at = ?2 AND stable_message_id < ?3)"
+    } else {
+        "sent_at > ?2 OR (sent_at = ?2 AND stable_message_id > ?3)"
+    };
+    Ok(connection.query_row(
+        &format!("SELECT count(*) FROM messages WHERE conversation_id = ?1 AND ({comparison})"),
+        params![conversation, time, id],
+        |row| row.get::<_, i64>(0),
+    )? as u64)
 }
 
 fn main() {

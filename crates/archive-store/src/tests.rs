@@ -633,6 +633,259 @@ fn repeated_revision_content_keeps_history_and_commits_the_whole_batch() {
 }
 
 #[test]
+fn anchor_pages_match_offset_pages_in_both_orders_with_ties_and_filters() {
+    let directory = tempdir().unwrap();
+    let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+    let mut input = batch("common needle");
+    let template = input.messages[0].clone();
+    input.messages = (0..431)
+        .map(|index| {
+            let mut message = template.clone();
+            message.stable_message_id = format!("anchor-{index:04}");
+            message.source_message_id = message.stable_message_id.clone();
+            message.sent_at += chrono::TimeDelta::seconds(index / 5);
+            message.sender_id = Some(format!("participant-{}", index % 2));
+            if index % 11 == 0 {
+                message.message_type = MessageType::File;
+                message.raw_type = "file".into();
+                message.media.push(MediaRefV1 {
+                    content_hash: None,
+                    original_name: Some("needle-attachment.txt".into()),
+                    mime_type: None,
+                    size_bytes: Some(17),
+                    source_locator: format!("synthetic-{index}"),
+                    integrity: MediaIntegrity::Missing,
+                    missing_reason: Some("synthetic".into()),
+                });
+            }
+            message.body_text = Some(
+                if index % 7 == 0 {
+                    "common needle"
+                } else {
+                    "common"
+                }
+                .into(),
+            );
+            message
+        })
+        .collect();
+    store.ingest_batch(&input).unwrap();
+    let revision = store.summary().unwrap().revision;
+    for ascending in [false, true] {
+        for text in [None, Some("needle".to_owned())] {
+            for participant in [None, Some("participant-0".to_owned())] {
+                for media_only in [false, true] {
+                    let query = MessageQuery {
+                        conversation_id: Some("conversation".into()),
+                        text: text.clone(),
+                        participant_id: participant.clone(),
+                        media_only,
+                        message_type: media_only.then_some(MessageType::File),
+                        starts_at: Some(template.sent_at + chrono::TimeDelta::seconds(10)),
+                        ends_at: Some(template.sent_at + chrono::TimeDelta::seconds(65)),
+                        sort_ascending: ascending,
+                        limit: 50_000,
+                        ..Default::default()
+                    };
+                    let complete = store.query_messages(&query).unwrap();
+                    for size in [1_u32, 7, 37] {
+                        for rank in [0, complete.len() / 2, complete.len() - 1] {
+                            let start = rank / size as usize * size as usize;
+                            let page_query = MessageQuery {
+                                limit: size,
+                                offset: start as u64,
+                                ..query.clone()
+                            };
+                            let expected = store.query_messages(&page_query).unwrap();
+                            let actual = store
+                                .query_messages_at_anchor(
+                                    &page_query,
+                                    &complete[rank].stable_message_id,
+                                    -((rank - start) as i32),
+                                    revision,
+                                )
+                                .unwrap()
+                                .unwrap();
+                            assert_eq!(actual, expected);
+                            let next = store
+                                .query_messages_at_anchor(
+                                    &page_query,
+                                    &complete[rank].stable_message_id,
+                                    1,
+                                    revision,
+                                )
+                                .unwrap()
+                                .unwrap();
+                            assert_eq!(
+                                next,
+                                complete
+                                    .iter()
+                                    .skip(rank + 1)
+                                    .take(size as usize)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            );
+                            if rank >= size as usize {
+                                let previous = store
+                                    .query_messages_at_anchor(
+                                        &page_query,
+                                        &complete[rank].stable_message_id,
+                                        -(size as i32),
+                                        revision,
+                                    )
+                                    .unwrap()
+                                    .unwrap();
+                                assert_eq!(previous, complete[rank - size as usize..rank]);
+                            }
+                            assert_eq!(
+                                store
+                                    .message_offset_in_conversation(
+                                        &complete[rank].stable_message_id,
+                                        ascending
+                                    )
+                                    .unwrap(),
+                                Some(
+                                    store
+                                        .query_messages(&MessageQuery {
+                                            conversation_id: Some("conversation".into()),
+                                            limit: 50_000,
+                                            sort_ascending: ascending,
+                                            ..Default::default()
+                                        })
+                                        .unwrap()
+                                        .iter()
+                                        .position(|m| m.stable_message_id
+                                            == complete[rank].stable_message_id)
+                                        .unwrap() as u64
+                                )
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn anchor_pages_preserve_legacy_projection_order_without_accelerators() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("archive.db");
+    let mut store = ArchiveStore::open(&path).unwrap();
+    let mut input = batch("legacy");
+    let template = input.messages[0].clone();
+    input.messages = (0..12)
+        .map(|index| {
+            let mut message = template.clone();
+            message.stable_message_id = format!("legacy-{index:02}");
+            message.source_message_id = message.stable_message_id.clone();
+            message.sent_at += chrono::TimeDelta::seconds(index / 2);
+            message
+        })
+        .collect();
+    store.ingest_batch(&input).unwrap();
+    store.connection.execute("UPDATE messages SET payload_json = json_set(payload_json, '$.sent_at', '2020-01-01T00:00:00Z') WHERE stable_message_id = 'legacy-05'", []).unwrap();
+    store
+        .connection
+        .execute_batch("DROP TABLE archive_fts_rows; DROP TABLE archive_conversation_stats;")
+        .unwrap();
+    drop(store);
+    let reader = ArchiveStore::open_read_only(&path).unwrap();
+    let _snapshot = reader.read_snapshot().unwrap();
+    let revision = reader.summary().unwrap().revision;
+    for ascending in [true, false] {
+        let query = MessageQuery {
+            conversation_id: Some("conversation".into()),
+            limit: 4,
+            sort_ascending: ascending,
+            ..Default::default()
+        };
+        let rank = reader
+            .message_offset_in_conversation("legacy-05", ascending)
+            .unwrap()
+            .unwrap();
+        let query = MessageQuery {
+            offset: rank / 4 * 4,
+            ..query
+        };
+        assert_eq!(
+            reader
+                .query_messages_at_anchor(&query, "legacy-05", -((rank % 4) as i32), revision)
+                .unwrap()
+                .unwrap(),
+            reader.query_messages(&query).unwrap()
+        );
+    }
+}
+
+#[test]
+fn anchor_revision_validation_uses_the_callers_snapshot_and_rejects_invalid_boundaries() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("archive.db");
+    let mut store = ArchiveStore::open(&path).unwrap();
+    store.ingest_batch(&batch("first")).unwrap();
+    let reader = ArchiveStore::open_read_only(&path).unwrap();
+    let snapshot = reader.read_snapshot().unwrap();
+    let revision = reader.summary().unwrap().revision;
+    let query = MessageQuery {
+        conversation_id: Some("conversation".into()),
+        limit: 7,
+        ..Default::default()
+    };
+    store.ingest_batch(&batch("revised")).unwrap();
+    assert!(
+        reader
+            .query_messages_at_anchor(&query, "stable-one", 0, revision)
+            .unwrap()
+            .is_some()
+    );
+    drop(snapshot);
+    assert!(
+        reader
+            .query_messages_at_anchor(&query, "stable-one", 0, revision)
+            .unwrap()
+            .is_none()
+    );
+    let revision = reader.summary().unwrap().revision;
+    assert!(
+        reader
+            .query_messages_at_anchor(&query, "absent", 0, revision)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reader
+            .query_messages_at_anchor(&query, "stable-one", -7, revision)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        reader
+            .query_messages_at_anchor(&query, "stable-one", 2, revision)
+            .is_err()
+    );
+    assert!(
+        reader
+            .query_messages_at_anchor(&query, "stable-one", -8, revision)
+            .is_err()
+    );
+    assert!(
+        reader
+            .query_messages_at_anchor(
+                &MessageQuery {
+                    conversation_id: Some("other".into()),
+                    ..query
+                },
+                "stable-one",
+                0,
+                revision
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn locates_message_offset_in_descending_conversation_order() {
     let directory = tempdir().unwrap();
     let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();

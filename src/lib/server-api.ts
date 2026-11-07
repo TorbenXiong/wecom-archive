@@ -104,6 +104,9 @@ export interface MessageQuery {
   limit?: number;
   offset?: number;
   sort?: "asc" | "desc";
+  anchorMessageId?: string;
+  anchorShift?: number;
+  anchorRevision?: number;
 }
 
 export interface ServerImportResult {
@@ -424,6 +427,9 @@ export function listMessages(token: string, query: MessageQuery, signal?: AbortS
   if (query.messageType) parameters.set("message_type", query.messageType);
   if (query.mediaOnly) parameters.set("media_only", "true");
   if (query.sort) parameters.set("sort", query.sort);
+  if (query.anchorMessageId) parameters.set("anchor_message_id", query.anchorMessageId);
+  if (query.anchorShift !== undefined) parameters.set("anchor_shift", String(query.anchorShift));
+  if (query.anchorRevision !== undefined) parameters.set("anchor_revision", String(query.anchorRevision));
   return request<ServerMessage[]>(`/api/v1/messages?${parameters}`, token, { signal });
 }
 
@@ -592,8 +598,10 @@ export async function getMediaBlob(token: string, contentHash: string, signal?: 
   return response.blob();
 }
 
-export async function getMediaObjectUrl(token: string, contentHash: string): Promise<string> {
-  return URL.createObjectURL(await getMediaBlob(token, contentHash));
+export async function getMediaObjectUrl(token: string, contentHash: string, signal?: AbortSignal): Promise<string> {
+  const blob = await getMediaBlob(token, contentHash, signal);
+  signal?.throwIfAborted();
+  return URL.createObjectURL(blob);
 }
 
 export function openMediaFile(token: string, contentHash: string, name: string): Promise<{ opened: boolean }> {

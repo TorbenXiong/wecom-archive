@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 
 pub(super) struct MediaResolver {
     pub(super) roots: Vec<PathBuf>,
-    pub(super) files_by_key: BTreeMap<String, Vec<PathBuf>>,
+    index_roots: Vec<PathBuf>,
+    pub(super) files_by_key: OnceLock<BTreeMap<String, Vec<PathBuf>>>,
     pub(super) voice_roots: Vec<PathBuf>,
     pub(super) voice_files_by_md5: OnceLock<BTreeMap<String, Vec<PathBuf>>>,
 }
@@ -27,8 +28,7 @@ impl MediaResolver {
             .iter()
             .filter_map(|root| root.canonicalize().ok())
             .collect::<Vec<_>>();
-        let mut files_by_key = BTreeMap::new();
-        if options.include_files || options.include_images {
+        let index_roots = if options.include_files || options.include_images {
             let account_root = candidate.root_path.canonicalize().ok();
             let index_account_root = candidate.media_roots.is_empty()
                 || account_root.as_ref().is_some_and(|root| {
@@ -38,13 +38,16 @@ impl MediaResolver {
                         .filter_map(|path| path.canonicalize().ok())
                         .any(|path| &path == root)
                 });
-            for root in &roots {
-                if !index_account_root && account_root.as_ref().is_some_and(|path| root == path) {
-                    continue;
-                }
-                index_media_directory(root, root, 0, &mut files_by_key);
-            }
-        }
+            roots
+                .iter()
+                .filter(|root| {
+                    index_account_root || account_root.as_ref().is_none_or(|path| *root != path)
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut voice_roots = std::collections::BTreeSet::new();
         if options.include_files {
             for root in &roots {
@@ -68,7 +71,8 @@ impl MediaResolver {
         }
         Self {
             roots,
-            files_by_key,
+            index_roots,
+            files_by_key: OnceLock::new(),
             voice_roots: voice_roots.into_iter().collect(),
             voice_files_by_md5: OnceLock::new(),
         }
@@ -98,12 +102,24 @@ impl MediaResolver {
         if direct_match.is_some() {
             return direct_match;
         }
+        // Most incremental runs have no media or have usable local paths.
+        // Traverse only when a name/digest fallback is actually needed, and
+        // keep the index local to this collection so later downloads are seen.
+        let index = self.files_by_key.get_or_init(|| self.index_files(None));
         media_lookup_keys(locator).into_iter().find_map(|key| {
-            self.files_by_key
+            index
                 .get(&key)
                 .filter(|paths| paths.len() == 1)
                 .and_then(|paths| self.authorized_file(paths[0].clone()))
         })
+    }
+
+    fn index_files(&self, scope: Option<&[PathBuf]>) -> BTreeMap<String, Vec<PathBuf>> {
+        let mut index = BTreeMap::new();
+        for root in &self.index_roots {
+            index_media_directory(root, root, 0, &mut index, scope);
+        }
+        index
     }
 
     pub(super) fn authorized_file(&self, candidate: PathBuf) -> Option<PathBuf> {
@@ -123,8 +139,18 @@ impl MediaResolver {
         let index = self.voice_files_by_md5.get_or_init(|| {
             // The cache uses timestamp filenames, so a name index cannot link it
             // to a message. Hash each authorized candidate once per collection.
-            let paths = self
-                .files_by_key
+            // Reuse a general index if another attachment already needed it.
+            // Otherwise retain the same root/depth limits while pruning
+            // branches outside the authorized Voice directories.
+            let scoped_files;
+            let files = match self.files_by_key.get() {
+                Some(files) => files,
+                None => {
+                    scoped_files = self.index_files(Some(&self.voice_roots));
+                    &scoped_files
+                }
+            };
+            let paths = files
                 .values()
                 .flatten()
                 .filter(|path| self.voice_roots.iter().any(|root| path.starts_with(root)))
@@ -160,8 +186,15 @@ pub(super) fn index_media_directory(
     directory: &Path,
     depth: usize,
     index: &mut BTreeMap<String, Vec<PathBuf>>,
+    scope: Option<&[PathBuf]>,
 ) {
-    if depth > 32 {
+    if depth > 32
+        || scope.is_some_and(|roots| {
+            !roots
+                .iter()
+                .any(|root| directory.starts_with(root) || root.starts_with(directory))
+        })
+    {
         return;
     }
     let Ok(entries) = fs::read_dir(directory) else {
@@ -176,8 +209,11 @@ pub(super) fn index_media_directory(
         }
         let path = entry.path();
         if file_type.is_dir() {
-            index_media_directory(root, &path, depth + 1, index);
+            index_media_directory(root, &path, depth + 1, index, scope);
         } else if file_type.is_file() {
+            if scope.is_some_and(|roots| !roots.iter().any(|root| path.starts_with(root))) {
+                continue;
+            }
             let mut keys = media_lookup_keys(&entry.file_name().to_string_lossy());
             if let Ok(relative) = path.strip_prefix(root) {
                 keys.extend(media_lookup_keys(&relative.to_string_lossy()));

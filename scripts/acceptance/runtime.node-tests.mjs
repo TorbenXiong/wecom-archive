@@ -5,12 +5,27 @@ import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
-import { availablePort, deadline, DesktopRun, fail, localFetch, portIsClosed, repoRoot, runChild, within } from "./runtime.mjs";
+import { availablePort, deadline, DesktopRun, fail, localFetch, localJsonRequest, portIsClosed, repoRoot, runChild, within } from "./runtime.mjs";
 
 test("owned directory checks reject parent traversal, sibling prefixes and the root itself", () => {
   const root = resolve("target/acceptance/synthetic");
   assert.equal(within(root, join(root, "data/file")), true);
   for (const outside of [root, join(root, ".."), `${root}-other/file`, join(root, "../elsewhere")]) assert.equal(within(root, outside), false);
+});
+
+test("native JSON requests preserve local-only boundaries and explicit deadlines", async () => {
+  const server = createServer((request, response) => {
+    if (request.url === "/redirect") { response.writeHead(302, { Location: "https://example.invalid" }); response.end(); }
+    else setTimeout(() => { response.setHeader("Content-Type", "application/json"); response.end('{"synthetic":true}'); }, 60);
+  });
+  await new Promise(done => server.listen(0, "127.0.0.1", done));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await assert.rejects(localJsonRequest(origin, "https://example.invalid"), { code: "NONLOCAL_TEST_REQUEST" });
+    await assert.rejects(localJsonRequest(origin, "/redirect"), { code: "REAL_API_STATUS_302" });
+    assert.deepEqual(await localJsonRequest(origin, "/delayed", { timeout: 2000 }), { synthetic: true });
+    await assert.rejects(localJsonRequest(origin, "/delayed", { timeout: 10 }), { code: "ABORT_ERR" });
+  } finally { server.closeAllConnections(); await new Promise(done => server.close(done)); }
 });
 
 test("test HTTP refuses other origins and redirects", async () => {
@@ -94,5 +109,18 @@ test("real environment entry requires an explicit authorization switch", { skip:
   try {
     const code = await deadline(new Promise((done, reject) => { child.once("error", reject); child.once("exit", done); }), 10_000, "PREFLIGHT_TIMEOUT");
     assert.notEqual(code, 0);
+  } finally { if (child.exitCode === null) child.kill(); }
+});
+
+test("real optimization acceptance requires explicit authorization before creating runtime data", async () => {
+  const child = spawn(process.execPath, [join(repoRoot, "scripts/acceptance/real-optimizations.mjs")], {
+    cwd: repoRoot, windowsHide: true, stdio: ["ignore", "ignore", "pipe"],
+  });
+  let error = "";
+  child.stderr.setEncoding("utf8").on("data", chunk => { error += chunk; });
+  try {
+    const code = await deadline(new Promise((done, reject) => { child.once("error", reject); child.once("exit", done); }), 10_000, "PREFLIGHT_TIMEOUT");
+    assert.notEqual(code, 0);
+    assert.equal(error.trim(), "EXPLICIT_REAL_ENVIRONMENT_AUTHORIZATION_REQUIRED");
   } finally { if (child.exitCode === null) child.kill(); }
 });

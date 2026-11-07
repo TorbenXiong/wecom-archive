@@ -6,6 +6,90 @@ use rusqlite::{OptionalExtension, params};
 const SEARCH_PREFIX_LIMIT: u64 = 4096;
 
 impl ArchiveStore {
+    /// Read a page relative to a stored projection key. Callers use a read
+    /// snapshot so revision validation and both sides share one archive view.
+    /// Missing/stale anchors return None for the ordinary OFFSET fallback.
+    pub fn query_messages_at_anchor(
+        &self,
+        query: &MessageQuery,
+        anchor_id: &str,
+        shift: i32,
+        revision: u64,
+    ) -> Result<Option<Vec<MessageV1>>, StoreError> {
+        let limit = query.limit.clamp(1, 50_000);
+        if shift < -(limit as i32) || shift > 1 {
+            return Err(StoreError::Invalid("invalid message anchor shift".into()));
+        }
+        // Do not compute a full archive summary just to validate a cursor.
+        if crate::sql::table_count(&self.connection, "audit_events")? != revision {
+            return Ok(None);
+        }
+        let (predicate, mut values) = message_predicate(query)?;
+        values.push(rusqlite::types::Value::Text(anchor_id.into()));
+        let time = self.connection.query_row(
+            &format!("SELECT m.sent_at FROM messages m WHERE {predicate} AND m.stable_message_id = ?{}", values.len()),
+            rusqlite::params_from_iter(values), |row| row.get::<_, String>(0),
+        ).optional()?;
+        let Some(time) = time else { return Ok(None) };
+        if shift == 1 {
+            return self
+                .anchor_slice(query, &time, anchor_id, false, false, limit)
+                .map(Some);
+        }
+        let before = shift.unsigned_abs();
+        let mut page = if before > 0 {
+            let mut rows = self.anchor_slice(query, &time, anchor_id, true, false, before)?;
+            if rows.len() != before as usize {
+                return Ok(None);
+            }
+            rows.reverse();
+            rows
+        } else {
+            Vec::new()
+        };
+        if before < limit {
+            page.extend(self.anchor_slice(query, &time, anchor_id, false, true, limit - before)?);
+        }
+        Ok(Some(page))
+    }
+
+    fn anchor_slice(
+        &self,
+        query: &MessageQuery,
+        time: &str,
+        id: &str,
+        before: bool,
+        inclusive: bool,
+        limit: u32,
+    ) -> Result<Vec<MessageV1>, StoreError> {
+        use rusqlite::types::Value;
+        let (predicate, mut values) = message_predicate(query)?;
+        values.push(Value::Text(time.into()));
+        let time_parameter = values.len();
+        values.push(Value::Text(id.into()));
+        let id_parameter = values.len();
+        values.push(Value::Integer(i64::from(limit)));
+        let limit_parameter = values.len();
+        let ascending = query.sort_ascending != before;
+        let comparison = match (ascending, inclusive) {
+            (true, false) => ">",
+            (true, true) => ">=",
+            (false, false) => "<",
+            (false, true) => "<=",
+        };
+        let direction = if ascending { "ASC" } else { "DESC" };
+        let sql = format!(
+            "SELECT m.payload_json FROM messages m WHERE {predicate}
+             AND (m.sent_at, m.stable_message_id) {comparison} (?{time_parameter}, ?{id_parameter})
+             ORDER BY m.sent_at {direction}, m.stable_message_id {direction} LIMIT ?{limit_parameter}"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
     pub fn query_messages(&self, query: &MessageQuery) -> Result<Vec<MessageV1>, StoreError> {
         if let Some(page) = self.query_search_prefix(query)? {
             return Ok(page);
@@ -267,9 +351,9 @@ impl ArchiveStore {
             return Ok(None);
         };
         let comparison = if sort_ascending {
-            "sent_at < ?2 OR (sent_at = ?2 AND stable_message_id < ?3)"
+            "(sent_at, stable_message_id) < (?2, ?3)"
         } else {
-            "sent_at > ?2 OR (sent_at = ?2 AND stable_message_id > ?3)"
+            "(sent_at, stable_message_id) > (?2, ?3)"
         };
         let sql = format!(
             "SELECT count(*) FROM messages

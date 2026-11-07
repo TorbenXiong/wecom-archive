@@ -1,9 +1,40 @@
 import { afterEach, vi } from "vitest";
-import { createServerExport, listConversations, type ServerConversation } from "./server-api";
+import { createServerExport, getMediaObjectUrl, listConversations, listMessages, type ServerConversation } from "./server-api";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it("forwards media cancellation and avoids creating a URL after the body read was aborted", async () => {
+  const controller = new AbortController();
+  const blob = new Blob(["synthetic image"]);
+  let resolve!: (value: Blob) => void;
+  const mock = vi.fn(async () => ({ ok: true, blob: () => new Promise<Blob>((done) => { resolve = done; }) }));
+  vi.stubGlobal("fetch", mock);
+  const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:unexpected");
+  const pending = getMediaObjectUrl("synthetic-token", "synthetic-hash", controller.signal);
+  await vi.waitFor(() => expect(resolve).toBeDefined());
+  expect(mock).toHaveBeenCalledWith("/api/v1/media/synthetic-hash", { headers: { Authorization: "Bearer synthetic-token" }, signal: controller.signal });
+  controller.abort();
+  resolve(blob);
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  expect(create).not.toHaveBeenCalled();
+});
+
+it("serializes revision-bound anchors while retaining the legacy offset request", async () => {
+  const mock = vi.fn(async (_input: RequestInfo | URL) => Response.json([]));
+  vi.stubGlobal("fetch", mock);
+  await listMessages("token", { conversationId: "synthetic", limit: 100, offset: 9000 });
+  let parameters = new URL(String(mock.mock.calls[0][0]), "http://localhost").searchParams;
+  expect(parameters.get("offset")).toBe("9000");
+  expect(parameters.has("anchor_message_id")).toBe(false);
+  await listMessages("token", { conversationId: "synthetic", limit: 100, offset: 9000, anchorMessageId: "message & #?", anchorShift: 0, anchorRevision: 0 });
+  parameters = new URL(String(mock.mock.calls[1][0]), "http://localhost").searchParams;
+  expect(parameters.get("anchor_message_id")).toBe("message & #?");
+  expect(parameters.get("anchor_shift")).toBe("0");
+  expect(parameters.get("anchor_revision")).toBe("0");
+  expect(parameters.get("offset")).toBe("9000");
 });
 
 it("waits for confirmed cleanup after cancellation and preserves a completed publication", async () => {

@@ -1,10 +1,11 @@
-import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink, FileText, Image, Megaphone, MoreVertical, SlidersHorizontal, X } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ExternalLink, FileText, Megaphone, MoreVertical, SlidersHorizontal } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import type { ConversationSummary, MessageItem, ParticipantItem } from "../domain/types";
 import { conversationKindLabel } from "../domain/conversations";
 import { getMediaObjectUrl, openMediaFile } from "../lib/server-api";
 import { ParticipantCard } from "./ParticipantCard";
+import { ImageAttachment } from "./ImageAttachment";
 import { VoiceAttachment } from "./VoiceAttachment";
 
 interface MessageTimelineProps {
@@ -64,7 +65,15 @@ export function MessageTimeline({
     setLocatingQuote(false);
     setQuoteError("");
     return () => quoteController.current?.abort();
-  }, [conversation.id, pageIndex, pageSize, sortAscending, targetMessageId, token]);
+  }, [conversation.id, pageIndex, pageSize, sortAscending, token]);
+  useEffect(() => {
+    // A new navigation supersedes pending quotes. Clearing an acknowledged
+    // highlight is not navigation and must not cancel a newer user request.
+    if (!targetMessageId) return;
+    quoteController.current?.abort();
+    setLocatingQuote(false);
+    setQuoteError("");
+  }, [targetMessageId]);
   useEffect(() => {
     setPageInput(String(Math.min(pageIndex + 1, totalPages)));
   }, [pageIndex, totalPages]);
@@ -339,21 +348,9 @@ function Attachment({ token, attachment, transcript }: { token: string; attachme
   const [objectUrl, setObjectUrl] = useState<string>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
-  const [previewOpen, setPreviewOpen] = useState(false);
   const [confirmRun, setConfirmRun] = useState(false);
   const active = useRef(true);
   useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
-  useEffect(() => {
-    let cancelled = false;
-    if (attachment.kind === "image" && attachment.contentHash) {
-      setLoading(true);
-      void getMediaObjectUrl(token, attachment.contentHash).then((url) => {
-        if (cancelled) URL.revokeObjectURL(url);
-        else setObjectUrl(url);
-      }).catch(() => { if (!cancelled) setError("图片读取失败，请重新采集或重试。"); }).finally(() => { if (!cancelled) setLoading(false); });
-    }
-    return () => { cancelled = true; };
-  }, [attachment.contentHash, attachment.kind, token]);
   useEffect(() => () => {
     if (objectUrl) URL.revokeObjectURL(objectUrl);
   }, [objectUrl]);
@@ -362,18 +359,16 @@ function Attachment({ token, attachment, transcript }: { token: string; attachme
     setLoading(true);
     setError(undefined);
     try {
-      if (attachment.kind === "image" || save) {
+      if (save) {
         const url = objectUrl || await getMediaObjectUrl(token, attachment.contentHash);
         if (!active.current) { if (!objectUrl) URL.revokeObjectURL(url); return; }
         if (!objectUrl) setObjectUrl(url);
-        if (save) {
-          const link = document.createElement("a");
-          link.href = url;
-          link.download = attachment.name;
-          document.body.appendChild(link);
-          link.click();
-          link.remove();
-        } else setPreviewOpen(true);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = attachment.name;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
       } else {
         await openMediaFile(token, attachment.contentHash, attachment.name);
       }
@@ -384,13 +379,8 @@ function Attachment({ token, attachment, transcript }: { token: string; attachme
     }
   };
   if (attachment.kind === "image") {
-    return <>
-      <button className="image-preview" type="button" aria-label={`查看图片 ${attachment.name}`} onClick={() => void open()} disabled={!attachment.contentHash || loading}>
-        {objectUrl ? <img src={objectUrl} alt={attachment.name} /> : <div className="mini-layout"><span /><span /><span /><span /></div>}
-        <div><Image size={15} />{loading ? "正在读取…" : error || (!attachment.contentHash ? "未采集图片内容" : attachment.meta)}</div>
-      </button>
-      {previewOpen && objectUrl && <div className="media-preview-backdrop" role="presentation" onMouseDown={() => setPreviewOpen(false)}><section className="media-preview-dialog" role="dialog" aria-modal="true" aria-label={`图片预览 ${attachment.name}`} onMouseDown={(event) => event.stopPropagation()}><button type="button" aria-label="关闭图片预览" onClick={() => setPreviewOpen(false)}><X size={20} /></button><img src={objectUrl} alt={attachment.name} /><span>{attachment.name}</span></section></div>}
-    </>;
+    // A changed credential or content hash owns a fresh request and URL lifetime.
+    return <ImageAttachment key={JSON.stringify([token, attachment.contentHash])} token={token} attachment={attachment} />;
   }
   if (attachment.kind === "audio") {
     return <VoiceAttachment key={`${token}:${attachment.contentHash || attachment.name}`} token={token} attachment={attachment} transcript={transcript} />;

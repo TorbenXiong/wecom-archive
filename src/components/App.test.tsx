@@ -122,6 +122,37 @@ afterEach(() => {
 });
 
 describe("archive workspace", () => {
+  it("opens a search hit in another conversation using a page-aligned anchor", async () => {
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
+    installApiMock();
+    const fallback = vi.mocked(fetch).getMockImplementation()!;
+    const pages: URLSearchParams[] = [];
+    const result = { stable_message_id: "search-target", conversation_id: "R:search-target", conversation_name: "跨会话命中", sender_id: "participant-1", sent_at: "2026-09-07T10:24:00Z", direction: "incoming", message_type: "text", body_text: "搜索命中预览", lifecycle: "active", media: [], raw_type: "text" };
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = new URL(String(input), "http://localhost");
+      if (url.pathname.endsWith("/participants")) return Response.json([]);
+      if (url.pathname === "/api/v1/search/messages") return Response.json([result]);
+      if (url.pathname.endsWith("/position")) return Response.json({ conversation_id: result.conversation_id, offset_in_conversation: 450 });
+      if (url.pathname === "/api/v1/messages/count") return Response.json({ total: 701 });
+      if (url.pathname === "/api/v1/messages" && url.searchParams.get("conversation_id") === result.conversation_id) {
+        pages.push(url.searchParams);
+        return Response.json([{ ...result, body_text: "搜索命中正文" }]);
+      }
+      return fallback(input, init);
+    });
+    const { container } = render(<App />);
+    await connect();
+    fireEvent.change(screen.getByLabelText("打开全局搜索"), { target: { value: "命中" } });
+    fireEvent.click(await screen.findByText("搜索命中预览"));
+    await screen.findByText("搜索命中正文");
+    await waitFor(() => expect(container.querySelector('[data-message-id="search-target"]')).toHaveClass("highlighted"));
+    expect(screen.getByLabelText("跳转页码")).toHaveValue("3");
+    expect(pages.at(-1)?.get("offset")).toBe("400");
+    expect(pages.at(-1)?.get("anchor_message_id")).toBe("search-target");
+    expect(pages.at(-1)?.get("anchor_shift")).toBe("-50");
+    expect(pages.at(-1)?.get("anchor_revision")).toBe("1");
+  });
+
   it.each([
     { sort: "desc", pageSize: 200, offset: 350, page: 2 },
     { sort: "asc", pageSize: 100, offset: 250, page: 3 },
@@ -130,6 +161,7 @@ describe("archive workspace", () => {
     installApiMock();
     const fallback = vi.mocked(fetch).getMockImplementation()!;
     const positions: string[] = [];
+    const pages: URLSearchParams[] = [];
     const message = { stable_message_id: "quoted-source", conversation_id: "conversation-1", sender_id: "participant-1", sent_at: "2026-09-07T10:24:00.123456Z", direction: "incoming", message_type: "text", body_text: "引用消息正文", lifecycle: "active", media: [], raw_type: "text" };
     vi.mocked(fetch).mockImplementation(async (input, init) => {
       const url = new URL(String(input), "http://localhost");
@@ -137,6 +169,7 @@ describe("archive workspace", () => {
       if (url.pathname.endsWith("/position")) { positions.push(url.searchParams.get("sort")!); return Response.json({ conversation_id: "conversation-1", offset_in_conversation: offset }); }
       if (url.pathname.endsWith("/messages/count")) return Response.json({ total: 401 });
       if (url.pathname === "/api/v1/messages") {
+        pages.push(url.searchParams);
         const start = Number(url.searchParams.get("offset"));
         return Response.json(start === 0 ? [{ ...message, quoted_message_id: "quoted-target", quoted_message: { ...message, stable_message_id: "quoted-target", body_text: "原消息预览" } }] : [{ ...message, stable_message_id: "quoted-target", body_text: "跨页原消息正文" }]);
       }
@@ -151,6 +184,9 @@ describe("archive workspace", () => {
     await waitFor(() => expect(container.querySelector('[data-message-id="quoted-target"]')).toHaveClass("highlighted"));
     expect(screen.getByLabelText("跳转页码")).toHaveValue(String(page));
     expect(positions).toEqual([sort]);
+    expect(pages.at(-1)?.get("anchor_message_id")).toBe("quoted-target");
+    expect(pages.at(-1)?.get("anchor_shift")).toBe(String(-(offset % pageSize)));
+    expect(pages.at(-1)?.get("anchor_revision")).toBe("1");
   });
 
   it("ignores a quoted-message position response after manual navigation even if fetch ignores abort", async () => {
@@ -363,15 +399,29 @@ describe("archive workspace", () => {
     expect(screen.getByText((_, element) => element instanceof HTMLElement && element.classList.contains("page-jump") && element.textContent.includes("/ 2 页"))).toBeInTheDocument();
     fireEvent.click(pagination.getByRole("button", { name: "下一页" }));
     await waitFor(() => expect(messageRequests.some((url) => new URL(url, "http://localhost").searchParams.get("offset") === "200")).toBe(true));
+    const nextPage = new URL(messageRequests.at(-1)!, "http://localhost").searchParams;
+    expect(nextPage.get("anchor_message_id")).toBe("message-199");
+    expect(nextPage.get("anchor_shift")).toBe("1");
+    expect(nextPage.get("anchor_revision")).toBe("1");
     expect(await screen.findByText((_, element) => element instanceof HTMLElement && element.classList.contains("page-jump") && element.textContent.includes("/ 2 页"))).toBeInTheDocument();
     expect(pagination.getByRole("button", { name: "上一页" })).not.toBeDisabled();
     fireEvent.change(pagination.getByLabelText("每页数量"), { target: { value: "100" } });
     await waitFor(() => expect(messageRequests.some((url) => new URL(url, "http://localhost").searchParams.get("limit") === "100" && new URL(url, "http://localhost").searchParams.get("offset") === "0")).toBe(true));
+    expect(new URL(messageRequests.at(-1)!, "http://localhost").searchParams.has("anchor_message_id")).toBe(false);
     expect(await screen.findByText((_, element) => element instanceof HTMLElement && element.classList.contains("page-jump") && element.textContent.includes("/ 3 页"))).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("跳转页码"), { target: { value: "99" } });
     fireEvent.blur(screen.getByLabelText("跳转页码"));
     await waitFor(() => expect(messageRequests.some((url) => new URL(url, "http://localhost").searchParams.get("offset") === "200" && new URL(url, "http://localhost").searchParams.get("limit") === "100")).toBe(true));
+    expect(new URL(messageRequests.at(-1)!, "http://localhost").searchParams.has("anchor_message_id")).toBe(false);
     expect(await screen.findByText((_, element) => element instanceof HTMLElement && element.classList.contains("page-jump") && element.textContent.includes("/ 3 页"))).toBeInTheDocument();
+    fireEvent.click(pagination.getByRole("button", { name: "上一页" }));
+    await waitFor(() => expect(new URL(messageRequests.at(-1)!, "http://localhost").searchParams.get("offset")).toBe("100"));
+    const previousPage = new URL(messageRequests.at(-1)!, "http://localhost").searchParams;
+    expect(previousPage.get("anchor_message_id")).toBe("message-200");
+    expect(previousPage.get("anchor_shift")).toBe("-100");
+    fireEvent.click(screen.getByRole("button", { name: "按时间降序" }));
+    await waitFor(() => expect(new URL(messageRequests.at(-1)!, "http://localhost").searchParams.get("sort")).toBe("asc"));
+    expect(new URL(messageRequests.at(-1)!, "http://localhost").searchParams.has("anchor_message_id")).toBe(false);
   });
 
   it("renders missing attachment sizes from nullable API fields without null B", async () => {
@@ -636,6 +686,7 @@ describe("archive workspace", () => {
   it("reloads the selected conversation when a collector upload changes the archive revision", async () => {
     let revision = 1;
     let messageRequests = 0;
+    const pageQueries: URLSearchParams[] = [];
     let resolveUpdate: ((response: Response) => void) | undefined;
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
@@ -647,6 +698,7 @@ describe("archive workspace", () => {
       if (url.includes("/messages/count")) return Response.json({ total: revision });
       if (url.includes("/messages")) {
         messageRequests += 1;
+        pageQueries.push(new URL(url, "http://localhost").searchParams);
         return Response.json([{ stable_message_id: `message-${revision}`, conversation_id: "conversation-1", sender_id: "participant-1", sent_at: "2026-09-15T10:00:00Z", direction: "incoming", message_type: "text", body_text: revision === 1 ? "刷新前消息" : "采集端上传后的消息", lifecycle: "active", media: [], raw_type: "text" }]);
       }
       if (url.includes("/participants")) return Response.json([]);
@@ -664,6 +716,7 @@ describe("archive workspace", () => {
     await act(async () => { resolveUpdate?.(Response.json({ revision: 2 })); });
     await waitFor(() => expect(messageRequests).toBeGreaterThan(1));
     expect(await screen.findByText("采集端上传后的消息")).toBeInTheDocument();
+    expect(pageQueries.at(-1)?.has("anchor_message_id")).toBe(false);
   });
 
   it("rejects imports outside the supported archive formats", async () => {
