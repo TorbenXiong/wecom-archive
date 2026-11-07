@@ -89,6 +89,8 @@ node scripts/acceptance/real-optimizations.mjs --authorized
 
 本轮完整验证结果、真实数据规模及尚未覆盖的边界见 [备份恢复及导入验证总览](docs/acceptance/backup-import-validation-summary-2026-11-07.md)。
 
+工作台导入、本机采集及归档导出支持请求响应丢失后的原任务续查；状态暂不可用时明确显示未知结果，避免重复执行。超时预算、记录保留和未覆盖边界见 [长任务状态与超时协调](docs/long-tasks.md)。
+
 打包入口执行测试、类型与格式检查、Clippy、前端构建、Windows Release 构建及桌面验收；`-IncludeRealEnvironment` 启用真实验收。可通过 `-PackageName` 指定全新交付目录，`-Cargo`、`-Node` 指定本机工具。交付目录仅含一个 `WeComArchive.exe`，检查版本、x64 架构和哈希；不覆盖旧包，不生成验收报告，不执行 Git 提交或对外发布。
 
 ## 运行数据

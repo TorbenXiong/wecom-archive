@@ -230,10 +230,12 @@ fn prepare_server(
         listen_address: address.to_string(),
         export_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         import_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        tasks: Arc::new(Mutex::new(Default::default())),
     };
 
     let app = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/tasks/{task_id}", get(crate::tasks::status))
         .route(
             "/api/v1/collectors/{collector_id}/software-update",
             post(crate::request_collector_update),

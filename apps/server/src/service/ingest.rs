@@ -1,3 +1,4 @@
+use crate::tasks::{Task, run_detached};
 use crate::{
     ApiError, AppState, ImportResponse, MAX_CLIENT_EXPORT_BYTES, authorize,
     authorize_enterprise_upload, decode_hex, encode_hex, is_valid_content_hash,
@@ -46,16 +47,55 @@ pub(crate) async fn import_enterprise(
 ) -> Result<Json<ImportResponse>, ApiError> {
     let collector_id =
         authorize_enterprise_upload(&headers, &state.token_sha256, &state.enterprise_config)?;
+    if collector_id.is_some() && headers.contains_key("x-archive-task-id") {
+        // Only workspace credentials can query the task result. Do not let
+        // collector identities consume the workspace tracking record budget.
+        return Err(ApiError::unauthorized());
+    }
+    let task = Task::register(&state, &headers, "import")?;
+    let work = import_enterprise_work(state, body, collector_id, task.clone());
+    if task.is_some() {
+        run_detached(task, work).await
+    } else {
+        work.await
+    }
+}
+
+async fn import_enterprise_work(
+    state: AppState,
+    body: Body,
+    collector_id: Option<String>,
+    task: Option<Arc<Task>>,
+) -> Result<Json<ImportResponse>, ApiError> {
     let permit = acquire_import_slot(&state, IMPORT_QUEUE_TIMEOUT).await?;
-    let file = ImportFile(receive_package(&state.data_root, body).await?);
+    if let Some(task) = &task {
+        task.update("receiving", "接收导入文件", Some(0));
+    }
+    let file = ImportFile(if let Some(task) = &task {
+        receive_file_with_progress(
+            &state.data_root,
+            body,
+            "wca",
+            MAX_CLIENT_EXPORT_BYTES,
+            IMPORT_IDLE_TIMEOUT,
+            IMPORT_RECEIVE_TIMEOUT,
+            Some(task),
+        )
+        .await?
+    } else {
+        receive_package(&state.data_root, body).await?
+    });
     let import_state = state.clone();
     tokio::task::spawn_blocking(move || {
         // A disconnected caller cannot release the slot while this worker is
         // still retaining the decrypted package or writing the archive.
         let _permit = permit;
+        if let Some(task) = &task {
+            task.update("running", "解密并校验导入文件", None);
+        }
         let export = decode_enterprise_export(&import_state, &file.0)?;
         drop(file);
-        let result = ingest_export_blocking(&import_state, export);
+        let result = ingest_export_with_progress(&import_state, export, task.as_deref());
         if let Ok(response) = &result
             && let Some(collector_id) = collector_id
             && let Ok(mut current) = import_state.enterprise_config.lock()
@@ -147,13 +187,46 @@ pub(crate) async fn import_json(
     body: Body,
 ) -> Result<Json<ImportResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
+    let task = Task::register(&state, &headers, "import")?;
+    let work = import_json_work(state, body, task.clone());
+    if task.is_some() {
+        run_detached(task, work).await
+    } else {
+        work.await
+    }
+}
+
+async fn import_json_work(
+    state: AppState,
+    body: Body,
+    task: Option<Arc<Task>>,
+) -> Result<Json<ImportResponse>, ApiError> {
     let permit = acquire_import_slot(&state, IMPORT_QUEUE_TIMEOUT).await?;
-    let file = ImportFile(receive_json(&state.data_root, body).await?);
+    if let Some(task) = &task {
+        task.update("receiving", "接收导入文件", Some(0));
+    }
+    let file = ImportFile(if let Some(task) = &task {
+        receive_file_with_progress(
+            &state.data_root,
+            body,
+            "json",
+            MAX_CLIENT_EXPORT_BYTES,
+            IMPORT_IDLE_TIMEOUT,
+            IMPORT_RECEIVE_TIMEOUT,
+            Some(task),
+        )
+        .await?
+    } else {
+        receive_json(&state.data_root, body).await?
+    });
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        if let Some(task) = &task {
+            task.update("running", "校验导入文件", None);
+        }
         let export = read_json(&file.0).map_err(|_| ApiError::invalid_export())?;
         drop(file);
-        ingest_export_blocking(&state, export)
+        ingest_export_with_progress(&state, export, task.as_deref())
     })
     .await
     .map_err(|_| ApiError::store())?
@@ -173,6 +246,14 @@ fn ingest_export_blocking(
     state: &AppState,
     export: archive_domain::ClientExportV1,
 ) -> Result<Json<ImportResponse>, ApiError> {
+    ingest_export_with_progress(state, export, None)
+}
+
+fn ingest_export_with_progress(
+    state: &AppState,
+    export: archive_domain::ClientExportV1,
+    task: Option<&Task>,
+) -> Result<Json<ImportResponse>, ApiError> {
     let export_id = export.export_id.to_string();
     let batch_count = export.batches.len();
     let media_count = export.media_count;
@@ -182,9 +263,15 @@ fn ingest_export_blocking(
     let batches = export.batches;
     let media_blobs = export.media_blobs;
     let (summary, revision) = {
+        if let Some(task) = task {
+            task.update("running", "校验并保存附件", None);
+        }
         // Release each large hexadecimal attachment as soon as it is durable.
         for blob in media_blobs {
             persist_media_blobs(&state.data_root, std::slice::from_ref(&blob))?;
+        }
+        if let Some(task) = task {
+            task.update("running", "写入归档并提交事务", None);
         }
         let mut store = ArchiveStore::open(&state.archive_path).map_err(ApiError::from_store)?;
         let total = store
@@ -395,6 +482,27 @@ pub(crate) async fn receive_file(
     idle_timeout: Duration,
     total_timeout: Duration,
 ) -> Result<PathBuf, ApiError> {
+    receive_file_with_progress(
+        root,
+        body,
+        extension,
+        limit,
+        idle_timeout,
+        total_timeout,
+        None,
+    )
+    .await
+}
+
+async fn receive_file_with_progress(
+    root: &Path,
+    body: Body,
+    extension: &str,
+    limit: u64,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+    task: Option<&Task>,
+) -> Result<PathBuf, ApiError> {
     let import_root = root.join("imports");
     tokio::fs::create_dir_all(&import_root)
         .await
@@ -437,6 +545,9 @@ pub(crate) async fn receive_file(
             .write_all(&chunk)
             .await
             .map_err(|_| ApiError::store())?;
+        if let Some(task) = task {
+            task.update("receiving", "接收导入文件", Some(received));
+        }
         idle_deadline = Instant::now() + idle_timeout;
     }
     if received == 0 || output.sync_all().await.is_err() {

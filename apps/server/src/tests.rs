@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::*;
 
+mod long_tasks;
 mod maintenance;
 mod settings;
 
@@ -502,6 +503,7 @@ fn state(directory: &TestDirectory) -> AppState {
         listen_address: "127.0.0.1:9812".into(),
         export_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         import_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        tasks: Arc::new(Mutex::new(Default::default())),
     }
 }
 

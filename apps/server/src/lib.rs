@@ -29,6 +29,7 @@ pub mod maintenance;
 mod runtime;
 mod service;
 mod state;
+mod tasks;
 
 use api::*;
 use auth::*;

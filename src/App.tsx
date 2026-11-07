@@ -35,6 +35,9 @@ import {
   ServerApiError,
 } from "./lib/server-api";
 import { useConversationPages } from "./lib/use-conversation-pages";
+import { ArchiveTaskStatus } from "./components/ArchiveTaskStatus";
+import { ArchiveTaskPendingError, type ArchiveTaskKind, type ArchiveTaskProgress } from "./lib/long-task";
+import { resumeArchiveTaskStatus, type ServerImportResult } from "./lib/server-api";
 import "./styles.css";
 
 type Section = "conversations" | "local-export" | "server-config" | "settings";
@@ -92,6 +95,17 @@ export default function App() {
   const [toast, setToast] = useState<{ message: string; tone: "success" | "error"; actionLabel?: string; onAction?: () => void }>();
   const [importing, setImporting] = useState(false);
   const [collectingLocal, setCollectingLocal] = useState(false);
+  const [importProgress, setImportProgress] = useState<ArchiveTaskProgress>();
+  const [collectionTask, setCollectionTask] = useState<ArchiveTaskProgress>();
+  const [pendingImport, setPendingImport] = useState<string>();
+  const [pendingCollection, setPendingCollection] = useState<string>();
+  const activeToken = useRef(token);
+  activeToken.current = token;
+  useEffect(() => {
+    setImportProgress(undefined); setCollectionTask(undefined);
+    setPendingImport(undefined); setPendingCollection(undefined);
+    setImporting(false); setCollectingLocal(false);
+  }, [token]);
   const [localCollectionDataRedaction, setLocalCollectionDataRedaction] = useState(true);
   const [showLocalCollectionSetup, setShowLocalCollectionSetup] = useState(false);
   const [collectionProgress, setCollectionProgress] = useState<LocalCollectionProgress>({ running: false, percent: 0, stage: "准备采集", detail: "正在初始化本机采集任务。" });
@@ -185,8 +199,21 @@ export default function App() {
     return () => controller.abort();
   }, [refreshVersion, token]);
 
+  const completeArchiveTask = async (accessToken: string, result: ServerImportResult, label: string, successMessage?: string) => {
+    if (activeToken.current !== accessToken) return;
+    try { await loadDirectory(accessToken); }
+    catch {
+      if (activeToken.current === accessToken) setToast({ message: `${label}已完成，但列表暂时无法刷新，请稍后重新加载。`, tone: "error" });
+      return;
+    }
+    if (activeToken.current === accessToken) {
+      setRefreshVersion((current) => current + 1);
+      setToast({ message: successMessage || `${label}完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条，更新 ${result.revised.toLocaleString("zh-CN")} 条消息。`, tone: "success" });
+    }
+  };
+
   const importPackage = async (file: File) => {
-    if (!token || importing) return;
+    if (!token || importing || pendingImport) return;
     const lowerName = file.name.toLowerCase();
     if (!lowerName.endsWith(".wca") && !lowerName.endsWith(".json")) {
       setToast({ message: "只支持导入采集端生成的 .wca 加密包或本机导出的 JSON。", tone: "error" });
@@ -195,36 +222,39 @@ export default function App() {
     setImporting(true);
     try {
       const result = lowerName.endsWith(".json")
-        ? await importClientJson(file, token)
-        : await importEnterprisePackage(file, token);
-      await loadDirectory(token);
-      setRefreshVersion((current) => current + 1);
-      setToast({ message: `会话导入完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条消息。`, tone: "success" });
+        ? await importClientJson(file, token, (progress) => { if (activeToken.current === token) setImportProgress(progress); })
+        : await importEnterprisePackage(file, token, (progress) => { if (activeToken.current === token) setImportProgress(progress); });
+      if (activeToken.current !== token) return;
+      setImportProgress(undefined);
+      await completeArchiveTask(token, result, "会话导入", `会话导入完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条消息。`);
     } catch (error) {
+      if (activeToken.current !== token) return;
+      if (error instanceof ArchiveTaskPendingError) { setPendingImport(error.taskId); return; }
+      setImportProgress(undefined);
       setToast({ message: error instanceof Error ? error.message : "会话导入失败。", tone: "error" });
     } finally {
-      setImporting(false);
+      if (activeToken.current === token) setImporting(false);
     }
   };
 
   const [customRootIssue, setCustomRootIssue] = useState<{ includeMedia: boolean; message: string; attemptedRoot?: string } | null>(null);
 
   const collectLocal = async (includeMedia: boolean, sourceRoot?: string) => {
-    if (!token || collectingLocal || !summary.local_collection_available) return;
+    if (!token || collectingLocal || pendingCollection || !summary.local_collection_available) return;
     setCollectingLocal(true);
     setCollectionProgress({ running: true, percent: 2, stage: "准备采集", detail: includeMedia ? "正在准备采集文本、图片和文件。" : "正在准备仅采集文本消息。" });
     try {
-      const result = await collectLocalArchive(token, includeMedia, sourceRoot, localCollectionDataRedaction);
+      const result = await collectLocalArchive(token, includeMedia, sourceRoot, localCollectionDataRedaction, (progress) => { if (activeToken.current === token) setCollectionTask(progress); });
+      if (activeToken.current !== token) return;
       setCustomRootIssue(null);
-      await loadDirectory(token);
-      setRefreshVersion((current) => current + 1);
-      setToast({
-        message: includeMedia
-          ? `本机全内容采集完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条，图片和附件已处理。`
-          : `本机采集完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条，更新 ${result.revised.toLocaleString("zh-CN")} 条消息。`,
-        tone: "success",
-      });
+      setCollectionTask(undefined);
+      await completeArchiveTask(token, result, includeMedia ? "本机全内容采集" : "本机采集", includeMedia
+        ? `本机全内容采集完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条，图片和附件已处理。`
+        : `本机采集完成：新增 ${result.inserted.toLocaleString("zh-CN")} 条，更新 ${result.revised.toLocaleString("zh-CN")} 条消息。`);
     } catch (error) {
+      if (activeToken.current !== token) return;
+      if (error instanceof ArchiveTaskPendingError) { setPendingCollection(error.taskId); return; }
+      setCollectionTask(undefined);
       setToast({ message: error instanceof Error ? error.message : "本机采集未完成。", tone: "error" });
       if (error instanceof ServerApiError && error.code === "LOCAL_SOURCE_NOT_FOUND") {
         setCustomRootIssue({ includeMedia, message: error.message, attemptedRoot: sourceRoot });
@@ -232,18 +262,41 @@ export default function App() {
         setCustomRootIssue(null);
       }
     } finally {
-      setCollectingLocal(false);
+      if (activeToken.current === token) setCollectingLocal(false);
     }
   };
 
   const openLocalCollectionSetup = () => {
-    if (!token || collectingLocal) return;
+    if (!token || collectingLocal || pendingCollection) return;
     setShowLocalCollectionSetup(true);
   };
 
   const openLocalCollectionFromConversation = () => {
     setSection("server-config");
     openLocalCollectionSetup();
+  };
+
+  const recheckArchiveTask = async (kind: ArchiveTaskKind) => {
+    const id = kind === "import" ? pendingImport : pendingCollection;
+    if (!token || !id || (kind === "import" ? importing : collectingLocal)) return;
+    const setBusy = kind === "import" ? setImporting : setCollectingLocal;
+    const setProgress = kind === "import" ? setImportProgress : setCollectionTask;
+    const clear = () => {
+      setProgress(undefined);
+      if (kind === "import") setPendingImport(undefined);
+      else setPendingCollection(undefined);
+    };
+    setBusy(true);
+    try {
+      const result = await resumeArchiveTaskStatus(token, id, kind, (progress) => { if (activeToken.current === token) setProgress(progress); });
+      if (activeToken.current !== token) return;
+      clear();
+      await completeArchiveTask(token, result, kind === "import" ? "会话导入" : "本机采集");
+    } catch (error) {
+      if (activeToken.current !== token || error instanceof ArchiveTaskPendingError) return;
+      clear();
+      setToast({ message: error instanceof Error ? error.message : "任务未完成。", tone: "error" });
+    } finally { if (activeToken.current === token) setBusy(false); }
   };
 
   useEffect(() => {
@@ -424,17 +477,21 @@ export default function App() {
   return <div className="app-shell">
     <div className={section === "local-export" ? "workspace-grid local-export-mode" : isFullPageSection ? "workspace-grid settings-mode" : !superAdminEnabled || !selectedConversation.isGroup ? "workspace-grid no-detail" : detailCollapsed ? "workspace-grid detail-collapsed" : "workspace-grid"}>
       <Navigation active={section} onSelect={setSection} />
-      {section === "server-config" ? <ServerConfigPage token={token} onTokenChanged={setToken} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal} onOpenLocalCollection={openLocalCollectionSetup} /> : section === "settings" ? <SettingsPage token={token} superAdminEnabled={superAdminEnabled} onSuperAdminChange={setSuperAdminEnabled} /> : section === "local-export" ? <LocalExportPage token={token} onCompleted={(result) => showExportCompleted(result, "本机导出完成")} onFailed={(error) => setToast({ message: error instanceof Error ? error.message : "本机导出失败。", tone: "error" })} /> : <>
-        <ConversationList token={token} conversations={conversations} paging={conversationPaging} selectedId={selectedId} messageSortAscending={messageSortAscending} superAdminEnabled={superAdminEnabled} collectedUsers={collectedUsers} onSelect={(id) => { selectedConversationOverride.current = conversations.find((item) => item.id === id); setTargetMessageId(undefined); setSelectedId(id); }} onOpenSearchResult={openSearchResult} onExport={() => setShowExport(true)} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal} onOpenLocalCollection={openLocalCollectionFromConversation} importing={importing} onImport={(file) => void importPackage(file)} />
+      {section === "server-config" ? <ServerConfigPage token={token} onTokenChanged={setToken} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal || Boolean(pendingCollection)} onOpenLocalCollection={openLocalCollectionSetup} /> : section === "settings" ? <SettingsPage token={token} superAdminEnabled={superAdminEnabled} onSuperAdminChange={setSuperAdminEnabled} /> : section === "local-export" ? <LocalExportPage token={token} onCompleted={(result) => showExportCompleted(result, "本机导出完成")} onFailed={(error) => setToast({ message: error instanceof Error ? error.message : "本机导出失败。", tone: "error" })} /> : <>
+        <ConversationList token={token} conversations={conversations} paging={conversationPaging} selectedId={selectedId} messageSortAscending={messageSortAscending} superAdminEnabled={superAdminEnabled} collectedUsers={collectedUsers} onSelect={(id) => { selectedConversationOverride.current = conversations.find((item) => item.id === id); setTargetMessageId(undefined); setSelectedId(id); }} onOpenSearchResult={openSearchResult} onExport={() => setShowExport(true)} localCollectionAvailable={summary.local_collection_available} collectingLocal={collectingLocal || Boolean(pendingCollection)} onOpenLocalCollection={openLocalCollectionFromConversation} importing={importing || Boolean(pendingImport)} onImport={(file) => void importPackage(file)} />
         {superAdminEnabled ? <MessageTimeline token={token} conversation={selectedConversation} messages={messages} participants={participants} sortAscending={messageSortAscending} onSortChange={(ascending) => { setMessageSortAscending(ascending); setMessagePage(0); }} status={messageStatus} targetMessageId={targetMessageId} onTargetLocated={() => setTargetMessageId(undefined)} onLocateQuote={openQuotedMessage} pageIndex={messagePage} pageSize={messagePageSize} totalMessages={messageTotal} totalPages={Math.max(1, Math.ceil(messageTotal / messagePageSize))} onPageSizeChange={(size) => setMessagePageSize(size)} onPageChange={(page) => setMessagePage(page)} onPreviousPage={() => setMessagePage((current) => Math.max(0, current - 1))} onNextPage={() => setMessagePage((current) => current + 1)} /> : <main className="content-gate"><ShieldCheck size={28} /><h2>会话内容已隐藏</h2></main>}
         {superAdminEnabled && selectedConversation.isGroup && <DetailPanel conversation={selectedConversation} participants={participants} messages={messages} collapsed={detailCollapsed} onToggleCollapsed={() => setDetailCollapsed((current) => !current)} />}
       </>}
     </div>
     <footer className="status-bar"><span>已归档 {summary.message_count.toLocaleString("zh-CN")} 条消息 · {summary.media_count.toLocaleString("zh-CN")} 项媒体 · {summary.conversation_count.toLocaleString("zh-CN")} 个会话</span><span><i />受控访问 · 审计已启用</span></footer>
-     {showExport && superAdminEnabled && <ExportDialog token={token} conversationPaging={conversationPaging} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} conversations={conversations} selectedConversationId={selectedId} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" || scope === "date_range" ? summary.message_count : scope === "current_filter" ? messages.length : scope === "selected_conversations" ? 0 : selectedConversation.messageCount} mediaCount={scope === "entire_archive" || scope === "date_range" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async (selection: ExportSelection, signal, onProgress) => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, conversationIds: selection.conversationIds, startDate: selection.startDate, endDate: selection.endDate, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }, signal, onProgress); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
+     {showExport && superAdminEnabled && <ExportDialog token={token} conversationPaging={conversationPaging} scope={scope} format={format} dataRedaction={exportDataRedaction} simplify={exportSimplify} pretty={exportPretty} conversationOrder={exportConversationOrder} messageOrder={exportMessageOrder} onConversationOrderChange={setExportConversationOrder} onMessageOrderChange={setExportMessageOrder} onSimplifyChange={setExportSimplify} onPrettyChange={setExportPretty} conversations={conversations} selectedConversationId={selectedId} onScopeChange={setScope} onFormatChange={setFormat} onDataRedactionChange={setExportDataRedaction} messageCount={scope === "entire_archive" || scope === "date_range" ? summary.message_count : scope === "current_filter" ? messages.length : scope === "selected_conversations" ? 0 : selectedConversation.messageCount} mediaCount={scope === "entire_archive" || scope === "date_range" ? summary.media_count : scope === "current_filter" ? messages.filter((message) => message.attachment).length : selectedConversation.mediaCount} onOpenDirectoryFailed={(error) => setToast({ message: error instanceof Error ? error.message : "无法打开导出目录。", tone: "error" })} onClose={() => setShowExport(false)} onConfirm={async (selection: ExportSelection, signal, onProgress, taskId) => { const result = await createServerExport(token, { scope, format, conversationId: selectedId || undefined, conversationIds: selection.conversationIds, startDate: selection.startDate, endDate: selection.endDate, dataRedaction: exportDataRedaction, simplify: exportSimplify, pretty: exportPretty, conversationOrder: exportConversationOrder, messageOrder: exportMessageOrder }, signal, onProgress, taskId); setShowExport(false); showExportCompleted(result, "服务端导出完成"); }} />}
     {showLocalCollectionSetup && !collectingLocal && <LocalCollectionSetupDialog dataRedaction={localCollectionDataRedaction} onDataRedactionChange={setLocalCollectionDataRedaction} onClose={() => setShowLocalCollectionSetup(false)} onCollect={(includeMedia) => { setShowLocalCollectionSetup(false); void collectLocal(includeMedia); }} />}
     {customRootIssue && !collectingLocal && <CustomSourceRootDialog message={customRootIssue.message} initialRoot={customRootIssue.attemptedRoot ?? ""} onClose={() => setCustomRootIssue(null)} onRetry={(root) => { void collectLocal(customRootIssue.includeMedia, root); }} />}
     {collectingLocal && <LocalCollectionDialog progress={collectionProgress} />}
+    <div className="archive-task-status-list">
+      {importProgress && <ArchiveTaskStatus progress={importProgress} uncertain={Boolean(pendingImport)} checking={importing && Boolean(pendingImport)} onRecheck={() => void recheckArchiveTask("import")} onDismiss={() => { setPendingImport(undefined); setImportProgress(undefined); }} />}
+      {collectionTask && pendingCollection && !collectingLocal && <ArchiveTaskStatus progress={collectionTask} uncertain checking={false} onRecheck={() => void recheckArchiveTask("collection")} onDismiss={() => { setPendingCollection(undefined); setCollectionTask(undefined); }} />}
+    </div>
     {toast && <Toast tone={toast.tone} actionLabel={toast.actionLabel} onAction={toast.onAction} onClose={() => setToast(undefined)}>{toast.message}</Toast>}
   </div>;
 }

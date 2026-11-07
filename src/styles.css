@@ -773,6 +773,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .maintenance-page h1 { font-size: 24px; }
 .maintenance-page p { line-height: 1.7; }
 .maintenance-result { overflow-wrap: anywhere; }
+.archive-task-status-list { position: fixed; right: 24px; bottom: 52px; z-index: 80; display: grid; gap: 12px; width: min(430px, calc(100vw - 48px)); }
+.archive-task-status { display: grid; gap: 8px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: 0 8px 28px #0002; }
+.archive-task-status > span, .archive-task-status small { color: var(--muted); font-size: 12px; }
+.archive-task-status p { margin: 0; font-size: 13px; line-height: 1.6; }
+.archive-task-status > div { display: flex; flex-wrap: wrap; gap: 8px; }
+.archive-task-status small { flex-basis: 100%; }
 .conversation-load-more { padding: 8px 12px; }
 .conversation-load-more:empty { display: none; }
 .timeline-location-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 20px; font-size: 13px; color: var(--blue); }

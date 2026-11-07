@@ -2,6 +2,8 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { StrictMode } from "react";
 import { afterEach, vi } from "vitest";
 import App from "../App";
+import * as serverApi from "../lib/server-api";
+import { ArchiveTaskPendingError, type ArchiveTaskKind, type ArchiveTaskProgress } from "../lib/long-task";
 
 const accessToken = "0123456789abcdefghijklmnop";
 const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
@@ -119,6 +121,91 @@ afterEach(() => {
   window.history.replaceState(null, "", "/");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("long task result recovery", () => {
+  const result: serverApi.ServerImportResult = {
+    exportId: "synthetic-completed-task", batchCount: 1, inserted: 4, unchanged: 0, revised: 0, mediaCount: 0, missingMediaCount: 0,
+  };
+
+  function progress(taskId: string, kind: ArchiveTaskKind): ArchiveTaskProgress {
+    return {
+      taskId, kind, status: "running", stage: "合成后台任务", receivedBytes: 1024,
+      startedAt: "2026-01-02T03:04:05Z", updatedAt: "2026-01-02T03:04:05Z",
+    };
+  }
+
+  it("keeps an uncertain import locked and queries its original identity without uploading again", async () => {
+    installApiMock();
+    const taskId = "synthetic-pending-import";
+    const upload = vi.spyOn(serverApi, "importClientJson").mockImplementation(async (_file, _token, onProgress) => {
+      onProgress?.(progress(taskId, "import"));
+      throw new ArchiveTaskPendingError(taskId, "import");
+    });
+    let finish!: (value: serverApi.ServerImportResult) => void;
+    const resume = vi.spyOn(serverApi, "resumeArchiveTaskStatus").mockImplementation((_token, _id, _kind, onProgress) => {
+      onProgress?.(progress(taskId, "import"));
+      return new Promise((resolve) => { finish = resolve; });
+    });
+    render(<App />);
+    await connect();
+    fireEvent.change(screen.getByLabelText("导入会话"), { target: { files: [new File(["{}"], "synthetic.json", { type: "application/json" })] } });
+    expect(await screen.findByRole("status", { name: "导入任务状态" })).toHaveTextContent("结果暂未确认");
+    expect(screen.getByLabelText("导入会话")).toBeDisabled();
+    expect(screen.queryByText("会话导入失败。")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "继续查询" }));
+    expect(resume).toHaveBeenCalledWith(accessToken, taskId, "import", expect.any(Function));
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("导入会话")).toBeDisabled();
+    await act(async () => { finish(result); });
+    expect(await screen.findByText("会话导入完成：新增 4 条，更新 0 条消息。")).toBeInTheDocument();
+    expect(screen.getByLabelText("导入会话")).toBeEnabled();
+    expect(screen.queryByRole("status", { name: "导入任务状态" })).not.toBeInTheDocument();
+    expect(upload).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks a second local collection while an unknown task can be queried to completion", async () => {
+    installApiMock();
+    const taskId = "synthetic-pending-collection";
+    const collect = vi.spyOn(serverApi, "collectLocalArchive").mockImplementation(async (_token, _media, _root, _redaction, onProgress) => {
+      onProgress?.(progress(taskId, "collection"));
+      throw new ArchiveTaskPendingError(taskId, "collection");
+    });
+    let finish!: (value: serverApi.ServerImportResult) => void;
+    const resume = vi.spyOn(serverApi, "resumeArchiveTaskStatus").mockImplementation((_token, _id, _kind, onProgress) => {
+      onProgress?.(progress(taskId, "collection"));
+      return new Promise((resolve) => { finish = resolve; });
+    });
+    render(<App />);
+    await connect();
+    fireEvent.click(screen.getByRole("button", { name: "采集本机" }));
+    fireEvent.click(await screen.findByRole("button", { name: "仅采集文本" }));
+    expect(await screen.findByRole("status", { name: "本机采集任务状态" })).toHaveTextContent("结果暂未确认");
+    expect(screen.getByRole("button", { name: "采集中…" })).toBeDisabled();
+    expect(screen.queryByRole("dialog", { name: "正在采集本机数据" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "继续查询" }));
+    expect(resume).toHaveBeenCalledWith(accessToken, taskId, "collection", expect.any(Function));
+    expect(collect).toHaveBeenCalledTimes(1);
+    await act(async () => { finish(result); });
+    expect(await screen.findByText("本机采集完成：新增 4 条，更新 0 条消息。")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "会话" }));
+    expect(await screen.findByRole("button", { name: "采集本机" })).toBeEnabled();
+    expect(screen.queryByRole("status", { name: "本机采集任务状态" })).not.toBeInTheDocument();
+    expect(collect).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a completed import separately from a directory refresh failure", async () => {
+    installApiMock();
+    const upload = vi.spyOn(serverApi, "importClientJson").mockResolvedValue(result);
+    render(<App />);
+    await connect();
+    vi.spyOn(serverApi, "getArchiveSummary").mockRejectedValueOnce(new Error("synthetic refresh failure"));
+    fireEvent.change(screen.getByLabelText("导入会话"), { target: { files: [new File(["{}"], "synthetic.json", { type: "application/json" })] } });
+    expect(await screen.findByText("会话导入已完成，但列表暂时无法刷新，请稍后重新加载。")).toBeInTheDocument();
+    expect(screen.queryByText("会话导入失败。")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("导入会话")).toBeEnabled();
+    expect(upload).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("archive workspace", () => {

@@ -242,10 +242,13 @@ pub(crate) async fn start_export_job(
 ) -> Result<Json<ExportStartResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
     require_super_admin(&state)?;
-    let task_id = Uuid::now_v7().to_string();
+    let task_id = crate::tasks::request_id(&headers)?.unwrap_or_else(|| Uuid::now_v7().to_string());
     let task = Arc::new(ExportTask::new());
     {
         let mut tasks = state.export_tasks.lock().map_err(|_| ApiError::store())?;
+        if tasks.contains_key(&task_id) {
+            return Err(crate::tasks::duplicate_id());
+        }
         if tasks.len() >= 64 {
             tasks.retain(|_, task| {
                 task.progress
