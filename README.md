@@ -74,6 +74,8 @@ cargo build --release --locked --offline --bin WeComArchive
 ./scripts/verify-desktop.ps1
 ./scripts/verify-real-environment.ps1 -Authorized
 node scripts/acceptance/real-optimizations.mjs --authorized
+./scripts/verify-real-recovery.ps1 -Authorized
+./scripts/verify-storage-faults.ps1
 ./scripts/package-release.ps1 -IncludeRealEnvironment
 ```
 
@@ -81,11 +83,19 @@ node scripts/acceptance/real-optimizations.mjs --authorized
 
 `real-optimizations.mjs` 使用已有 Release 程序，在独立实例采集真实数据，验证三个本机计划周期、可选快照缓存复用、深页及定位对照、真实图片滚动加载与预览；仅在用户明确授权后运行，可能耗时较长。实例只监听本机，结束或失败均尝试清理本次真实测试数据并报告结果；不会更改已有工作台配置或源数据库。联合回归结果见 [优化验收记录](docs/acceptance/optimization-regression-2026-11-06.md)。
 
+`verify-real-recovery.ps1 -Authorized` 验证真实数据完整备份、独立恢复及导入故障回滚，保留一份校验通过的本机备份并清理临时恢复和故障副本；仅在用户明确授权后执行。数据范围、保留位置及故障场景见 [真实恢复演练](docs/real-recovery-drill.md)。
+
+`verify-storage-faults.ps1` 使用合成数据演练备份/恢复进程中断、导入提交前后中断和 SQLite 容量耗尽；真实 NTFS 写满使用需管理员运行的 `-BoundedVolume`，只操作新建的 256 MiB 虚拟磁盘。进程终止不代表物理断电，详见 [存储故障演练](docs/storage-fault-drill.md)。
+
+本轮完整验证结果、真实数据规模及尚未覆盖的边界见 [备份恢复及导入验证总览](docs/acceptance/backup-import-validation-summary-2026-11-07.md)。
+
 打包入口执行测试、类型与格式检查、Clippy、前端构建、Windows Release 构建及桌面验收；`-IncludeRealEnvironment` 启用真实验收。可通过 `-PackageName` 指定全新交付目录，`-Cargo`、`-Node` 指定本机工具。交付目录仅含一个 `WeComArchive.exe`，检查版本、x64 架构和哈希；不覆盖旧包，不生成验收报告，不执行 Git 提交或对外发布。
 
 ## 运行数据
 
-完整备份范围、离线备份方法、配置异常恢复和 DPAPI 跨机限制见 [备份与恢复](docs/backup-recovery.md)。完整 JSON 导出不包含服务端附件字节，不能替代完整备份。
+桌面“设置 → 归档存储”可退出工作台并打开独立的备份与恢复窗口；无法正常启动时可运行 `WeComArchive.exe --maintenance`。支持完整备份、校验及恢复到新目录，恢复首次启动须确认并暂停计划及旧采集端。完整范围、操作和 DPAPI 跨机限制见 [备份与恢复](docs/backup-recovery.md)。完整 JSON 导出不包含服务端附件字节，不能替代完整备份。
+
+导入的全部批次与人员、会话目录现在统一事务提交，失败可幂等重试；已有附件同时核对实际哈希。数据库回滚与附件文件的边界见 [导入可靠性](docs/import-reliability.md)。
 
 - 自动发现合并企业微信注册表配置、记住的目录及原有默认目录；优先当前账号数据，历史 `Backup` 数据作为后备候选。工作台、采集端发现和后台任务复用记忆目录。
 - 手动填写目录重试时只扫描该目录，避免默认目录中的其他账号被误选。目录须是本机磁盘上的子目录；不接受整盘根目录、网络路径或父目录跳转。目录配置缺失、损坏或失效时，自动发现仍可回退到默认目录。

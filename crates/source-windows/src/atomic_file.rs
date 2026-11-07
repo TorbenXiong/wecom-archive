@@ -4,6 +4,36 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+/// Reject both symbolic links and Windows junctions before maintenance I/O.
+pub fn is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+pub fn lock_exclusive(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000).share_mode(3);
+    }
+    let file = options.open(path)?;
+    if is_link(&file.metadata()?) || !file.metadata()?.is_file() {
+        return Err(io::Error::other("invalid maintenance lock"));
+    }
+    file.try_lock()
+        .map_err(|_| io::Error::other("data directory busy"))?;
+    Ok(file)
+}
+
 struct PartialFile(PathBuf);
 
 impl Drop for PartialFile {

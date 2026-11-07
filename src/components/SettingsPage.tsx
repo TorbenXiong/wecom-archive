@@ -4,6 +4,7 @@ import voiceNotices from "../third-party/silk-notices.txt?raw";
 import { getServerHealth, updateSuperAdmin, type ServerHealth } from "../lib/server-api";
 import { checkForUpdate, installUpdate, type UpdateInfo } from "../lib/update";
 import { isTauri } from "@tauri-apps/api/core";
+import { openDataMaintenance } from "../lib/maintenance";
 
 interface SettingsPageProps {
   token: string;
@@ -19,6 +20,7 @@ export function SettingsPage({ token, superAdminEnabled, onSuperAdminChange }: S
   const [update, setUpdate] = useState<UpdateInfo | null>();
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updateMessage, setUpdateMessage] = useState("");
+  const [maintenanceBusy, setMaintenanceBusy] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -89,6 +91,11 @@ export function SettingsPage({ token, superAdminEnabled, onSuperAdminChange }: S
           <div className="setting-fact"><span>存储方式</span><strong>本机单节点归档库</strong></div>
           <div className="setting-fact"><span>数据目录</span><strong>serverData</strong></div>
           <p>支持全文检索、幂等导入、消息修订和完整性校验。</p>
+          {isTauri() && <><p>备份与恢复将在独立窗口中执行，并退出当前工作台。请先等待采集、导入和导出结束。</p>
+            <button className="secondary-button" disabled={maintenanceBusy || updateBusy} onClick={() => {
+              setMaintenanceBusy(true); setError("");
+              void openDataMaintenance().catch(() => { setMaintenanceBusy(false); setError("无法打开备份与恢复窗口，请重试。"); });
+            }}>{maintenanceBusy ? "正在打开维护窗口…" : "退出工作台并打开备份与恢复"}</button></>}
         </section>
 
         <section className="settings-section compact-setting">

@@ -11,6 +11,7 @@ use tokio::sync::{Semaphore, watch};
 
 #[derive(Clone)]
 pub(super) struct AppState {
+    pub(super) _data_lock: Option<Arc<std::fs::File>>,
     pub(super) data_root: Arc<PathBuf>,
     pub(super) archive_path: Arc<PathBuf>,
     pub(super) token_sha256: Arc<Mutex<[u8; 32]>>,

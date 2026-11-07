@@ -4,7 +4,6 @@ use crate::{
     persist_enterprise_config,
 };
 use archive_store::ArchiveStore;
-use archive_store::IngestSummary;
 use archive_transfer::read_json;
 use axum::Json;
 use axum::body::Body;
@@ -188,19 +187,8 @@ fn ingest_export_blocking(
             persist_media_blobs(&state.data_root, std::slice::from_ref(&blob))?;
         }
         let mut store = ArchiveStore::open(&state.archive_path).map_err(ApiError::from_store)?;
-        let mut total = IngestSummary {
-            inserted: 0,
-            unchanged: 0,
-            revised: 0,
-        };
-        for batch in batches {
-            let current = store.ingest_batch(&batch).map_err(ApiError::from_store)?;
-            total.inserted += current.inserted;
-            total.unchanged += current.unchanged;
-            total.revised += current.revised;
-        }
-        store
-            .upsert_directory(&conversations, &participants)
+        let total = store
+            .ingest_batches_with_directory(batches, &conversations, &participants)
             .map_err(ApiError::from_store)?;
         let revision = store.summary().map_err(ApiError::from_store)?.revision;
         (total, revision)
@@ -270,7 +258,7 @@ pub(crate) fn persist_media_blobs(
                 return Err(ApiError::invalid_export());
             }
             let Some(output) = output else {
-                return Ok(());
+                return verify_persisted_media(&target, &blob.content_hash, blob.size_bytes);
             };
             output.sync_all().map_err(|_| ApiError::store())?;
             drop(output);
@@ -279,7 +267,7 @@ pub(crate) fn persist_media_blobs(
                 Err(error)
                     if error.kind() == std::io::ErrorKind::AlreadyExists && target.is_file() =>
                 {
-                    Ok(())
+                    verify_persisted_media(&target, &blob.content_hash, blob.size_bytes)
                 }
                 Err(_) => Err(ApiError::store()),
             }
@@ -288,6 +276,18 @@ pub(crate) fn persist_media_blobs(
             let _ = std::fs::remove_file(&partial);
         }
         write_result?;
+    }
+    Ok(())
+}
+
+fn verify_persisted_media(path: &Path, hash: &str, size: u64) -> Result<(), ApiError> {
+    if std::fs::metadata(path)
+        .map_err(|_| ApiError::store())?
+        .len()
+        != size
+        || crate::sha256_file(path).map_err(|_| ApiError::store())? != hash
+    {
+        return Err(ApiError::store());
     }
     Ok(())
 }
@@ -305,9 +305,7 @@ pub(crate) fn persist_local_media_file(
     std::fs::create_dir_all(&media_root).map_err(|_| ApiError::store())?;
     let target = media_root.join(expected_hash);
     if target.is_file() {
-        return (target.metadata().map_err(|_| ApiError::store())?.len() == expected_size)
-            .then_some(())
-            .ok_or_else(ApiError::invalid_export);
+        return verify_persisted_media(&target, expected_hash, expected_size);
     }
     let partial = media_root.join(format!(
         ".{}.{}.partial",
@@ -342,7 +340,13 @@ pub(crate) fn persist_local_media_file(
         match std::fs::hard_link(&partial, &target) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && target.is_file() => {
-                Ok(())
+                if std::fs::metadata(&target)?.len() == expected_size
+                    && crate::sha256_file(&target)? == expected_hash
+                {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("existing media integrity failed"))
+                }
             }
             Err(error) => Err(error),
         }

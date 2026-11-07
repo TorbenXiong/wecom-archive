@@ -18,7 +18,82 @@ use uuid::Uuid;
 
 use super::*;
 
+mod maintenance;
 mod settings;
+
+#[tokio::test]
+async fn failed_multibatch_import_preserves_visible_archive_and_allows_retry() {
+    let directory = TestDirectory::new();
+    let app_state = state(&directory);
+    let existing: ClientExportV1 =
+        serde_json::from_slice(&export_bytes("original", Uuid::new_v4(), "original")).unwrap();
+    let _ = ingest_export(&app_state, existing.clone()).await.unwrap();
+    let before = ArchiveStore::open_read_only(&app_state.archive_path)
+        .unwrap()
+        .summary()
+        .unwrap();
+    let notified = *app_state.archive_update.borrow();
+    let mut first = existing.batches[0].clone();
+    first.batch_id = Uuid::new_v4();
+    first.messages[0].body_text = Some("revised in failing import".into());
+    first.messages[0].collection_batch_id = first.batch_id;
+    first.content_sha256 = archive_transfer::json_sha256(&first.messages).unwrap();
+    let mut conflict = existing.batches[0].clone();
+    conflict.content_sha256 = "conflict".into();
+    let mut export = existing.clone();
+    export.batches = vec![first.clone(), conflict];
+    assert!(ingest_export(&app_state, export).await.is_err());
+    let store = ArchiveStore::open_read_only(&app_state.archive_path).unwrap();
+    assert_eq!(store.summary().unwrap(), before);
+    assert_eq!(*app_state.archive_update.borrow(), notified);
+    assert_eq!(
+        store
+            .query_messages(&archive_store::MessageQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap(),
+        existing.batches[0].messages
+    );
+    drop(store);
+    let mut retry = existing;
+    retry.batches = vec![first];
+    assert_eq!(
+        ingest_export(&app_state, retry.clone())
+            .await
+            .unwrap()
+            .0
+            .revised,
+        1
+    );
+    assert_eq!(
+        ingest_export(&app_state, retry).await.unwrap().0.unchanged,
+        1
+    );
+}
+
+#[test]
+fn existing_media_with_equal_size_but_wrong_hash_is_not_accepted_or_overwritten() {
+    let directory = TestDirectory::new();
+    let bytes = b"verified media";
+    let hash = encode_hex(&Sha256::digest(bytes));
+    let blob = MediaBlobV1 {
+        content_hash: hash.clone(),
+        original_name: None,
+        mime_type: None,
+        size_bytes: bytes.len() as u64,
+        content_hex: encode_hex(bytes),
+    };
+    persist_media_blobs(&directory.0, std::slice::from_ref(&blob)).unwrap();
+    let path = directory.0.join("media").join(&hash);
+    let corrupted = vec![b'x'; bytes.len()];
+    std::fs::write(&path, &corrupted).unwrap();
+    assert!(persist_media_blobs(&directory.0, std::slice::from_ref(&blob)).is_err());
+    let source = directory.0.join("synthetic-media");
+    std::fs::write(&source, bytes).unwrap();
+    assert!(persist_local_media_file(&directory.0, &source, &hash, bytes.len() as u64).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+}
 
 #[test]
 fn only_source_discovery_failures_offer_a_custom_root_retry() {
@@ -412,6 +487,7 @@ impl Drop for TestDirectory {
 
 fn state(directory: &TestDirectory) -> AppState {
     AppState {
+        _data_lock: None,
         data_root: Arc::new(directory.0.clone()),
         archive_path: Arc::new(directory.0.join("archive.db")),
         token_sha256: Arc::new(Mutex::new(Sha256::digest(TEST_TOKEN.as_bytes()).into())),

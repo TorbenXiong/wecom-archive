@@ -25,6 +25,7 @@ mod collector;
 mod config;
 mod error;
 mod files;
+pub mod maintenance;
 mod runtime;
 mod service;
 mod state;
