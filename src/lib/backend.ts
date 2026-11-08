@@ -34,8 +34,11 @@ export interface OfflineExportResult {
 
 export interface CollectorScheduleStatus {
   running: boolean;
+  uploadStage?: string;
+  uploadResultUnknown?: boolean;
   lastAttemptAt?: string;
   lastSuccessAt?: string;
+  lastUploadMessageCount?: number;
   lastError?: string;
   lastMessageCount?: number;
   lastMediaCount?: number;
@@ -70,10 +73,14 @@ export function isMissingSourceKeyError(reason: unknown): boolean {
   return parseBackendError(reason).code === "SOURCE_KEY_NOT_FOUND";
 }
 
+export function isUnknownUploadResultError(reason: unknown): boolean {
+  return parseBackendError(reason).code === "ENTERPRISE_UPLOAD_RESULT_UNKNOWN";
+}
+
 function parseBackendError(reason: unknown): BackendCommandError {
   if (reason && typeof reason === "object") {
     const candidate = reason as BackendCommandError;
-    if (typeof candidate.code === "string" || typeof candidate.message === "string") {
+    if (typeof candidate.code === "string" || (!(reason instanceof Error) && typeof candidate.message === "string")) {
       return candidate;
     }
   }

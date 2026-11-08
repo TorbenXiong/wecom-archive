@@ -46,7 +46,7 @@ try {
         & $Node --check $file.FullName
         if ($LASTEXITCODE -ne 0) { throw 'Node script syntax check failed.' }
     }
-    Invoke-WorkflowCheck 'workflow-regressions' $Node @('--test', 'scripts/acceptance/runtime.node-tests.mjs')
+    Invoke-WorkflowCheck 'workflow-regressions' $Node @('--test', 'scripts/acceptance/runtime.node-tests.mjs', 'scripts/acceptance/real-task-recovery.node-tests.mjs')
     Invoke-WorkflowCheck 'frontend-tests' $Node @('node_modules/vitest/vitest.mjs', 'run')
     Invoke-WorkflowCheck 'frontend-types' $Node @('node_modules/typescript/bin/tsc', '-b')
     Invoke-WorkflowCheck 'build-client-assets' $Node @('node_modules/vite/bin/vite.js', 'build', '--mode', 'client')

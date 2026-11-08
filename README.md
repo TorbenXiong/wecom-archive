@@ -40,9 +40,9 @@ crates/archive-store/ SQLite/FTS5 归档、修订和审计
 crates/export/        JSON/CSV/HTML/Markdown 导出
 ```
 
-详细设计见 [`docs/architecture.md`](docs/architecture.md)，安全边界见 [`docs/privacy-security.md`](docs/privacy-security.md)，当前能力见 [`docs/capability-matrix.md`](docs/capability-matrix.md)，验证状态见 [`docs/implementation-status.md`](docs/implementation-status.md)。
+详细设计见 [架构](docs/architecture.md)、[安全边界](docs/privacy-security.md)、[产品能力](docs/capability-matrix.md)；验证结果集中在 [0.0.17 验收记录](docs/acceptance/0.0.17-results.md)。
 
-本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；当前版本变化见 [0.0.16 版本说明](docs/release-0.0.16.md)，升级操作见 [升级功能测试方案](docs/update-test-plan.md)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
+本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；版本变化见 [0.0.17 版本说明](docs/release-0.0.17.md)，历史版本见 [GitHub Releases](https://github.com/TorbenXiong/wecom-archive/releases)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
 
 合成数据性能基准见 [`docs/benchmarks.md`](docs/benchmarks.md)，使用 PowerShell 运行 `./scripts/benchmark-archive.ps1`。
 
@@ -74,18 +74,30 @@ cargo build --release --locked --offline --bin WeComArchive
 ./scripts/verify-desktop.ps1
 ./scripts/verify-real-environment.ps1 -Authorized
 node scripts/acceptance/real-optimizations.mjs --authorized
+./scripts/verify-real-recovery.ps1 -Authorized
+./scripts/verify-storage-faults.ps1
 ./scripts/package-release.ps1 -IncludeRealEnvironment
 ```
 
 桌面验收使用现有 `target/release/WeComArchive.exe` 和隔离合成数据；真实验收需要已登录的企业微信，默认检查源发现、探针、群资料和媒体采集，可用 `-Cases media` 单独重跑，单项默认等待 15 分钟。
 
-`real-optimizations.mjs` 使用已有 Release 程序，在独立实例采集真实数据，验证三个本机计划周期、可选快照缓存复用、深页及定位对照、真实图片滚动加载与预览；仅在用户明确授权后运行，可能耗时较长。实例只监听本机，结束或失败均尝试清理本次真实测试数据并报告结果；不会更改已有工作台配置或源数据库。联合回归结果见 [优化验收记录](docs/acceptance/optimization-regression-2026-11-06.md)。
+`real-optimizations.mjs` 使用已有 Release 程序，在独立实例采集真实数据，验证三个本机计划周期、快照缓存复用、深分页、真实图片加载，以及选定会话 JSON 导出和重复导入的原任务续查、导出容量保护。响应故障由本机 WebView 受控注入，不属于跨机网络测试。仅在用户明确授权后运行，可能耗时较长；结束或失败均尝试清理本次进程与真实测试数据并报告结果。结果见 [0.0.17 验收记录](docs/acceptance/0.0.17-results.md#真实来源与原生界面验证2026-11-07)，前期性能对照见 [优化验收](docs/acceptance/optimization-regression-2026-11-06.md)。
+
+`verify-real-recovery.ps1 -Authorized` 验证真实数据完整备份、独立恢复及导入故障回滚，保留一份校验通过的本机备份并清理临时恢复和故障副本；仅在用户明确授权后执行。数据范围、保留位置及故障场景见 [真实恢复演练](docs/real-recovery-drill.md)。
+
+`verify-storage-faults.ps1` 使用合成数据演练备份/恢复进程中断、导入提交前后中断和 SQLite 容量耗尽；真实 NTFS 写满使用需管理员运行的 `-BoundedVolume`，只操作新建的 256 MiB 虚拟磁盘。进程终止不代表物理断电，详见 [存储故障演练](docs/storage-fault-drill.md)。
+
+工作台导入、本机采集及归档导出支持请求响应丢失后的原任务续查；状态暂不可用时明确显示未知结果，避免重复执行。超时预算、记录保留和未覆盖边界见 [长任务状态与超时协调](docs/long-tasks.md)。
+
+远程采集端上传支持独立的设备结果确认；结果未知时保留原标识，不推进增量进度，继续确认不会重复发送原包。设备接口、旧端兼容及重启限制见 [采集端上传结果确认](docs/collector-upload-confirmation.md)。
 
 打包入口执行测试、类型与格式检查、Clippy、前端构建、Windows Release 构建及桌面验收；`-IncludeRealEnvironment` 启用真实验收。可通过 `-PackageName` 指定全新交付目录，`-Cargo`、`-Node` 指定本机工具。交付目录仅含一个 `WeComArchive.exe`，检查版本、x64 架构和哈希；不覆盖旧包，不生成验收报告，不执行 Git 提交或对外发布。
 
 ## 运行数据
 
-完整备份范围、离线备份方法、配置异常恢复和 DPAPI 跨机限制见 [备份与恢复](docs/backup-recovery.md)。完整 JSON 导出不包含服务端附件字节，不能替代完整备份。
+桌面“设置 → 归档存储”可退出工作台并打开独立的备份与恢复窗口；无法正常启动时可运行 `WeComArchive.exe --maintenance`。支持完整备份、校验及恢复到新目录，恢复首次启动须确认并暂停计划及旧采集端。完整范围、操作和 DPAPI 跨机限制见 [备份与恢复](docs/backup-recovery.md)。完整 JSON 导出不包含服务端附件字节，不能替代完整备份。
+
+导入的全部批次与人员、会话目录现在统一事务提交，失败可幂等重试；已有附件同时核对实际哈希。数据库回滚与附件文件的边界见 [导入可靠性](docs/import-reliability.md)。
 
 - 自动发现合并企业微信注册表配置、记住的目录及原有默认目录；优先当前账号数据，历史 `Backup` 数据作为后备候选。工作台、采集端发现和后台任务复用记忆目录。
 - 手动填写目录重试时只扫描该目录，避免默认目录中的其他账号被误选。目录须是本机磁盘上的子目录；不接受整盘根目录、网络路径或父目录跳转。目录配置缺失、损坏或失效时，自动发现仍可回退到默认目录。
@@ -95,7 +107,7 @@ node scripts/acceptance/real-optimizations.mjs --authorized
 
 日志默认关闭，可在“生成默认配置”和“采集端管理”中启用采集端日志；环境变量 `WECOM_ARCHIVE_COLLECTOR_LOG`、`WECOM_ARCHIVE_SERVER_LOG` 可设置启动默认值。日志按日期分文件，时间格式为 `yyyy-MM-dd HH:mm:ss.SSS`。
 
-升级说明和人工验收步骤见 [`docs/update-test-plan.md`](docs/update-test-plan.md)。工作台仅在“设置 → 关于”手动检查 HTTPS Release；采集端由管理员在“采集端管理”发起签名升级。两条路径都会校验版本、SHA-256 和 Windows x64 EXE，并保留数据与采集端绑定配置；默认不会后台联网。
+日常人工检查见 [人工验收清单](docs/manual-acceptance.md)，升级专项见 [升级测试方案](docs/update-test-plan.md)。工作台仅在“设置 → 关于”手动检查 HTTPS Release；采集端由管理员在“采集端管理”发起签名升级。两条路径都会校验版本、SHA-256 和 Windows x64 EXE，并保留数据与采集端绑定配置；默认不会后台联网。
 
 | 日志 | exe 同级目录 |
 | --- | --- |

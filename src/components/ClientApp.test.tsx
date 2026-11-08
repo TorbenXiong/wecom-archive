@@ -149,4 +149,87 @@ describe("collector", () => {
     fireEvent.click(screen.getByRole("button", { name: "确认" }));
     expect(screen.getByRole("button", { name: "上传到归档工作台" })).toBeEnabled();
   });
+
+  it("continues an unknown upload through the existing command and clears its local unknown state after confirmation", async () => {
+    vi.spyOn(backend, "getCollectorScheduleStatus").mockResolvedValue({ running: false, uploadResultUnknown: true });
+    let finish!: (value: { messageCount: number }) => void;
+    const upload = vi.spyOn(backend, "uploadLatest").mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    render(<ClientApp />);
+    await screen.findByRole("heading", { name: "示例采集端" });
+    const statusRow = screen.getByText("状态：").parentElement!;
+    expect(within(statusRow).getByText("上传结果待确认")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "继续确认上传" }));
+    expect(upload).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "正在确认…" })).toBeDisabled();
+    await act(async () => { finish({ messageCount: 238 }); });
+    expect(await screen.findByRole("heading", { name: "上传完成" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认" }));
+    expect(screen.getByRole("button", { name: "上传到归档工作台" })).toBeEnabled();
+    expect(within(statusRow).getByText("运行正常")).toBeInTheDocument();
+  });
+
+  it("shows the confirmed upload count instead of a zero cumulative fingerprint count after an unknown first upload", async () => {
+    let currentStatus: CollectorScheduleStatus = { running: false, uploadResultUnknown: true, uploadedCount: 0 };
+    let poll: (() => Promise<void>) | undefined;
+    vi.spyOn(window, "setInterval").mockImplementation((callback, delay) => {
+      if (delay === 5000) poll = callback as () => Promise<void>;
+      return 1;
+    });
+    vi.spyOn(backend, "getCollectorScheduleStatus").mockImplementation(async () => currentStatus);
+    const upload = vi.spyOn(backend, "uploadLatest").mockImplementation(async () => {
+      currentStatus = {
+        running: false, uploadResultUnknown: false, uploadedCount: 0,
+        lastSuccessAt: "2026-09-24T02:00:00Z", lastUploadMessageCount: 9,
+      };
+      return { messageCount: 9 };
+    });
+    render(<ClientApp />);
+    await screen.findByRole("heading", { name: "示例采集端" });
+    fireEvent.click(screen.getByRole("button", { name: "继续确认上传" }));
+    await screen.findByRole("heading", { name: "上传完成" });
+    await act(async () => { await poll?.(); });
+    expect(screen.getByText("最近上传：").parentElement).toHaveTextContent("9 条");
+    expect(screen.queryByText("已上传：")).not.toBeInTheDocument();
+    expect(upload).toHaveBeenCalledOnce();
+  });
+
+  it("uses the server upload stage for scheduled and manual work but ignores a stale idle stage", async () => {
+    let currentStatus: CollectorScheduleStatus = { running: true, uploadStage: "服务端正在接收" };
+    let poll: (() => Promise<void>) | undefined;
+    vi.spyOn(window, "setInterval").mockImplementation((callback, delay) => {
+      if (delay === 5000) poll = callback as () => Promise<void>;
+      return 1;
+    });
+    vi.spyOn(backend, "getCollectorScheduleStatus").mockImplementation(async () => currentStatus);
+    let finish!: (value: { messageCount: number }) => void;
+    vi.spyOn(backend, "uploadLatest").mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    render(<ClientApp />);
+    await screen.findByRole("heading", { name: "示例采集端" });
+    const statusRow = screen.getByText("状态：").parentElement!;
+    expect(within(statusRow).getByText("服务端正在接收")).toBeInTheDocument();
+    currentStatus = { running: false, uploadStage: "正在确认原上传" };
+    await act(async () => { await poll?.(); });
+    expect(within(statusRow).getByText("运行正常")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "上传到归档工作台" }));
+    expect(within(statusRow).getByText("正在确认原上传")).toBeInTheDocument();
+    await act(async () => { finish({ messageCount: 238 }); });
+    await screen.findByRole("heading", { name: "上传完成" });
+  });
+
+  it.each([
+    { code: "ENTERPRISE_UPLOAD_RESULT_UNKNOWN", message: "合成上传结果未确认。" },
+    JSON.stringify({ code: "ENTERPRISE_UPLOAD_RESULT_UNKNOWN", message: "合成上传结果未确认。" }),
+    new Error(JSON.stringify({ code: "ENTERPRISE_UPLOAD_RESULT_UNKNOWN", message: "合成上传结果未确认。" })),
+  ])("labels an unknown command outcome without claiming upload failure (%j)", async (reason) => {
+    vi.spyOn(backend, "uploadLatest").mockRejectedValue(reason);
+    render(<ClientApp />);
+    await screen.findByRole("heading", { name: "示例采集端" });
+    fireEvent.click(screen.getByRole("button", { name: "上传到归档工作台" }));
+    expect(await screen.findByRole("heading", { name: "上传结果待确认" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "上传失败" })).not.toBeInTheDocument();
+    expect(screen.getByText(/合成上传结果未确认/)).toHaveTextContent("ENTERPRISE_UPLOAD_RESULT_UNKNOWN");
+    fireEvent.click(screen.getByRole("button", { name: "确认" }));
+    expect(screen.getByRole("button", { name: "继续确认上传" })).toBeEnabled();
+    expect(screen.getByText("状态：").parentElement).toHaveTextContent("上传结果待确认");
+  });
 });

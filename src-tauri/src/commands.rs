@@ -3,7 +3,8 @@ use crate::collection::{
     collect_candidate_with_options,
 };
 use crate::collector_config::{
-    CollectionSchedule, ensure_collector_config_fresh, load_enterprise_collector_config,
+    CollectionSchedule, EnterpriseCollectorConfig, ensure_collector_config_fresh,
+    load_enterprise_collector_config,
 };
 use crate::collector_control::sync_collector_config_with_status;
 use crate::collector_schedule::set_next_run_from_completion;
@@ -18,7 +19,7 @@ use crate::paths::{
 use crate::source_keys::resolve_collection_key;
 use crate::state::{
     AppState, CollectionRunGuard, CollectionSummary, CollectorScheduleStatus, CommandError,
-    begin_collector_attempt, finish_collector_attempt, internal_error,
+    begin_collector_attempt, internal_error,
 };
 use archive_domain::{SourceCandidate, SourceCapability};
 use chrono::Utc;
@@ -163,7 +164,7 @@ pub(super) async fn collect_source(
             recoverable: true,
         });
     }
-    let _run_guard = CollectionRunGuard(Arc::clone(&state.collection_running));
+    let run_guard = CollectionRunGuard(Arc::clone(&state.collection_running));
     begin_collector_attempt(&state);
     let authorization = CollectionAuthorization {
         notice_version: LOCAL_NOTICE_VERSION.into(),
@@ -172,51 +173,53 @@ pub(super) async fn collect_source(
     // 密钥探针、快照复制和数据库读取都可能耗时较长，必须全部放到阻塞线程，
     // 否则 Tauri 主线程会被拖住，窗口表现为“未响应”或只显示空白页。
     let collection_state = state.inner().clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let candidate = collection_state
-            .discovered_sources
-            .lock()
-            .map_err(|_| internal_error())?
-            .get(&source_id)
-            .cloned()
-            .ok_or(CommandError {
-                code: "SOURCE_HANDLE_EXPIRED",
-                message: "数据源授权已失效，请重新发现。".into(),
-                recoverable: true,
-            })?;
-        let config = load_enterprise_collector_config()?;
-        ensure_collector_config_fresh(&config)?;
-        let media_options = MediaCollectionOptions {
-            include_files: config.include_files,
-            include_images: config.include_images,
-        };
-        let encrypted = candidate
-            .databases
-            .iter()
-            .any(|database| database.encrypted);
-        let key = resolve_collection_key(&candidate, encrypted, &collector_data_root()?)?;
-        let root = collector_work_root("manual")?;
-        let result = collect_candidate_with_options(
-            candidate,
-            root.join("work"),
-            key.as_ref(),
-            authorization,
-            media_options,
-            None,
-            None,
-        );
-        let _ = fs::remove_dir_all(root);
-        result
-    })
+    crate::state::run_owned_collector_attempt(
+        collection_state,
+        run_guard,
+        move |collection_state| {
+            let candidate = collection_state
+                .discovered_sources
+                .lock()
+                .map_err(|_| internal_error())?
+                .get(&source_id)
+                .cloned()
+                .ok_or(CommandError {
+                    code: "SOURCE_HANDLE_EXPIRED",
+                    message: "数据源授权已失效，请重新发现。".into(),
+                    recoverable: true,
+                })?;
+            let config = load_enterprise_collector_config()?;
+            ensure_collector_config_fresh(&config)?;
+            let media_options = MediaCollectionOptions {
+                include_files: config.include_files,
+                include_images: config.include_images,
+            };
+            let encrypted = candidate
+                .databases
+                .iter()
+                .any(|database| database.encrypted);
+            let key = resolve_collection_key(&candidate, encrypted, &collector_data_root()?)?;
+            let root = collector_work_root("manual")?;
+            let result = collect_candidate_with_options(
+                candidate,
+                root.join("work"),
+                key.as_ref(),
+                authorization,
+                media_options,
+                None,
+                None,
+            );
+            let _ = fs::remove_dir_all(root);
+            let export = result?;
+            let summary = CollectionSummary::from(&export);
+            *collection_state
+                .latest_export
+                .lock()
+                .map_err(|_| internal_error())? = Some(Arc::new(export));
+            Ok(summary)
+        },
+    )
     .await
-    .unwrap_or_else(|_| Err(internal_error()));
-    let result = result.and_then(|export| {
-        let summary = CollectionSummary::from(&export);
-        *state.latest_export.lock().map_err(|_| internal_error())? = Some(Arc::new(export));
-        Ok(summary)
-    });
-    finish_collector_attempt(&state, &result);
-    result
 }
 
 #[tauri::command]
@@ -235,47 +238,67 @@ pub(super) async fn upload_latest_enterprise(
             recoverable: true,
         });
     }
-    let _run_guard = CollectionRunGuard(Arc::clone(&state.collection_running));
+    let run_guard = CollectionRunGuard(Arc::clone(&state.collection_running));
     begin_collector_attempt(&state);
-    let upload_state = state.clone();
-    let result: Result<UploadResult, CommandError> =
-        tauri::async_runtime::spawn_blocking(move || {
-            let config = load_enterprise_collector_config()?;
-            ensure_collector_config_fresh(&config)?;
-            let export = upload_state
-                .latest_export
-                .lock()
-                .map_err(|_| internal_error())?
-                .clone()
-                .ok_or(CommandError {
-                    code: "COLLECTION_RESULT_MISSING",
-                    message: "没有可上传的采集结果，请先完成采集。".into(),
-                    recoverable: true,
-                })?;
-            if !has_upload_changes(&upload_state, &export) {
-                return Ok(UploadResult { message_count: 0 });
-            }
-            let package = create_enterprise_package(&export, &config)?;
-            let completed_at = post_enterprise_package(
-                &config.upload_url,
-                config.upload_token.as_bytes(),
-                &package,
-            )?;
-            record_upload_success(&upload_state, &export);
-            if let Ok(mut status) = upload_state.schedule_status.lock() {
-                status.last_success_at = Some(completed_at);
-                status.last_message_count = Some(export.message_count);
-                status.last_media_count = Some(export.media_count);
-            }
-            set_next_run_from_completion(&upload_state, &config.collector_schedule);
-            Ok(UploadResult {
-                message_count: export.message_count,
-            })
-        })
-        .await
-        .unwrap_or_else(|_| Err(internal_error()));
-    finish_collector_attempt(&state, &result);
-    result
+    crate::state::run_owned_collector_attempt(state, run_guard, move |upload_state| {
+        let config = load_enterprise_collector_config()?;
+        ensure_collector_config_fresh(&config)?;
+        upload_latest_for_config(upload_state, &config)
+    })
+    .await
+}
+
+pub(super) fn upload_latest_for_config(
+    upload_state: &AppState,
+    config: &EnterpriseCollectorConfig,
+) -> Result<UploadResult, CommandError> {
+    if let Some(confirmed) = crate::collector_upload::prepare_upload(
+        upload_state,
+        &config.upload_url,
+        config.upload_token.as_bytes(),
+    )? {
+        // Confirmation may belong to a scheduled upload whose snapshot was
+        // never published as latest_export. Do not read/re-upload an old one.
+        if let Ok(mut status) = upload_state.schedule_status.lock() {
+            status.last_success_at = Some(confirmed.completed_at);
+            status.last_message_count = Some(confirmed.message_count);
+            status.last_media_count = Some(confirmed.media_count);
+        }
+        set_next_run_from_completion(upload_state, &config.collector_schedule);
+        return Ok(UploadResult {
+            message_count: confirmed.message_count,
+        });
+    }
+    let export = upload_state
+        .latest_export
+        .lock()
+        .map_err(|_| internal_error())?
+        .clone()
+        .ok_or(CommandError {
+            code: "COLLECTION_RESULT_MISSING",
+            message: "没有可上传的采集结果，请先完成采集。".into(),
+            recoverable: true,
+        })?;
+    if !has_upload_changes(upload_state, &export) {
+        return Ok(UploadResult { message_count: 0 });
+    }
+    let package = create_enterprise_package(&export, config)?;
+    let completed_at = post_enterprise_package(
+        upload_state,
+        &config.upload_url,
+        config.upload_token.as_bytes(),
+        &package,
+    )?;
+    record_upload_success(upload_state, &export);
+    if let Ok(mut status) = upload_state.schedule_status.lock() {
+        status.last_success_at = Some(completed_at);
+        status.last_message_count = Some(export.message_count);
+        status.last_media_count = Some(export.media_count);
+    }
+    set_next_run_from_completion(upload_state, &config.collector_schedule);
+    Ok(UploadResult {
+        message_count: export.message_count,
+    })
 }
 
 #[tauri::command]

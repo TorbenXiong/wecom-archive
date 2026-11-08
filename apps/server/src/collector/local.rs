@@ -32,7 +32,7 @@ pub(crate) async fn collect_local(
     {
         return Err(ApiError::local_collection_running());
     }
-    let _run_guard = LocalCollectionRunGuard(Arc::clone(&state.local_collection_running));
+    let run_guard = LocalCollectionRunGuard(Arc::clone(&state.local_collection_running));
     let (configured_include_media, configured_data_redaction) = {
         let config = state
             .enterprise_config
@@ -42,13 +42,22 @@ pub(crate) async fn collect_local(
     };
     let include_media = query.include_media.unwrap_or(configured_include_media);
     let data_redaction = query.data_redaction.unwrap_or(configured_data_redaction);
-    run_local_collection(
-        &state,
-        include_media,
-        data_redaction,
-        None,
-        query.source_root,
-    )
+    let task = crate::tasks::Task::register(&state, &headers, "collection")?;
+    let progress_task = task.clone();
+    crate::tasks::run_detached(task, async move {
+        // The request may disappear while spawn_blocking still collects data.
+        // Keep the lock through collection AND archive commit in the owned job.
+        let _run_guard = run_guard;
+        run_local_collection(
+            &state,
+            include_media,
+            data_redaction,
+            None,
+            query.source_root,
+            progress_task,
+        )
+        .await
+    })
     .await
 }
 
@@ -196,7 +205,15 @@ pub(crate) async fn run_local_collection_once(
             .map_err(|_| ApiError::store())?;
         config.data_redaction
     };
-    run_local_collection(state, include_media, data_redaction, since_unix_ms, None).await
+    run_local_collection(
+        state,
+        include_media,
+        data_redaction,
+        since_unix_ms,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn run_local_collection(
@@ -205,13 +222,18 @@ async fn run_local_collection(
     data_redaction: bool,
     since_unix_ms: Option<i64>,
     source_root: Option<String>,
+    task: Option<Arc<crate::tasks::Task>>,
 ) -> Result<Json<ImportResponse>, ApiError> {
     let collector = state
         .local_collector
         .clone()
         .ok_or_else(ApiError::local_collection_unavailable)?;
     let progress = Arc::clone(&state.local_collection_progress);
+    let reported_task = task.clone();
     let reporter: LocalCollectionProgressReporter = Arc::new(move |percent, stage, detail| {
+        if let Some(task) = &reported_task {
+            task.update("running", stage, None);
+        }
         if let Ok(mut current) = progress.lock() {
             *current = LocalCollectionProgress {
                 running: true,
@@ -228,6 +250,9 @@ async fn run_local_collection(
                 .map_err(|_| "媒体文件写入归档失败。".to_owned())
         });
     let result = async {
+        if let Some(task) = &task {
+            task.update("running", "准备本机采集", None);
+        }
         set_local_collection_progress(
             state,
             true,
@@ -263,6 +288,9 @@ async fn run_local_collection(
             "写入归档",
             "正在写入本次采集的文字、图片和附件。",
         );
+        if let Some(task) = &task {
+            task.update("running", "写入归档并提交事务", None);
+        }
         ingest_export(state, export).await
     }
     .await;

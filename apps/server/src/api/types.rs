@@ -317,7 +317,7 @@ pub(crate) struct HealthResponse {
     pub(crate) version: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImportResponse {
     pub(crate) export_id: String,
@@ -348,7 +348,7 @@ pub(crate) struct ArchiveUpdateResponse {
     pub(crate) revision: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ErrorResponse {
     pub(crate) code: &'static str,

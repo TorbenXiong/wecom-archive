@@ -119,6 +119,7 @@ pub struct ArchiveReadSnapshot<'a> {
     _transaction: rusqlite::Transaction<'a>,
 }
 
+mod backup;
 mod connection;
 mod derived;
 mod ingest;

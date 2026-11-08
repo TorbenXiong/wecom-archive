@@ -157,6 +157,14 @@ fn prepare_server(
         .unwrap_or_else(default_data_root);
     std::fs::create_dir_all(&data_root)
         .map_err(|error| format!("服务端数据目录不可用（{}），请检查目录权限。", error.kind()))?;
+    let data_lock = crate::maintenance::lock_data_root(&data_root)?;
+    if data_root
+        .join(crate::maintenance::RESTORE_PENDING_FILE)
+        .try_exists()
+        .map_err(|_| "无法检查恢复状态。")?
+    {
+        return Err("恢复尚未确认，请打开备份与恢复窗口完成检查。".into());
+    }
     diagnostics::init(&data_root);
     diagnostics::write("server_prepare_started", "");
     let enterprise_config = load_enterprise_config(&data_root)?;
@@ -203,6 +211,7 @@ fn prepare_server(
     let initial_revision = open_archive_for_startup(&archive_path)?;
     let (archive_update, _) = watch::channel(initial_revision);
     let state = AppState {
+        _data_lock: Some(Arc::new(data_lock)),
         data_root: Arc::new(data_root.clone()),
         archive_path,
         token_sha256: Arc::new(Mutex::new(Sha256::digest(token.as_bytes()).into())),
@@ -220,11 +229,19 @@ fn prepare_server(
         },
         listen_address: address.to_string(),
         export_tasks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        export_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         import_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        tasks: Arc::new(Mutex::new(Default::default())),
+        collector_uploads: Arc::new(Mutex::new(Default::default())),
     };
 
     let app = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/tasks/{task_id}", get(crate::tasks::status))
+        .route(
+            "/api/v1/collector-uploads/{upload_id}",
+            get(crate::collector_uploads::status).post(crate::collector_uploads::start),
+        )
         .route(
             "/api/v1/collectors/{collector_id}/software-update",
             post(crate::request_collector_update),

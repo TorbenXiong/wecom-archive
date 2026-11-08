@@ -9,6 +9,7 @@ mod collector_runtime;
 mod collector_schedule;
 mod collector_transfer;
 mod collector_update;
+mod collector_upload;
 mod commands;
 mod diagnostics;
 mod paths;

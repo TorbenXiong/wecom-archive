@@ -49,6 +49,8 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+mod real_recovery;
+
 #[test]
 fn expired_schedule_waits_for_config_refresh_without_accessing_sources() {
     let config: EnterpriseCollectorConfig = serde_json::from_value(serde_json::json!({

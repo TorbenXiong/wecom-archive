@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { InfoDialog } from "./components/Overlays";
 import type { CollectionSchedule } from "./domain/types";
-import { backend, formatBackendError, isMissingSourceKeyError, type CollectionSummary, type CollectorScheduleStatus } from "./lib/backend";
+import { backend, formatBackendError, isMissingSourceKeyError, isUnknownUploadResultError, type CollectionSummary, type CollectorScheduleStatus } from "./lib/backend";
 import "./styles.css";
 
 type PrepareState = "preparing" | "ready" | "failed";
@@ -63,6 +63,7 @@ export default function ClientApp() {
         try {
           await backend.uploadLatest();
         } catch (reason) {
+          if (isUnknownUploadResultError(reason)) setScheduleStatus((current) => ({ ...current, uploadResultUnknown: true }));
           setStatus(formatBackendError(reason, "首次上传失败，请检查服务端连接。"));
         }
       }
@@ -123,9 +124,12 @@ export default function ClientApp() {
     try {
       const result = await backend.uploadLatest();
       setStatus("");
+      setScheduleStatus((current) => ({ ...current, uploadResultUnknown: false, uploadStage: undefined }));
       setInfo({ title: "上传完成", message: `已直接上传到归档工作台\n共 ${result.messageCount.toLocaleString("zh-CN")} 条消息。`, tone: "success" });
     } catch (reason) {
-      setInfo({ title: "上传失败", message: formatBackendError(reason, "上传失败，临时文件已清理。"), tone: "error" });
+      const unknown = isUnknownUploadResultError(reason);
+      if (unknown) setScheduleStatus((current) => ({ ...current, uploadResultUnknown: true }));
+      setInfo({ title: unknown ? "上传结果待确认" : "上传失败", message: formatBackendError(reason, unknown ? "暂时无法确认上传结果，请继续确认原上传。" : "上传失败，临时文件已清理。"), tone: "error" });
     } finally { setUploading(false); }
   };
 
@@ -141,12 +145,17 @@ export default function ClientApp() {
     } finally { setExporting(false); }
   };
 
-  const activity = uploading ? "正在上传"
+  const uploadResultUnknown = scheduleStatus.uploadResultUnknown ?? false;
+  const uploadStage = uploading || scheduleStatus.running ? scheduleStatus.uploadStage?.trim() : undefined;
+  const activity = uploadStage || (uploading ? "正在上传"
     : exporting ? "正在导出"
     : state === "preparing" || scheduleStatus.running ? "正在采集"
+    : uploadResultUnknown ? "上传结果待确认"
     : state === "failed" || status || scheduleStatus.lastError ? "执行失败"
-    : "运行正常";
-  const uploaded = scheduleStatus.lastSuccessAt != null && scheduleStatus.uploadedCount != null;
+    : "运行正常");
+  const uploadCount = scheduleStatus.lastUploadMessageCount ?? scheduleStatus.uploadedCount;
+  const uploaded = scheduleStatus.lastSuccessAt != null && uploadCount != null;
+  const uploadMetricLabel = scheduleStatus.lastUploadMessageCount != null ? "最近上传：" : "已上传：";
   const mediaCount = summary?.mediaCount ?? 0;
 
   return <div className="collector-shell">
@@ -158,11 +167,11 @@ export default function ClientApp() {
         <div><dt>状态：</dt><dd>{activity}</dd></div>
         <div><dt>最近成功：</dt><dd>{formatScheduleTime(scheduleStatus.lastSuccessAt, "尚未上传")}</dd></div>
         <div><dt>下次执行：</dt><dd>{formatScheduleTime(scheduleStatus.nextRunAt, scheduleDescription === "未启用" ? "未启用" : "计算中")}</dd></div>
-        {state === "ready" && <div><dt>{uploaded ? "已上传：" : "已采集："}</dt><dd><strong>{(uploaded ? scheduleStatus.uploadedCount : summary?.messageCount)?.toLocaleString("zh-CN") ?? "0"}</strong> 条</dd></div>}
+        {state === "ready" && <div><dt>{uploaded ? uploadMetricLabel : "已采集："}</dt><dd><strong>{(uploaded ? uploadCount : summary?.messageCount)?.toLocaleString("zh-CN") ?? "0"}</strong> 条</dd></div>}
         {state === "ready" && mediaCount > 0 && <div><dt>媒体引用：</dt><dd>{mediaCount.toLocaleString("zh-CN")} 项</dd></div>}
       </dl>
       {(status || scheduleStatus.lastError) && <p className="collector-error" role="status">{status || scheduleStatus.lastError}</p>}
-      {state === "failed" ? <button className="primary-button collector-main-button" type="button" onClick={() => void prepare()}><RefreshCw size={17} />重试</button> : <div className={offlineExportEnabled ? "collector-action-grid" : "collector-action-grid single"}><button className="primary-button collector-main-button" disabled={state !== "ready" || uploading || exporting} type="button" onClick={uploadCollection}>{uploading ? <><LoaderCircle className="spin" size={17} />正在上传…</> : <><Upload size={17} />上传到归档工作台</>}</button>{offlineExportEnabled && <button className="secondary-button collector-main-button" disabled={state !== "ready" || uploading || exporting} type="button" onClick={() => void exportCollection()}>{exporting ? <><LoaderCircle className="spin" size={17} />正在导出…</> : <><Download size={17} />导出加密文件</>}</button>}</div>}
+      {state === "failed" ? <button className="primary-button collector-main-button" type="button" onClick={() => void prepare()}><RefreshCw size={17} />重试</button> : <div className={offlineExportEnabled ? "collector-action-grid" : "collector-action-grid single"}><button className="primary-button collector-main-button" disabled={state !== "ready" || uploading || exporting} type="button" onClick={uploadCollection}>{uploading ? <><LoaderCircle className="spin" size={17} />{uploadResultUnknown ? "正在确认…" : "正在上传…"}</> : <><Upload size={17} />{uploadResultUnknown ? "继续确认上传" : "上传到归档工作台"}</>}</button>{offlineExportEnabled && <button className="secondary-button collector-main-button" disabled={state !== "ready" || uploading || exporting} type="button" onClick={() => void exportCollection()}>{exporting ? <><LoaderCircle className="spin" size={17} />正在导出…</> : <><Download size={17} />导出加密文件</>}</button>}</div>}
     </section></main>
     {info && <InfoDialog title={info.title} tone={info.tone} actionLabel={info.openDirectory ? "打开目录" : undefined} onAction={info.openDirectory ? () => void backend.openOfflineExportDirectory() : undefined} onConfirm={() => setInfo(undefined)}>{info.message}</InfoDialog>}
     {offlineExportPrompt && <div className="modal-backdrop" role="presentation"><section className="modal-card collector-offline-export-dialog" role="dialog" aria-modal="true" aria-labelledby="collector-offline-export-title"><span className="modal-icon"><Download /></span><h2 id="collector-offline-export-title">离线导出</h2><p>将当前已采集数据导出为加密文件，供管理员稍后导入归档工作台。</p><div className="modal-actions"><button className="secondary-button" type="button" onClick={() => setOfflineExportPrompt(false)}>取消</button><button className="primary-button" type="button" onClick={() => void exportCollection()} disabled={state !== "ready" || uploading || exporting}>{exporting ? "正在导出…" : "开始导出"}</button></div></section></div>}

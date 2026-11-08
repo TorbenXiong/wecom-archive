@@ -1,4 +1,5 @@
 import type { ExportScope, MessageDirection, MessageType, ParticipantProfile } from "../domain/types";
+import { resumeArchiveTask, trackArchiveRequest, type ArchiveTaskKind, type ArchiveTaskProgress } from "./long-task";
 
 export interface ServerArchiveSummary {
   conversation_count: number;
@@ -354,6 +355,45 @@ async function request<T>(path: string, token: string, init?: RequestInit): Prom
   return response.json() as Promise<T>;
 }
 
+async function boundedRequest<T>(path: string, token: string, signal?: AbortSignal): Promise<T> {
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort(new DOMException("状态查询超时", "TimeoutError")), 30_000);
+  try { return await request<T>(path, token, { signal: controller.signal }); }
+  finally { clearTimeout(timer); signal?.removeEventListener("abort", abort); }
+}
+
+export function getArchiveTaskStatus(token: string, taskId: string, signal?: AbortSignal): Promise<ArchiveTaskProgress> {
+  return boundedRequest(`/api/v1/tasks/${encodeURIComponent(taskId)}`, token, signal);
+}
+
+function archiveTaskFailure(progress: ArchiveTaskProgress): ServerApiError {
+  return new ServerApiError(progress.error || "服务端任务未完成。", progress.errorStatus || 500, progress.errorCode || undefined);
+}
+
+function definiteArchiveRequestFailure(error: unknown): boolean {
+  if (!(error instanceof ServerApiError) || !error.code || error.code === "TASK_ALREADY_EXISTS") return false;
+  // Preserve known business failures, including legacy servers without task
+  // queries. Other transport-like replies may hide an already accepted task.
+  if (error.status === 503 && ["TASK_CAPACITY_REACHED", "IMPORT_BUSY"].includes(error.code)) return true;
+  if (error.status === 408 && error.code === "IMPORT_RECEIVE_TIMEOUT") return true;
+  if (error.status === 409 && ["LOCAL_COLLECTION_RUNNING", "BATCH_CONFLICT"].includes(error.code)) return true;
+  return error.status >= 400 && error.status < 500 && ![408, 409, 429].includes(error.status);
+}
+
+function trackedRequest(token: string, kind: ArchiveTaskKind, path: string, init: RequestInit, onProgress?: (progress: ArchiveTaskProgress) => void): Promise<ServerImportResult> {
+  return trackArchiveRequest(kind,
+    (id, signal) => request<ServerImportResult>(path, token, { ...init, signal, headers: { ...init.headers, "X-Archive-Task-Id": id } }),
+    (id, signal) => getArchiveTaskStatus(token, id, signal), archiveTaskFailure,
+    definiteArchiveRequestFailure, onProgress);
+}
+
+export function resumeArchiveTaskStatus(token: string, taskId: string, kind: ArchiveTaskKind, onProgress?: (progress: ArchiveTaskProgress) => void): Promise<ServerImportResult> {
+  return resumeArchiveTask(taskId, kind, (signal) => getArchiveTaskStatus(token, taskId, signal), archiveTaskFailure, onProgress);
+}
+
 export function getArchiveSummary(token: string): Promise<ServerArchiveSummary> {
   return request<ServerArchiveSummary>("/api/v1/archive/summary", token);
 }
@@ -377,15 +417,15 @@ export function getCollectedUsers(token: string, signal?: AbortSignal): Promise<
   return request<CollectedUser[]>("/api/v1/archive/collected-users", token, { signal });
 }
 
-export function collectLocalArchive(token: string, includeMedia: boolean, sourceRoot?: string, dataRedaction?: boolean): Promise<ServerImportResult> {
+export function collectLocalArchive(token: string, includeMedia: boolean, sourceRoot?: string, dataRedaction?: boolean, onProgress?: (progress: ArchiveTaskProgress) => void): Promise<ServerImportResult> {
   const parameters = new URLSearchParams({ include_media: String(includeMedia) });
   if (sourceRoot) parameters.set("source_root", sourceRoot);
   if (dataRedaction !== undefined) parameters.set("data_redaction", String(dataRedaction));
-  return request<ServerImportResult>(`/api/v1/collections/local?${parameters}`, token, { method: "POST" });
+  return trackedRequest(token, "collection", `/api/v1/collections/local?${parameters}`, { method: "POST" }, onProgress);
 }
 
 export function getLocalCollectionProgress(token: string, signal?: AbortSignal): Promise<LocalCollectionProgress> {
-  return request<LocalCollectionProgress>("/api/v1/collections/local/progress", token, { signal });
+  return boundedRequest<LocalCollectionProgress>("/api/v1/collections/local/progress", token, signal);
 }
 
 export async function listConversations(token: string, signal?: AbortSignal): Promise<ServerConversation[]> {
@@ -457,12 +497,12 @@ export function getMessagePosition(token: string, stableMessageId: string, sort:
   return request<{ conversation_id: string; offset_in_conversation: number }>(`/api/v1/messages/${encodeURIComponent(stableMessageId)}/position?sort=${sort}`, token, { signal });
 }
 
-export async function importClientJson(file: File, token: string): Promise<ServerImportResult> {
-  return request<ServerImportResult>("/api/v1/imports/json", token, {
+export async function importClientJson(file: File, token: string, onProgress?: (progress: ArchiveTaskProgress) => void): Promise<ServerImportResult> {
+  return trackedRequest(token, "import", "/api/v1/imports/json", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: file,
-  });
+  }, onProgress);
 }
 
 export function getEnterpriseConfig(token: string): Promise<EnterpriseConfig> {
@@ -581,12 +621,12 @@ export function openEnterpriseCollectorDirectory(token: string): Promise<{ opene
   return request<{ opened: boolean }>("/api/v1/enterprise/collectors/open-directory", token, { method: "POST" });
 }
 
-export async function importEnterprisePackage(file: File, token: string): Promise<ServerImportResult> {
-  return request<ServerImportResult>("/api/v1/imports/enterprise", token, {
+export async function importEnterprisePackage(file: File, token: string, onProgress?: (progress: ArchiveTaskProgress) => void): Promise<ServerImportResult> {
+  return trackedRequest(token, "import", "/api/v1/imports/enterprise", {
     method: "POST",
     headers: { "Content-Type": "application/octet-stream" },
     body: file,
-  });
+  }, onProgress);
 }
 
 export async function getMediaBlob(token: string, contentHash: string, signal?: AbortSignal): Promise<Blob> {
@@ -609,36 +649,86 @@ export function openMediaFile(token: string, contentHash: string, name: string):
   return request<{ opened: boolean }>(`/api/v1/media/${encodeURIComponent(contentHash)}/open?${parameters}`, token, { method: "POST" });
 }
 
-export async function createServerExport(token: string, exportRequest: ServerExportRequest, signal?: AbortSignal, onProgress?: (progress: ExportTaskProgress) => void): Promise<ServerExportResult> {
-  signal?.throwIfAborted();
-  let started: { taskId: string };
-  try {
-    started = await request<{ taskId: string }>("/api/v1/exports/start", token, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(exportRequest), signal: AbortSignal.timeout(30000),
-    });
-  } catch (error) {
-    if (error instanceof ServerApiError && error.status === 404) return request<ServerExportResult>("/api/v1/exports", token, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(exportRequest), signal,
-    });
-    throw error;
+export class ExportStatusUnknownError extends ServerApiError {
+  constructor(readonly taskId: string, readonly cancellationRequested: boolean, message?: string) {
+    super(message || "暂时无法确认导出结果，原任务可能仍在运行。请继续查询原任务。", 0, "EXPORT_STATUS_UNKNOWN");
+    this.name = "ExportStatusUnknownError";
+  }
+}
+
+function retryableExportStatusError(error: unknown): boolean {
+  return !(error instanceof ServerApiError) || error.status >= 500 || error.status === 408 || error.status === 429;
+}
+
+async function queryExportWithRetry(taskId: string, cancellationRequested: () => boolean, action: () => Promise<ExportTaskProgress>): Promise<ExportTaskProgress> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const progress = await action();
+      if (!["queued", "running", "cancelling", "completed", "cancelled", "failed"].includes(progress.status)
+        || (progress.status === "completed" && !progress.result)) throw new Error("Invalid export status");
+      return progress;
+    } catch (error) {
+      if (!retryableExportStatusError(error) || attempt === 2) {
+        throw new ExportStatusUnknownError(taskId, cancellationRequested(),
+          error instanceof ServerApiError && (error.status === 401 || error.status === 403)
+            ? "无法读取导出状态，请核对访问权限后继续查询原任务。" : undefined);
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  throw new ExportStatusUnknownError(taskId, cancellationRequested());
+}
+
+function finishedExport(progress: ExportTaskProgress): ServerExportResult | undefined {
+  if (progress.status === "completed" && progress.result) return progress.result;
+  if (progress.status === "cancelled") throw new ServerApiError("导出已取消，未完成文件已清理。", 409, "EXPORT_CANCELLED");
+  if (progress.status === "failed") throw new ServerApiError(progress.error || "服务端导出失败。", 500, progress.errorCode);
+  return undefined;
+}
+
+export async function createServerExport(token: string, exportRequest: ServerExportRequest, signal?: AbortSignal, onProgress?: (progress: ExportTaskProgress) => void, resumeTaskId?: string): Promise<ServerExportResult> {
+  if (!resumeTaskId) signal?.throwIfAborted();
+  let taskId = resumeTaskId;
+  if (!taskId) {
+    const requestedTaskId = crypto.randomUUID();
+    try {
+      const started = await request<{ taskId: string }>("/api/v1/exports/start", token, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Archive-Task-Id": requestedTaskId }, body: JSON.stringify(exportRequest), signal: AbortSignal.timeout(30000),
+      });
+      if (typeof started.taskId !== "string" || !started.taskId.trim()) {
+        throw new ExportStatusUnknownError(requestedTaskId, Boolean(signal?.aborted));
+      }
+      // Older servers may ignore the optional identity header and return their
+      // own ID. A valid acknowledgement remains the authority in that case.
+      taskId = started.taskId;
+    } catch (error) {
+      if (error instanceof ServerApiError && error.status === 404) return request<ServerExportResult>("/api/v1/exports", token, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(exportRequest), signal,
+      });
+      // Capacity is a confirmed refusal before registration. Other coded 5xx
+      // replies may come from a gateway after the original task was accepted.
+      if (error instanceof ServerApiError && error.code && error.code !== "TASK_ALREADY_EXISTS"
+        && ((error.status >= 400 && error.status < 500 && ![408, 409, 429].includes(error.status))
+          || (error.status === 503 && error.code === "EXPORT_TASK_CAPACITY_REACHED"))) throw error;
+      throw new ExportStatusUnknownError(requestedTaskId, Boolean(signal?.aborted));
+    }
   }
   let cancelSent = false;
-  try {
-    while (true) {
-      if (signal?.aborted && !cancelSent) {
-        const cancelling = await cancelServerExport(token, started.taskId);
-        onProgress?.(cancelling);
-        cancelSent = true;
-      }
-      const progress = await request<ExportTaskProgress>(`/api/v1/exports/${encodeURIComponent(started.taskId)}`, token, { signal: AbortSignal.timeout(30000) });
-      onProgress?.(progress);
-      if (progress.status === "completed" && progress.result) return progress.result;
-      if (progress.status === "cancelled") throw new ServerApiError("导出已取消，未完成文件已清理。", 409, "EXPORT_CANCELLED");
-      if (progress.status === "failed") throw new ServerApiError(progress.error || "服务端导出失败。", 500, progress.errorCode);
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
+  while (true) {
+    if (signal?.aborted && !cancelSent) {
+      // Cancellation is idempotent; a lost response can safely be retried.
+      const cancelling = await queryExportWithRetry(taskId, () => true, () => cancelServerExport(token, taskId));
+      onProgress?.(cancelling);
+      cancelSent = true;
+      const completed = finishedExport(cancelling);
+      if (completed) return completed;
     }
-  } catch (error) {
-    throw error;
+    const progress = await queryExportWithRetry(taskId, () => Boolean(signal?.aborted), () =>
+      request<ExportTaskProgress>(`/api/v1/exports/${encodeURIComponent(taskId)}`, token, { signal: AbortSignal.timeout(30000) }));
+    onProgress?.(progress);
+    const completed = finishedExport(progress);
+    if (completed) return completed;
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
   }
 }
 

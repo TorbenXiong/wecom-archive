@@ -9,6 +9,147 @@ use serde_json::json;
 use tempfile::tempdir;
 use uuid::Uuid;
 
+mod fault_drill;
+
+#[test]
+fn whole_import_rolls_back_prior_batches_fts_statistics_revisions_and_directory() {
+    let directory = tempdir().unwrap();
+    let mut store = ArchiveStore::open(&directory.path().join("archive.db")).unwrap();
+    let original = batch("original");
+    store.ingest_batch(&original).unwrap();
+    let before = store.summary().unwrap();
+    let mut first = batch("new searchable revision");
+    first.batch_id = Uuid::new_v4();
+    first.messages[0].collection_batch_id = first.batch_id;
+    let mut conflict = original.clone();
+    conflict.content_sha256 = "conflicting-content".into();
+    assert!(matches!(
+        store.ingest_batches_with_directory(vec![first.clone(), conflict], &[], &[]),
+        Err(StoreError::BatchConflict)
+    ));
+    assert_eq!(store.summary().unwrap(), before);
+    assert_eq!(
+        store
+            .query_messages(&MessageQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap(),
+        original.messages
+    );
+    assert_eq!(
+        store
+            .count_messages(&MessageQuery {
+                text: Some("searchable".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT count(*) FROM message_revisions", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
+    store.connection.execute_batch("CREATE TRIGGER fail_directory BEFORE INSERT ON participants WHEN new.participant_id = 'blocked' BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;").unwrap();
+    let participants = vec![ParticipantV1 {
+        participant_id: "blocked".into(),
+        display_name: Some("合成成员".into()),
+        participant_kind: None,
+    }];
+    assert!(
+        store
+            .ingest_batches_with_directory(vec![first.clone()], &[], &participants)
+            .is_err()
+    );
+    assert_eq!(store.summary().unwrap(), before);
+    assert_eq!(
+        store
+            .query_messages(&MessageQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap(),
+        original.messages
+    );
+    store
+        .connection
+        .execute_batch("DROP TRIGGER fail_directory")
+        .unwrap();
+    let result = store
+        .ingest_batches_with_directory(vec![first.clone()], &[], &participants)
+        .unwrap();
+    assert_eq!(result.revised, 1);
+    assert_eq!(
+        store
+            .ingest_batches_with_directory(vec![first], &[], &participants)
+            .unwrap()
+            .unchanged,
+        1
+    );
+    store.verify_integrity().unwrap();
+}
+
+#[test]
+fn backup_includes_wal_and_rejects_existing_targets_without_changing_source() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("archive.db");
+    let mut store = ArchiveStore::open(&path).unwrap();
+    store
+        .connection
+        .pragma_update(None, "wal_autocheckpoint", 0)
+        .unwrap();
+    store.ingest_batch(&batch("committed WAL fixture")).unwrap();
+    store.ingest_batch(&batch("revised WAL fixture")).unwrap();
+    let snapshot = directory.path().join("snapshot.db");
+    ArchiveStore::backup_to(&path, &snapshot).unwrap();
+    let backup = ArchiveStore::open_read_only(&snapshot).unwrap();
+    backup.verify_integrity().unwrap();
+    assert_eq!(
+        backup
+            .connection
+            .query_row("SELECT payload_json FROM message_revisions", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        store
+            .connection
+            .query_row("SELECT payload_json FROM message_revisions", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+    );
+    assert_eq!(backup.summary().unwrap(), store.summary().unwrap());
+    assert_eq!(
+        backup
+            .query_messages(&MessageQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap(),
+        store
+            .query_messages(&MessageQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+    );
+    let existing = directory.path().join("existing.db");
+    std::fs::write(&existing, b"preserve existing target").unwrap();
+    assert!(ArchiveStore::backup_to(&path, &existing).is_err());
+    assert_eq!(
+        std::fs::read(existing).unwrap(),
+        b"preserve existing target"
+    );
+    let failed = directory.path().join("failed.db");
+    assert!(ArchiveStore::backup_to(&directory.path().join("missing.db"), &failed).is_err());
+    assert!(!failed.exists());
+}
+
 #[test]
 fn application_conversations_ignore_stale_group_types_and_keep_document_metadata() {
     let directory = tempdir().unwrap();

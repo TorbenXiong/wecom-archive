@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct ApiError {
     pub(super) status: StatusCode,
     pub(super) body: ErrorResponse,
@@ -98,6 +98,19 @@ impl ApiError {
             body: ErrorResponse {
                 code: "IMPORT_BUSY",
                 message: "导入等待超时，服务端正在处理其他导入，请稍后重试。".into(),
+                recoverable: true,
+            },
+        }
+    }
+
+    pub(super) fn export_task_capacity() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: ErrorResponse {
+                code: "EXPORT_TASK_CAPACITY_REACHED",
+                message:
+                    "导出任务记录已满，已有结果仍保留；请先查询原任务，待记录过期后再创建导出。"
+                        .into(),
                 recoverable: true,
             },
         }

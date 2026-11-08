@@ -1,7 +1,3 @@
-use std::sync::Mutex;
-
-static EXPORT_FILE_LOCK: Mutex<()> = Mutex::new(());
-
 mod diagnostics;
 
 const DATA_ROOT_ENV: &str = "WECOM_ARCHIVE_SERVER_DATA";
@@ -22,12 +18,15 @@ include!(concat!(env!("OUT_DIR"), "/embedded_web.rs"));
 mod api;
 mod auth;
 mod collector;
+mod collector_uploads;
 mod config;
 mod error;
 mod files;
+pub mod maintenance;
 mod runtime;
 mod service;
 mod state;
+mod tasks;
 
 use api::*;
 use auth::*;

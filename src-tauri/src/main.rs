@@ -6,6 +6,8 @@ use std::time::Duration;
 use libsqlite3_sys as _;
 use tauri::Manager;
 
+mod maintenance;
+
 fn workspace_capability(page_url: &tauri::Url) -> tauri::ipc::CapabilityBuilder {
     // Authorize only the server started by this process, including its exact
     // port. Do not grant desktop commands to arbitrary LAN or remote pages.
@@ -26,6 +28,21 @@ fn workspace_capability(page_url: &tauri::Url) -> tauri::ipc::CapabilityBuilder 
         .permission("allow-exit-workspace")
         .permission("allow-check-for-update")
         .permission("allow-install-update")
+        .permission("allow-open-data-maintenance")
+}
+
+#[tauri::command]
+fn open_data_maintenance(app: tauri::AppHandle) -> Result<(), String> {
+    let mut command =
+        std::process::Command::new(std::env::current_exe().map_err(|_| "无法定位当前程序。")?);
+    command.arg("--maintenance");
+    source_windows::updater::hide(&mut command);
+    command.spawn().map_err(|_| "无法打开备份与恢复窗口。")?;
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        app.exit(0);
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -76,6 +93,16 @@ fn main() {
         return;
     }
 
+    let recovery_pending = wecom_archive_server::maintenance::restore_pending()
+        .unwrap_or_else(|message| exit_with_error(&message));
+    let backup_location = wecom_archive_server::maintenance::backup_location()
+        .unwrap_or_else(|message| exit_with_error(&message));
+    if arguments.get(1).is_some_and(|a| a == "--maintenance") || recovery_pending || backup_location
+    {
+        maintenance::run(backup_location);
+        return;
+    }
+
     let server = Arc::new(
         wecom_archive_server::start_desktop_server_with_local_collector(
             wecom_archive_desktop::collect_local_export_with_progress,
@@ -116,6 +143,7 @@ fn main() {
             exit_workspace,
             check_for_update,
             install_update,
+            open_data_maintenance,
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|_| exit_with_error("桌面工作台初始化失败。"))
@@ -160,7 +188,12 @@ mod tests {
                 .add_capability(workspace_capability(&page))
                 .unwrap();
             let origin = Origin::Remote { url: page.clone() };
-            for command in ["exit_workspace", "check_for_update", "install_update"] {
+            for command in [
+                "exit_workspace",
+                "check_for_update",
+                "install_update",
+                "open_data_maintenance",
+            ] {
                 assert!(
                     authority
                         .resolve_access(command, "main", "main", &origin)
@@ -194,6 +227,50 @@ mod tests {
             assert!(
                 authority
                     .resolve_access("collect_source", "main", "main", &origin)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_commands_require_the_local_maintenance_window() {
+        let mut context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let authority = context.runtime_authority_mut();
+        authority.add_capability(maintenance::capability()).unwrap();
+        for command in [
+            "maintenance_status",
+            "maintenance_create_backup",
+            "maintenance_verify_backup",
+            "maintenance_restore_backup",
+            "maintenance_activate",
+        ] {
+            assert!(
+                authority
+                    .resolve_access(command, "maintenance", "maintenance", &Origin::Local)
+                    .is_some()
+            );
+            assert!(
+                authority
+                    .resolve_access(command, "main", "main", &Origin::Local)
+                    .is_none()
+            );
+            assert!(
+                authority
+                    .resolve_access(
+                        command,
+                        "maintenance",
+                        "maintenance",
+                        &Origin::Remote {
+                            url: tauri::Url::parse("http://127.0.0.1:9812").unwrap()
+                        }
+                    )
+                    .is_none()
+            );
+        }
+        for rejected in ["collect_source", "open_data_maintenance", "install_update"] {
+            assert!(
+                authority
+                    .resolve_access(rejected, "maintenance", "maintenance", &Origin::Local)
                     .is_none()
             );
         }
