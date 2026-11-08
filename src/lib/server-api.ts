@@ -373,11 +373,21 @@ function archiveTaskFailure(progress: ArchiveTaskProgress): ServerApiError {
   return new ServerApiError(progress.error || "服务端任务未完成。", progress.errorStatus || 500, progress.errorCode || undefined);
 }
 
+function definiteArchiveRequestFailure(error: unknown): boolean {
+  if (!(error instanceof ServerApiError) || !error.code || error.code === "TASK_ALREADY_EXISTS") return false;
+  // Preserve known business failures, including legacy servers without task
+  // queries. Other transport-like replies may hide an already accepted task.
+  if (error.status === 503 && ["TASK_CAPACITY_REACHED", "IMPORT_BUSY"].includes(error.code)) return true;
+  if (error.status === 408 && error.code === "IMPORT_RECEIVE_TIMEOUT") return true;
+  if (error.status === 409 && ["LOCAL_COLLECTION_RUNNING", "BATCH_CONFLICT"].includes(error.code)) return true;
+  return error.status >= 400 && error.status < 500 && ![408, 409, 429].includes(error.status);
+}
+
 function trackedRequest(token: string, kind: ArchiveTaskKind, path: string, init: RequestInit, onProgress?: (progress: ArchiveTaskProgress) => void): Promise<ServerImportResult> {
   return trackArchiveRequest(kind,
     (id, signal) => request<ServerImportResult>(path, token, { ...init, signal, headers: { ...init.headers, "X-Archive-Task-Id": id } }),
     (id, signal) => getArchiveTaskStatus(token, id, signal), archiveTaskFailure,
-    (error) => error instanceof ServerApiError && Boolean(error.code) && error.code !== "TASK_ALREADY_EXISTS", onProgress);
+    definiteArchiveRequestFailure, onProgress);
 }
 
 export function resumeArchiveTaskStatus(token: string, taskId: string, kind: ArchiveTaskKind, onProgress?: (progress: ArchiveTaskProgress) => void): Promise<ServerImportResult> {

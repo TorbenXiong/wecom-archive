@@ -2,6 +2,7 @@
 import { copyFile, mkdir, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { connect, createRun, DesktopRun, fail, localJsonRequest, pause, repoRoot, until, validateRun, within } from "./runtime.mjs";
+import { realTaskRecoveryCases } from "./real-task-recovery.mjs";
 
 if (process.argv.length !== 3 || process.argv[2] !== "--authorized") {
   console.error("EXPLICIT_REAL_ENVIRONMENT_AUTHORIZATION_REQUIRED");
@@ -62,6 +63,7 @@ try {
   await request("/api/v1/collections/local?include_media=true&data_redaction=true", {});
   const initial = await request("/api/v1/archive/summary");
   check("real-full-media-collection", initial.message_count > 0 && initial.media_count > 0);
+  console.log(`Real archive counters: messages=${initial.message_count}, media=${initial.media_count}`);
 
   stage = "scheduled-cache-cycles";
   const schedules = await request("/api/v1/collection-schedules", {
@@ -175,6 +177,8 @@ try {
   await page.evaluate(`${row}.scrollIntoView({block:'center',behavior:'instant'})`);
   await page.wait(`!!${row}?.querySelector('.image-preview img')?.naturalWidth`);
   check("real-image-visible-load", await loads() === beforeReload + 1);
+  stage = "real-task-recovery";
+  await realTaskRecoveryCases({ root, desktop, session, request, check });
 } catch (error) {
   const code = error?.code || error?.cause?.code;
   console.error(`FAIL real-${stage}`, /^[A-Z_0-9]{1,80}$/.test(code || "") ? code : "REAL_ACCEPTANCE_FAILED");

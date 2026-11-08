@@ -297,6 +297,144 @@ fn lost_post_response_only_queries_original_upload_to_completion() {
 }
 
 #[test]
+fn mismatched_refusal_responses_query_the_original_upload_to_completion() {
+    for code in [
+        "INVALID_QUERY",
+        "COLLECTOR_UPLOAD_BUSY",
+        "UNAUTHORIZED",
+        "COLLECTOR_IDENTITY_REQUIRED",
+    ] {
+        for status in [408, 409, 429, 500, 502, 503, 504] {
+            if status == 503 && code == "COLLECTOR_UPLOAD_BUSY" {
+                continue;
+            }
+            let state = AppState::default();
+            let (package, identity) = package();
+            let expected_body = package.clone();
+            let server = Server::new(move |request, index| match index {
+                0 => missing(),
+                1 => {
+                    assert_eq!(request.method, "POST");
+                    assert_eq!(request.body, expected_body);
+                    Reply::Json(status, json!({"code": code}))
+                }
+                2 => Reply::Json(200, progress(request, &identity, "completed")),
+                _ => panic!("unexpected request"),
+            });
+            let client = UploadClient::new(&state, &server.endpoint, TOKEN, policy());
+            assert_eq!(client.upload(&package).unwrap(), COMPLETED_AT);
+            let requests = server.requests();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(server.count("POST"), 1);
+            assert_eq!(requests[2].method, "GET");
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.id() == requests[0].id())
+            );
+            assert!(state.pending_upload.lock().unwrap().is_none());
+            assert!(state.confirmed_upload.lock().unwrap().is_some());
+        }
+    }
+}
+
+#[test]
+fn mismatched_refusal_retains_pending_and_recovers_without_reposting() {
+    let state = AppState::default();
+    let (package, identity) = package();
+    let complete = Arc::new(AtomicBool::new(false));
+    let completed = complete.clone();
+    let server = Server::new(move |request, index| match index {
+        0 => missing(),
+        1 => {
+            assert_eq!(request.method, "POST");
+            Reply::Json(503, json!({"code": "UNAUTHORIZED"}))
+        }
+        _ => {
+            assert_eq!(request.method, "GET");
+            if completed.load(Ordering::Acquire) {
+                Reply::Json(200, progress(request, &identity, "completed"))
+            } else {
+                Reply::Json(503, json!({"code": "UPSTREAM_TIMEOUT"}))
+            }
+        }
+    });
+    let client = UploadClient::new(&state, &server.endpoint, TOKEN, policy());
+    assert_unknown(client.upload(&package), &state);
+    let pending_id = state
+        .pending_upload
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .upload_id;
+    assert_unknown(client.upload(&package), &state);
+    assert_eq!(server.count("POST"), 1);
+    assert_eq!(
+        state
+            .pending_upload
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .upload_id,
+        pending_id
+    );
+    complete.store(true, Ordering::Release);
+    let confirmed = client.confirm_pending().unwrap().unwrap();
+    assert_eq!(confirmed.completed_at, COMPLETED_AT);
+    assert_eq!(confirmed.message_count, 9);
+    let request_count = server.requests().len();
+    assert_eq!(client.upload(&package).unwrap(), COMPLETED_AT);
+    assert_eq!(server.requests().len(), request_count);
+    assert_eq!(server.count("POST"), 1);
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|request| request.id() == pending_id)
+    );
+    assert!(state.pending_upload.lock().unwrap().is_none());
+}
+
+#[test]
+fn exact_registration_refusals_clear_pending_and_allow_a_new_attempt() {
+    for (status, code) in [
+        (400, "INVALID_QUERY"),
+        (401, "UNAUTHORIZED"),
+        (403, "COLLECTOR_IDENTITY_REQUIRED"),
+        (503, "COLLECTOR_UPLOAD_BUSY"),
+    ] {
+        let state = AppState::default();
+        let (package, identity) = package();
+        let server = Server::new(move |request, index| match index {
+            0 | 2 => missing(),
+            1 => {
+                assert_eq!(request.method, "POST");
+                Reply::Json(status, json!({"code": code}))
+            }
+            3 => accepted(request),
+            4 => Reply::Json(200, progress(request, &identity, "completed")),
+            _ => panic!("unexpected request"),
+        });
+        let client = UploadClient::new(&state, &server.endpoint, TOKEN, policy());
+        assert_eq!(
+            client.upload(&package).unwrap_err().code,
+            "ENTERPRISE_UPLOAD_FAILED"
+        );
+        assert!(state.pending_upload.lock().unwrap().is_none());
+        assert!(state.confirmed_upload.lock().unwrap().is_none());
+        assert_eq!(server.requests().len(), 2);
+        assert_eq!(client.upload(&package).unwrap(), COMPLETED_AT);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(server.count("POST"), 2);
+        assert_ne!(requests[1].id(), requests[3].id());
+        assert_eq!(requests[3].id(), requests[4].id());
+    }
+}
+
+#[test]
 fn running_budget_keeps_pending_then_confirmation_and_receipt_reuse_do_not_post() {
     let state = AppState::default();
     let (package, identity) = package();

@@ -391,15 +391,15 @@ impl<'a> UploadClient<'a> {
             return Err(failed());
         }
         if let Ok(response) = &response
-            && !response.is_success()
+            // Only the product's exact registration-refusal replies establish
+            // that no upload was accepted. A gateway may reuse a business code
+            // with another status after forwarding the original request.
             && matches!(
-                code(response).as_deref(),
-                Some(
-                    "INVALID_QUERY"
-                        | "COLLECTOR_UPLOAD_BUSY"
-                        | "UNAUTHORIZED"
-                        | "COLLECTOR_IDENTITY_REQUIRED"
-                )
+                (response.status, code(response).as_deref()),
+                (400, Some("INVALID_QUERY"))
+                    | (401, Some("UNAUTHORIZED"))
+                    | (403, Some("COLLECTOR_IDENTITY_REQUIRED"))
+                    | (503, Some("COLLECTOR_UPLOAD_BUSY"))
             )
         {
             self.clear(pending.upload_id)?;
