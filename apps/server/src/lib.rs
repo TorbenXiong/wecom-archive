@@ -16,6 +16,7 @@ const MAX_ENTERPRISE_KEY_ID_LEN: usize = 128;
 include!(concat!(env!("OUT_DIR"), "/embedded_web.rs"));
 
 mod api;
+mod archive_health;
 mod auth;
 mod collector;
 mod collector_uploads;
@@ -26,6 +27,7 @@ pub mod maintenance;
 mod runtime;
 mod service;
 mod state;
+mod task_history;
 mod tasks;
 
 use api::*;

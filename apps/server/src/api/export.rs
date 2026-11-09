@@ -65,15 +65,17 @@ pub(crate) async fn create_export_job(
 ) -> Result<Json<ExportResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
     require_super_admin(&state)?;
-    let task = Arc::new(ExportTask::new());
+    let task_id = Uuid::now_v7().to_string();
+    let mut task = ExportTask::new();
+    task.history = Some(state.task_history.begin(task_id.clone(), "export")?);
+    let task = Arc::new(task);
     // The legacy synchronous endpoint also keeps accepted work alive if its
     // waiter disconnects while the operation is still queued.
-    tokio::spawn(execute_archive_export(
-        state,
-        request,
-        task,
-        Uuid::now_v7().to_string(),
-    ))
+    tokio::spawn(async move {
+        let result = execute_archive_export(state, request, Arc::clone(&task), task_id).await;
+        task.finish(&result);
+        result
+    })
     .await
     .map_err(|_| ApiError::store())?
     .map(Json)
@@ -267,7 +269,7 @@ pub(crate) async fn start_export_job(
     authorize(&headers, &state.token_sha256)?;
     require_super_admin(&state)?;
     let task_id = crate::tasks::request_id(&headers)?.unwrap_or_else(|| Uuid::now_v7().to_string());
-    let task = Arc::new(ExportTask::new());
+    let mut task = ExportTask::new();
     {
         let mut tasks = state.export_tasks.lock().map_err(|_| ApiError::store())?;
         tasks.retain(|_, task| !task.expired());
@@ -277,11 +279,17 @@ pub(crate) async fn start_export_job(
         if tasks.len() >= 64 {
             return Err(ApiError::export_task_capacity());
         }
-        tasks.insert(task_id.clone(), Arc::clone(&task));
+        task.history = Some(state.task_history.begin(task_id.clone(), "export")?);
+        let task = Arc::new(task);
+        tasks.insert(task_id.clone(), task);
     }
+    let task = find_export_task(&state, &task_id)?;
     let run_id = task_id.clone();
     tokio::spawn(async move {
-        let result = execute_archive_export(state, request, Arc::clone(&task), run_id).await;
+        let worker_task = Arc::clone(&task);
+        let result = tokio::spawn(execute_archive_export(state, request, worker_task, run_id))
+            .await
+            .unwrap_or_else(|_| Err(ApiError::store()));
         task.finish(&result);
     });
     Ok(Json(ExportStartResponse {
@@ -297,9 +305,43 @@ pub(crate) async fn export_status(
 ) -> Result<Json<ExportTaskProgress>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
     require_super_admin(&state)?;
-    let task = find_export_task(&state, &export_id)?;
-    let progress = task.progress.lock().map_err(|_| ApiError::store())?.clone();
-    Ok(Json(progress))
+    if let Ok(task) = find_export_task(&state, &export_id) {
+        let progress = task.progress.lock().map_err(|_| ApiError::store())?.clone();
+        return Ok(Json(progress));
+    }
+    let record = state
+        .task_history
+        .get(&export_id)?
+        .filter(|r| r.kind == "export")
+        .ok_or_else(ApiError::invalid_query)?;
+    let result = record.output.map(|output| ExportResponse {
+        task_id: Some(record.task_id),
+        status: Some("completed".into()),
+        export_id: output.export_id,
+        file_name: output.file_name,
+        directory: state.data_root.join("exports").display().to_string(),
+        message_count: output.message_count,
+        media_count: output.media_count,
+        missing_media_count: output.missing_media_count,
+        manifest_sha256: output.sha256,
+    });
+    let stage = match record.status.as_str() {
+        "completed" => "已完成（历史记录）",
+        "failed" => "导出失败（历史记录）",
+        "cancelled" => "已取消（历史记录）",
+        _ => "结果待核对，请检查导出目录",
+    };
+    Ok(Json(ExportTaskProgress {
+        status: record.status,
+        percent: if result.is_some() { 100 } else { 0 },
+        stage: stage.into(),
+        result,
+        error: None,
+        error_code: record.error_code,
+        processed_messages: 0,
+        total_messages: None,
+        finished_at: None,
+    }))
 }
 
 pub(crate) async fn cancel_export(
@@ -327,6 +369,34 @@ fn find_export_task(state: &AppState, id: &str) -> Result<Arc<ExportTask>, ApiEr
 /// standalone export flow separate from archive ingestion: it avoids writing
 /// the snapshot to SQLite and then reading the same messages back for export.
 pub(crate) async fn create_local_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<LocalExportRequest>,
+) -> Result<Json<ExportResponse>, ApiError> {
+    authorize(&headers, &state.token_sha256)?;
+    let history = state
+        .task_history
+        .begin(Uuid::now_v7().to_string(), "local_export")?;
+    tokio::spawn(async move {
+        history.progress("running", 0);
+        let result = tokio::spawn(create_local_export_work(
+            State(state),
+            headers,
+            Json(request),
+        ))
+        .await
+        .unwrap_or_else(|_| Err(ApiError::store()));
+        history.finish_export(
+            &result.as_ref().map(|r| r.0.clone()).map_err(Clone::clone),
+            false,
+        );
+        result
+    })
+    .await
+    .map_err(|_| ApiError::store())?
+}
+
+async fn create_local_export_work(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<LocalExportRequest>,

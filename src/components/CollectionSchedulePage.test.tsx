@@ -98,14 +98,16 @@ it("automatically discovers new collectors without replacing an active edit", as
   expect(requestCount).toBe(2);
 });
 
-it("shows the remote plan on three rows and aligns both editors with shared controls", async () => {
+it("keeps plan times visible and reveals device details on demand", async () => {
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
     if (String(input).endsWith("/api/v1/collectors/collector-1")) return Response.json({ config: { displayName: "10.0.0.2", enabled: true, includeMedia: true, dataRedaction: true, offlineExportEnabled: false, schedule: { mode: "interval", intervalMinutes: 20, dailyTime: "02:00" } } });
     return Response.json({ targets: [{ targetId: "collector-1", kind: "collector", displayName: "10.0.0.2", clientIp: "10.0.0.2", status: "online", configRevision: 1, lastAppliedRevision: 1, logDirectory: "collector/collector-1", plans: [{ id: "collector-1", name: "远程计划", includeMedia: true, schedule: { mode: "interval", intervalMinutes: 20, dailyTime: "02:00" }, lastRunAt: "2026-09-24T10:00:00Z", nextRunAt: "2026-09-24T10:20:00Z" }] }] });
   }));
   const { container } = render(<CollectionSchedulePage token="test-token" />);
   expect(await screen.findByText(/采集计划：每 20 分钟执行/)).toBeInTheDocument();
-  expect(screen.getByText(/服务端日志目录：collector\/collector-1\/日期.log/)).toBeInTheDocument();
+  expect(screen.getByText(/服务端日志目录：collector\/collector-1\/日期.log/)).not.toBeVisible();
+  fireEvent.click(screen.getByText("设备详情"));
+  expect(screen.getByText(/服务端日志目录：collector\/collector-1\/日期.log/)).toBeVisible();
   fireEvent.change(screen.getByRole("textbox", { name: "检索采集端" }), { target: { value: "collector-1" } });
   expect(screen.getByText(/实例标识：collector-1/)).toBeInTheDocument();
   const summary = container.querySelector(".collector-target-summary");

@@ -53,11 +53,19 @@ pub(crate) async fn import_enterprise(
         return Err(ApiError::unauthorized());
     }
     let task = Task::register(&state, &headers, "import")?;
-    let work = import_enterprise_work(state, body, collector_id, task.clone());
-    if task.is_some() {
-        run_detached(task, work).await
+    if let Some(task) = task {
+        let work = import_enterprise_work(state, body, collector_id, Some(Arc::clone(&task)));
+        run_detached(Some(task), work).await
     } else {
-        work.await
+        let id = Uuid::now_v7().to_string();
+        let kind = if collector_id.is_some() {
+            "collector_upload"
+        } else {
+            "import"
+        };
+        let task = Task::create_tracked(&state, id, kind)?;
+        let work = import_enterprise_work(state, body, collector_id, Some(Arc::clone(&task)));
+        crate::tasks::run_inline(task, work).await
     }
 }
 
@@ -245,11 +253,13 @@ pub(crate) async fn import_json(
 ) -> Result<Json<ImportResponse>, ApiError> {
     authorize(&headers, &state.token_sha256)?;
     let task = Task::register(&state, &headers, "import")?;
-    let work = import_json_work(state, body, task.clone());
-    if task.is_some() {
-        run_detached(task, work).await
+    if let Some(task) = task {
+        let work = import_json_work(state, body, Some(Arc::clone(&task)));
+        run_detached(Some(task), work).await
     } else {
-        work.await
+        let task = Task::create_tracked(&state, Uuid::now_v7().to_string(), "import")?;
+        let work = import_json_work(state, body, Some(Arc::clone(&task)));
+        crate::tasks::run_inline(task, work).await
     }
 }
 

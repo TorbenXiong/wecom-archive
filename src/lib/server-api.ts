@@ -664,7 +664,7 @@ async function queryExportWithRetry(taskId: string, cancellationRequested: () =>
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const progress = await action();
-      if (!["queued", "running", "cancelling", "completed", "cancelled", "failed"].includes(progress.status)
+      if (!["queued", "running", "cancelling", "completed", "cancelled", "failed", "unknown"].includes(progress.status)
         || (progress.status === "completed" && !progress.result)) throw new Error("Invalid export status");
       return progress;
     } catch (error) {
@@ -726,6 +726,7 @@ export async function createServerExport(token: string, exportRequest: ServerExp
     const progress = await queryExportWithRetry(taskId, () => Boolean(signal?.aborted), () =>
       request<ExportTaskProgress>(`/api/v1/exports/${encodeURIComponent(taskId)}`, token, { signal: AbortSignal.timeout(30000) }));
     onProgress?.(progress);
+    if (progress.status === "unknown") throw new ExportStatusUnknownError(taskId, Boolean(signal?.aborted), "服务端已重启，导出结果待核对。请先检查导出目录中的成品文件。");
     const completed = finishedExport(progress);
     if (completed) return completed;
     await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
@@ -746,4 +747,71 @@ export function createLocalExport(token: string, payload: LocalExportRequest): P
 
 export function openExportDirectory(token: string): Promise<{ opened: boolean }> {
   return request<{ opened: boolean }>("/api/v1/exports/open-directory", token, { method: "POST" });
+}
+
+export interface ArchiveVerification {
+  revision: number;
+  databaseOk: boolean;
+  checkedMedia: number;
+  missingFiles: number;
+  damagedFiles: number;
+  unreadableFiles: number;
+}
+
+export interface TaskHistoryRecord {
+  taskId: string;
+  kind: string;
+  status: string;
+  startedAt: string;
+  updatedAt: string;
+  receivedBytes: number;
+  phase?: string;
+  errorCode?: string | null;
+  importResult?: ServerImportResult | null;
+  output?: { fileName: string; exportId: string; messageCount: number; mediaCount: number; missingMediaCount: number; sha256: string } | null;
+  verification?: ArchiveVerification | null;
+}
+
+export interface TaskHistoryPage {
+  records: TaskHistoryRecord[];
+  total: number;
+  persistenceError: boolean;
+}
+
+export interface ArchiveHealth {
+  revision: number;
+  messageCount: number;
+  conversationCount: number;
+  batchCount: number;
+  sourceCount: number;
+  firstMessageAt?: string | null;
+  lastMessageAt?: string | null;
+  lastCollectedAt?: string | null;
+  unsupportedMessages: number;
+  verifiedMedia: number;
+  missingMedia: number;
+  invalidMedia: number;
+  restrictedBatches: number;
+  missingLocator: number;
+  missingInSource: number;
+  missingOther: number;
+  checkedAt: string;
+  latestVerification?: TaskHistoryRecord | null;
+  availableBytes?: number | null;
+  databaseBytes?: number | null;
+}
+
+export function getArchiveHealth(token: string, signal?: AbortSignal): Promise<ArchiveHealth> {
+  return boundedRequest("/api/v1/archive/health", token, signal);
+}
+
+export function startArchiveHealthCheck(token: string, signal?: AbortSignal): Promise<TaskHistoryRecord> {
+  return request("/api/v1/archive/health-check", token, { method: "POST", signal });
+}
+
+export function getTaskHistory(token: string, query: { kind?: string; status?: string; offset?: number }, signal?: AbortSignal): Promise<TaskHistoryPage> {
+  const params = new URLSearchParams({ limit: "50", offset: String(query.offset ?? 0) });
+  if (query.kind) params.set("kind", query.kind);
+  if (query.status) params.set("status", query.status);
+  return boundedRequest(`/api/v1/task-history?${params}`, token, signal);
 }

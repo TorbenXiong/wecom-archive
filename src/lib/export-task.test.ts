@@ -7,6 +7,15 @@ import { createServerExport, ExportStatusUnknownError, ServerApiError } from "./
 const result = { exportId: "synthetic-export", fileName: "synthetic.json", messageCount: 1 };
 const exportRequest = { scope: "entire_archive" as const, format: "json" as const };
 
+it("surfaces a persisted interrupted export without endless polling or a new start", async () => {
+  const fetchMock = vi.fn(async (_input: RequestInfo | URL) => Response.json({ status: "unknown", stage: "结果待核对" }));
+  vi.stubGlobal("fetch", fetchMock);
+  await expect(createServerExport("synthetic-token", exportRequest, undefined, undefined, "synthetic-id"))
+    .rejects.toMatchObject({ code: "EXPORT_STATUS_UNKNOWN", taskId: "synthetic-id" });
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  expect(String(fetchMock.mock.calls[0][0])).toBe("/api/v1/exports/synthetic-id");
+});
+
 it("treats malformed status replies as unknown after the retry budget", async () => {
   vi.useFakeTimers();
   let polls = 0;

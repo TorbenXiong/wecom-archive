@@ -198,15 +198,19 @@ async fn expired_results_are_pruned_by_lookup_cancel_and_registration_without_de
         .collect::<Vec<_>>();
     assert_eq!(recent_ids.len(), 61);
 
-    let missing = export_status(
+    let durable = export_status(
         State(app_state.clone()),
         authorized_headers(),
         AxumPath(original_id.clone()),
     )
     .await
-    .unwrap_err();
-    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
-    assert_eq!(missing.body.code, "INVALID_QUERY");
+    .unwrap()
+    .0;
+    assert_eq!(durable.status, "completed");
+    assert_eq!(
+        durable.result.unwrap().manifest_sha256,
+        completed.manifest_sha256
+    );
     let missing = cancel_export(
         State(app_state.clone()),
         authorized_headers(),

@@ -42,7 +42,7 @@ pub(crate) struct UploadStatus {
     received_bytes: u64,
     result: Option<ImportResponse>,
     error: Option<String>,
-    error_code: Option<&'static str>,
+    error_code: Option<String>,
     error_status: Option<u16>,
 }
 
@@ -155,10 +155,7 @@ pub(crate) async fn start(
     let owner = device(&state, &headers)?;
     let id = uuid(&id)?.to_string();
     let identity = identity(&headers)?;
-    let record = UploadRecord {
-        identity: identity.clone(),
-        task: Task::create(id.clone(), "collector_upload"),
-    };
+    let record;
     {
         let mut registry = state
             .collector_uploads
@@ -195,6 +192,13 @@ pub(crate) async fn start(
                 "此设备的上传记录或并发任务已达上限，请稍后查询原任务再重试。",
             ));
         }
+        let history = state
+            .task_history
+            .begin(Uuid::now_v7().to_string(), "collector_upload")?;
+        record = UploadRecord {
+            identity: identity.clone(),
+            task: Task::with_history(id.clone(), "collector_upload", history),
+        };
         registry
             .0
             .insert((owner.clone(), id.clone()), record.clone());

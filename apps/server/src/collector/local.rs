@@ -42,7 +42,17 @@ pub(crate) async fn collect_local(
     };
     let include_media = query.include_media.unwrap_or(configured_include_media);
     let data_redaction = query.data_redaction.unwrap_or(configured_data_redaction);
-    let task = crate::tasks::Task::register(&state, &headers, "collection")?;
+    let mut tracking_headers = headers.clone();
+    if !tracking_headers.contains_key("x-archive-task-id") {
+        tracking_headers.insert(
+            "x-archive-task-id",
+            uuid::Uuid::now_v7()
+                .to_string()
+                .parse()
+                .map_err(|_| ApiError::store())?,
+        );
+    }
+    let task = crate::tasks::Task::register(&state, &tracking_headers, "collection")?;
     let progress_task = task.clone();
     crate::tasks::run_detached(task, async move {
         // The request may disappear while spawn_blocking still collects data.
@@ -62,6 +72,12 @@ pub(crate) async fn collect_local(
 }
 
 pub(crate) struct LocalCollectionRunGuard(Arc<AtomicBool>);
+
+impl LocalCollectionRunGuard {
+    pub(crate) fn new(running: Arc<AtomicBool>) -> Self {
+        Self(running)
+    }
+}
 
 impl Drop for LocalCollectionRunGuard {
     fn drop(&mut self) {
@@ -205,14 +221,28 @@ pub(crate) async fn run_local_collection_once(
             .map_err(|_| ApiError::store())?;
         config.data_redaction
     };
-    run_local_collection(
-        state,
-        include_media,
-        data_redaction,
-        since_unix_ms,
-        None,
-        None,
-    )
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-archive-task-id",
+        uuid::Uuid::now_v7()
+            .to_string()
+            .parse()
+            .map_err(|_| ApiError::store())?,
+    );
+    let task = crate::tasks::Task::register(state, &headers, "collection")?;
+    let progress_task = task.clone();
+    let state = state.clone();
+    crate::tasks::run_detached(task, async move {
+        run_local_collection(
+            &state,
+            include_media,
+            data_redaction,
+            since_unix_ms,
+            None,
+            progress_task,
+        )
+        .await
+    })
     .await
 }
 

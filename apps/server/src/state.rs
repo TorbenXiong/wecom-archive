@@ -29,6 +29,8 @@ pub(super) struct AppState {
     pub(super) export_slots: Arc<Semaphore>,
     pub(super) import_slots: Arc<Semaphore>,
     pub(super) tasks: Arc<Mutex<crate::tasks::TaskRegistry>>,
+    pub(super) task_history: Arc<crate::task_history::TaskHistory>,
+    pub(super) health_check_running: Arc<AtomicBool>,
     pub(super) collector_uploads: Arc<Mutex<crate::collector_uploads::UploadRegistry>>,
 }
 
@@ -48,6 +50,7 @@ pub(crate) struct ExportTaskProgress {
 }
 
 pub(crate) struct ExportTask {
+    pub(super) history: Option<crate::task_history::HistoryHandle>,
     pub cancelled: AtomicBool,
     pub(super) cancellation: Notify,
     pub progress: Mutex<ExportTaskProgress>,
@@ -56,6 +59,7 @@ pub(crate) struct ExportTask {
 impl ExportTask {
     pub fn new() -> Self {
         Self {
+            history: None,
             cancelled: AtomicBool::new(false),
             cancellation: Notify::new(),
             progress: Mutex::new(ExportTaskProgress {
@@ -108,6 +112,9 @@ impl ExportTask {
                 }
             }
             progress.finished_at = Some(Instant::now());
+            if let Some(history) = &self.history {
+                history.finish_export(result, self.cancelled.load(Ordering::Acquire));
+            }
         }
     }
 
@@ -123,6 +130,9 @@ impl ExportTask {
             progress.status = "cancelling".into();
             progress.stage = "正在取消并清理临时文件".into();
             self.cancellation.notify_one();
+            if let Some(history) = &self.history {
+                history.progress("cancelling", 0);
+            }
         }
     }
 
@@ -140,6 +150,9 @@ impl ExportTask {
             progress.status = "running".into();
             progress.percent = percent;
             progress.stage = stage.into();
+            if let Some(history) = &self.history {
+                history.progress("running", 0);
+            }
         }
     }
 }

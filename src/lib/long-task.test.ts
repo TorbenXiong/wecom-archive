@@ -17,6 +17,12 @@ const fail = (value: ArchiveTaskProgress) => Object.assign(new Error(value.error
   code: value.errorCode, status: value.errorStatus,
 });
 
+it("returns a restart interruption as unknown immediately without polling or resending", async () => {
+  const read = vi.fn(async () => progress("synthetic-id", "unknown"));
+  await expect(resumeArchiveTask("synthetic-id", "import", read, fail)).rejects.toBeInstanceOf(ArchiveTaskPendingError);
+  expect(read).toHaveBeenCalledTimes(1);
+});
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();

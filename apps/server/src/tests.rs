@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use super::*;
 
+mod archive_operations;
 mod collector_uploads;
 mod export_queue;
 mod export_retention;
@@ -508,6 +509,8 @@ fn state(directory: &TestDirectory) -> AppState {
         export_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         import_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         tasks: Arc::new(Mutex::new(Default::default())),
+        task_history: crate::task_history::TaskHistory::open(&directory.0).unwrap(),
+        health_check_running: Arc::new(AtomicBool::new(false)),
         collector_uploads: Arc::new(Mutex::new(Default::default())),
     }
 }
