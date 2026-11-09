@@ -5,6 +5,7 @@ import { archiveCases } from "./archive.mjs";
 import { settingsCases } from "./settings.mjs";
 import { timeoutCases } from "./import-timeouts.mjs";
 import { recoveryCases } from "./recovery.mjs";
+import { operationsCases } from "./archive-operations.mjs";
 
 const root = await createRun();
 const executable = join(root, "app/WeComArchive.exe");
@@ -57,6 +58,8 @@ try {
   const fresh = await desktop.start("fresh");
   stage = "archive";
   await archiveCases({ desktop, main, fresh, check });
+  stage = "archive-operations";
+  main = await operationsCases({ root, desktop, main, check });
   stage = "settings";
   main = await settingsCases({ root, desktop, main, check });
   stage = "import-timeouts";

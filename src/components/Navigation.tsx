@@ -1,6 +1,6 @@
-import { Download, MessagesSquare, ServerCog, Settings } from "lucide-react";
+import { Activity, Download, ListChecks, MessagesSquare, ServerCog, Settings } from "lucide-react";
 
-type Section = "conversations" | "local-export" | "server-config" | "settings";
+type Section = "conversations" | "local-export" | "server-config" | "settings" | "archive-health" | "tasks";
 
 interface NavigationProps {
   active: Section;
@@ -11,6 +11,8 @@ const items: Array<{ id: Section; label: string; icon: typeof MessagesSquare }> 
   { id: "local-export", label: "本机", icon: Download },
   { id: "conversations", label: "会话", icon: MessagesSquare },
   { id: "server-config", label: "采集端", icon: ServerCog },
+  { id: "archive-health", label: "归档健康", icon: Activity },
+  { id: "tasks", label: "任务中心", icon: ListChecks },
 ];
 
 export function Navigation({ active, onSelect }: NavigationProps) {

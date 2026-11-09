@@ -122,12 +122,15 @@ pub struct ArchiveReadSnapshot<'a> {
 mod backup;
 mod connection;
 mod derived;
+mod health;
 mod ingest;
 mod migration;
 mod query;
 mod revision;
 mod schema;
 mod sql;
+
+pub use health::ArchiveHealth;
 
 #[cfg(test)]
 mod tests;

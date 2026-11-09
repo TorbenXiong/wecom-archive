@@ -693,7 +693,7 @@ describe("archive workspace", () => {
     render(<App />);
     await connect();
     const navigation = screen.getByRole("navigation", { name: "主导航" });
-    expect([...navigation.querySelectorAll("button")].map((button) => button.textContent)).toEqual(["本机", "会话", "采集端", "设置"]);
+    expect([...navigation.querySelectorAll("button")].map((button) => button.textContent)).toEqual(["本机", "会话", "采集端", "归档健康", "任务中心", "设置"]);
     expect(screen.queryByText("离线运行")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "本机" }));
     expect(await screen.findByRole("heading", { name: "快速导出本机记录", level: 2 })).toBeInTheDocument();

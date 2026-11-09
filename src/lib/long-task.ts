@@ -4,7 +4,7 @@ export type ArchiveTaskKind = "import" | "collection";
 export interface ArchiveTaskProgress {
   taskId: string;
   kind: ArchiveTaskKind;
-  status: "queued" | "receiving" | "running" | "completed" | "failed";
+  status: "queued" | "receiving" | "running" | "completed" | "failed" | "unknown";
   stage: string;
   receivedBytes: number;
   startedAt: string;
@@ -47,7 +47,7 @@ async function poll(
     let progress: ArchiveTaskProgress;
     try {
       progress = await read(signal);
-      if (progress.taskId !== id || progress.kind !== kind || !["queued", "receiving", "running", "completed", "failed"].includes(progress.status)) {
+      if (progress.taskId !== id || progress.kind !== kind || !["queued", "receiving", "running", "completed", "failed", "unknown"].includes(progress.status)) {
         throw new Error("Invalid task status");
       }
       if (progress.status === "completed" && !progress.result) throw new Error("Missing task result");
@@ -64,6 +64,7 @@ async function poll(
     }
     last = progress;
     onProgress?.({ ...progress, trackingUnavailable: false });
+    if (progress.status === "unknown") throw new ArchiveTaskPendingError(id, kind);
     if (progress.status === "completed") return progress.result!;
     if (progress.status === "failed") throw fail(progress);
     await pause(750, signal);

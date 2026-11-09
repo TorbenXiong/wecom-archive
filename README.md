@@ -4,6 +4,9 @@
 
 ## 功能
 
+- “归档健康”展示消息范围、媒体缺失原因、受限采集批次及磁盘余量，并可手动执行只读数据库和附件完整性校验。
+- “任务中心”持久保存采集、上传、导入、导出和校验历史；重启后保留已确认结果，未确认任务标为“结果待核对”，不自动重跑。范围与存储说明见 [归档健康与任务中心](docs/archive-operations.md)。
+
 - 按需加载、全局搜索和导出会话，展示成员名称、引用消息、群公告、图片和文件；搜索结果与引用消息均可跨页定位到原消息。
 - 立即采集本机文本或完整内容，也可导入专属采集端生成的 `.wca` 文件。
 - 自动读取当前 Windows 用户的企业微信存储目录设置；找不到数据时，可在工作台采集或快速导出中填写本机目录，采集成功后加密记住。
@@ -40,9 +43,9 @@ crates/archive-store/ SQLite/FTS5 归档、修订和审计
 crates/export/        JSON/CSV/HTML/Markdown 导出
 ```
 
-详细设计见 [架构](docs/architecture.md)、[安全边界](docs/privacy-security.md)、[产品能力](docs/capability-matrix.md)；验证结果集中在 [0.0.17 验收记录](docs/acceptance/0.0.17-results.md)。
+详细设计见 [架构](docs/architecture.md)、[安全边界](docs/privacy-security.md)、[产品能力](docs/capability-matrix.md)；当前验证结果见 [0.0.18 验收记录](docs/acceptance/0.0.18-results.md)。
 
-本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；版本变化见 [0.0.17 版本说明](docs/release-0.0.17.md)，历史版本见 [GitHub Releases](https://github.com/TorbenXiong/wecom-archive/releases)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
+本机采集、会话分类及人员资料的缓存限制见 [本机采集说明](docs/local-collection-fixes.md)；版本变化见 [0.0.18 版本说明](docs/release-0.0.18.md)，历史版本见 [GitHub Releases](https://github.com/TorbenXiong/wecom-archive/releases)。语音支持读取企业微信已缓存的转写文字；“包含全内容”可按消息摘要采集本机 SILK 原文件。点击语音气泡可离线播放或暂停，并显示时长与进度；同一行的下载图标保存原始 `.silk` 文件。
 
 合成数据性能基准见 [`docs/benchmarks.md`](docs/benchmarks.md)，使用 PowerShell 运行 `./scripts/benchmark-archive.ps1`。
 

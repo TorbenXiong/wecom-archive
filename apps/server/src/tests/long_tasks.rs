@@ -164,7 +164,7 @@ async fn failed_tracked_import_is_queryable_after_cleanup_and_cannot_be_resubmit
     .unwrap_err();
     assert_eq!(error.body.code, "INVALID_CLIENT_EXPORT");
     let failed = wait_for_progress(&app_state, id, |p| p.status == "failed").await;
-    assert_eq!(failed.error_code, Some("INVALID_CLIENT_EXPORT"));
+    assert_eq!(failed.error_code.as_deref(), Some("INVALID_CLIENT_EXPORT"));
     assert_eq!(failed.error_status, Some(422));
     assert!(failed.result.is_none());
     assert!(failed.received_bytes > 0);

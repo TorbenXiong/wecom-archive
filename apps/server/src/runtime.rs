@@ -232,11 +232,23 @@ fn prepare_server(
         export_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         import_slots: Arc::new(tokio::sync::Semaphore::new(1)),
         tasks: Arc::new(Mutex::new(Default::default())),
+        task_history: crate::task_history::TaskHistory::open(&data_root)
+            .map_err(|_| "任务历史不可读或损坏，已停止启动，请通过维护窗口检查备份。".to_owned())?,
+        health_check_running: Arc::new(AtomicBool::new(false)),
         collector_uploads: Arc::new(Mutex::new(Default::default())),
     };
 
     let app = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/task-history", get(crate::task_history::list))
+        .route(
+            "/api/v1/archive/health",
+            get(crate::archive_health::summary),
+        )
+        .route(
+            "/api/v1/archive/health-check",
+            post(crate::archive_health::start),
+        )
         .route("/api/v1/tasks/{task_id}", get(crate::tasks::status))
         .route(
             "/api/v1/collector-uploads/{upload_id}",
