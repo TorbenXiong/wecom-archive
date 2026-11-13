@@ -47,5 +47,3 @@
 资料通过已有 `raw_payload.participant_profiles` 传递，并投影至 `participants.metadata_json`，不增加数据库字段。`MessageV1`、`ArchiveBatchV1`、`ClientExportV1`、`UploadEnvelopeV1` 的结构不变；人员 API 增加可选 `profile`。会话类型新增 `document`、`application`、`assistant`、`temporary`、`system` 显示语义，旧归档缺少的信息通过重新采集补齐。
 
 本地未缓存的电话号码无法离线还原。已对联系人、企业资料及相关缓存做只读核验；一次原生名片点击“查看”前后对比没有发现可补齐该联系人的持久号码。本结论限于已核验的客户端与缓存，不能推广到所有版本。字符串 `null`、内部数字标识和企业总机不能作为个人号码。补齐按需显示的号码仍需另行确认企业授权的数据来源，当前实现不增加网络请求。
-
-历史 `0.0.12` 记录中，用户已确认转写及原始语音采集成功，生产代码只读核验取得过 11,591 字节 SILK 样本并确认 SHA-256；这不替代当前构建播放、暂停、保存和人工听音的验收。当前步骤见 [人工验收清单](manual-acceptance.md)，构建与自动验收入口见 [README](../README.md#开发)。真实数据、诊断副本及临时诊断代码不进入源码或发布包；历史诊断目录不属于交付产物。
